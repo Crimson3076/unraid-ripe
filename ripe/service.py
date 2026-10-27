@@ -263,13 +263,22 @@ class Coordinator:
         notifier = Notifier(self.store,self.runtime.ha_url,self.runtime.ha_token)
         await notifier.tick(self.settings(),self.views(),demo=self.demo)
 
+    async def cycle(self):
+        if not self.demo:
+            last = self.store.get('last_poll')
+            elapsed = (utcnow()-datetime.fromisoformat(last)).total_seconds() if last else float('inf')
+            if elapsed >= self.settings().poll_hours*3600:
+                self.request_poll()
+            if not self.polling:
+                await self.notify()
+
     async def run(self):
         while True:
-            if not self.demo:
-                last = self.store.get('last_poll')
-                elapsed = (utcnow()-datetime.fromisoformat(last)).total_seconds() if last else float('inf')
-                if elapsed >= self.settings().poll_hours*3600:
-                    self.request_poll()
-                if not self.polling:
-                    await self.notify()
-            await asyncio.sleep(30)
+            delay = 30
+            try:
+                await self.cycle()
+            except Exception:
+                # Keep the scheduler alive; the fixed message avoids leaking secrets from exception text.
+                self.store.log_error({'source':'scheduler','message':'Scheduler cycle failed; will retry shortly.'})
+                delay = 60
+            await asyncio.sleep(delay)

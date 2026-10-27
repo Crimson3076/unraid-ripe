@@ -94,3 +94,25 @@ async def test_profile_edit_during_inference_cannot_restore_old_exclusion(tmp_pa
         if not task.done():
             await task
         manager.close()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_loop_survives_an_exception(tmp_path,monkeypatch):
+    manager=Coordinator(runtime(tmp_path))
+    runs=[]
+    async def cycle():
+        runs.append(1)
+        if len(runs)==1:
+            raise RuntimeError('boom secret')
+    async def sleep(delay):
+        if len(runs)>=3:
+            raise asyncio.CancelledError
+    monkeypatch.setattr(manager,'cycle',cycle)
+    monkeypatch.setattr(service.asyncio,'sleep',sleep)
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await manager.run()
+        assert len(runs)==3
+        assert 'secret' not in str(manager.store.logs())
+    finally:
+        manager.close() if hasattr(manager,'close') else None
