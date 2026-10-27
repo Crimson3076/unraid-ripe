@@ -1,6 +1,9 @@
 # Claude Code agent: starts when n8n (or you) adds the `agent-fix` label to an issue,
 # or when the owner/a collaborator writes a comment that STARTS with @claude
 # (a mention buried in other text, e.g. quoted from an issue, does not trigger it).
+# This only controls WHO can start the agent: anything written after @claude, including text pasted from elsewhere,
+# still reaches the agent as instructions, so don't paste untrusted text into a trigger comment. The comment must
+# start exactly with @claude (a leading space or newline means it is silently ignored).
 name: Claude agent
 on:
   issues:
