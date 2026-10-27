@@ -6,7 +6,7 @@ import threading
 from pathlib import Path
 from typing import Any
 from .models import AppRecord, Release, Settings, utcnow
-from .privacy import redact
+from .privacy import redact, redact_exact
 from .versions import compare_versions
 
 
@@ -38,8 +38,11 @@ class Store:
         return json.loads(row[0]) if row else default
 
     def set(self, key: str, value: Any):
+        # Cached public HTTP bodies must round-trip unchanged: pattern redaction would
+        # rewrite changelog text and change the classification key.
+        clean = redact_exact(value, self.secrets) if key.startswith('http:') else redact(value, self.secrets)
         with self.lock, self.db:
-            self.db.execute('INSERT OR REPLACE INTO kv(key,data) VALUES(?,?)', (key, json.dumps(redact(value, self.secrets), default=str)))
+            self.db.execute('INSERT OR REPLACE INTO kv(key,data) VALUES(?,?)', (key, json.dumps(clean, default=str)))
 
     def settings(self, initial: Settings | None = None) -> Settings:
         data = self.get('settings')

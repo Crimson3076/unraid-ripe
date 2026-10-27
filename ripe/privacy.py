@@ -25,6 +25,18 @@ def registered_secrets() -> tuple[str, ...]:
         return tuple(_runtime_secrets)
 
 
+def redact_exact(value: Any, secrets: list[str] | None = None) -> Any:
+    """Replace only known secret values, leaving ordinary text (e.g. changelogs) untouched."""
+    if isinstance(value, dict):
+        return {str(k): redact_exact(v, secrets) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [redact_exact(v, secrets) for v in value]
+    if isinstance(value, str):
+        for secret in (*registered_secrets(), *(secrets or [])):
+            value = value.replace(secret, '[redacted]')
+    return value
+
+
 def redact(value: Any, secrets: list[str] | None = None) -> Any:
     if isinstance(value, dict):
         return {str(k): '[redacted]' if SENSITIVE_KEY.search(str(k)) else redact(v, secrets) for k,v in value.items()}

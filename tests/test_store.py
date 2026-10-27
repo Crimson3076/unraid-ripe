@@ -58,3 +58,22 @@ def test_logs_redact_runtime_secrets_nested_credentials_and_url_userinfo(tmp_pat
     assert secret not in raw
     assert 'never-store-this' not in raw
     db.close()
+
+
+def test_http_cache_keeps_changelog_text_and_classification_key(tmp_path):
+    from ripe.intelligence import classification_key
+    from ripe.models import Settings
+    secret = 'a-runtime-secret-value-for-tests'
+    notes = 'Bearer authentication is now supported. token: optional for public repos.'
+    db = Store(tmp_path / 'ripe.sqlite3', secrets=[secret])
+    db.set('http:abc', {'body': [{'body': notes + ' ' + secret, 'token': 'x'}], 'fetched': 1})
+    cached = db.get('http:abc')['body'][0]
+    assert cached['body'] == notes + ' [redacted]'  # exact known secret still removed
+    assert cached['token'] == 'x'
+    db.set('http:def', {'body': notes})
+    assert db.get('http:def')['body'] == notes
+    app = AppRecord(id='docker:a', name='a', source='docker', installed_version='1.0.0')
+    fresh = Release(id='github:o/a:1', app_id=app.id, version='2.0.0', notes=notes)
+    again = fresh.model_copy(update={'notes': db.get('http:def')['body']})
+    assert classification_key(fresh, app, Settings()) == classification_key(again, app, Settings())
+    db.close()
