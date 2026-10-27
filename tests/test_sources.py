@@ -155,7 +155,7 @@ async def test_home_assistant_only_update_fields_retained():
         assert request.url.path == '/api/states'
         return httpx.Response(200, json=[{'entity_id':'update.home_assistant_core','state':'on','attributes':{'installed_version':'2026.10.1','latest_version':'2026.10.3','title':'Home Assistant Core','release_summary':'Fix issue','secret':'never'}}, {'entity_id':'sensor.secret','state':'not-allowed'}])
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        states = await ha_states(client, 'http://192.168.0.61:8123', 'token')
+        states = await ha_states(client, 'http://10.20.30.41:8123', 'token')
     assert len(states) == 1
     assert 'secret' not in json.dumps(states)
     apps, releases = ha_records(states, {}, {})
@@ -202,8 +202,8 @@ async def test_unraid_webui_placeholders_resolve_with_published_ports(tmp_path):
     def handler(request):
         return httpx.Response(200, json=[{'Id':ident,'Names':['/ollama'],'Image':'ollama/ollama:latest','Ports':[{'PrivatePort':11434,'PublicPort':11435}]}])
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler),base_url='http://docker') as client:
-        apps = await DockerReader(client, host='192.168.0.83').apps(templates, {})
-    assert apps[0].web_url == 'http://192.168.0.83:11435/'
+        apps = await DockerReader(client, host='10.20.30.40').apps(templates, {})
+    assert apps[0].web_url == 'http://10.20.30.40:11435/'
     assert apps[0].detected['ports'][0]['public'] == 11435
 
 

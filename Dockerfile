@@ -4,7 +4,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     RIPE_CONFIG_DIR=/config \
-    TZ=America/New_York
+    TZ=UTC
 
 WORKDIR /app
 COPY requirements.lock pyproject.toml ./

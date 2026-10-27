@@ -13,15 +13,16 @@ services:
       - "${RIPE_BIND_IP:-127.0.0.1}:8087:8087"
     environment:
       RIPE_CONFIG_DIR: /config
-      RIPE_ALLOWED_HOSTS: "${RIPE_ALLOWED_HOSTS:-localhost,127.0.0.1,::1,192.168.0.83,node2,NODE2}"
-      TZ: "${TZ:-America/New_York}"
-      HA_URL: "${HA_URL:-http://192.168.0.61:8123}"
+      RIPE_ALLOWED_HOSTS: "${RIPE_ALLOWED_HOSTS:-localhost,127.0.0.1,::1}"
+      TZ: "${TZ:-UTC}"
+      HA_URL: "${HA_URL:-}"
       HA_TOKEN: "${HA_TOKEN:-}"
       GITHUB_TOKEN: "${GITHUB_TOKEN:-}"
       GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
-      OLLAMA_URL: "${OLLAMA_URL:-http://192.168.0.83:11434}"
+      OLLAMA_URL: "${OLLAMA_URL:-}"
       LOCAL_MODEL: "${LOCAL_MODEL:-qwen3:8b}"
       GEMINI_MODEL: "${GEMINI_MODEL:-gemini-2.5-flash}"
+      DASHBOARD_URL: "${DASHBOARD_URL:-http://localhost:8087}"
     volumes:
       - "${RIPE_APPDATA:-/mnt/user/appdata/ripe}:/config"
       - /var/run/docker.sock:/var/run/docker.sock:ro

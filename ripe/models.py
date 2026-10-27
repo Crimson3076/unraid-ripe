@@ -52,7 +52,7 @@ class Release(BaseModel):
     classification_key: str | None = None
 
 class Settings(BaseModel):
-    timezone: str = "America/New_York"
+    timezone: str = "UTC"
     soak_days: dict[str, int] = Field(default_factory=lambda: {"infrastructure":21,"internet":14,"general":14})
     patch_soak_days: int = Field(default=3, ge=0, le=365)
     patch_exception: bool = True
@@ -61,10 +61,12 @@ class Settings(BaseModel):
     poll_hours: int = Field(default=12, ge=1, le=168)
     digest_weekday: int = Field(default=0, ge=0, le=6)
     digest_time: str = "09:00"
-    notification_people: list[str] = Field(default_factory=lambda: ["dallas"])
+    notification_script: str = ""
+    notification_channel: str = ""
+    notification_people: list[str] = Field(default_factory=list)
     notifications_enabled: bool = False
-    dashboard_url: str = "http://192.168.0.83:8087"
-    ollama_url: str = "http://192.168.0.83:11434"
+    dashboard_url: str = "http://localhost:8087"
+    ollama_url: str = ""
     local_model: str = "qwen3:8b"
     gemini_model: str = "gemini-2.5-flash"
     classification_provider: Literal["local", "gemini"] = "local"

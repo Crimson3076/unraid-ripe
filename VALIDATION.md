@@ -1,23 +1,21 @@
 # Stage 1 validation · 2026-10-27
 
-The Stage 1 implementation is prepared for review and live acceptance on NODE2. Stage 2 has not been started.
+This records the initial Stage 1 validation baseline. Live integration acceptance must be performed for each deployment; no private installation configuration belongs in the repository.
 
-Verified in the cloud workspace:
+Verified during initial development:
 
-- `python -m pytest -q`: **157 passed**, including version forms, quiet-soak resets, Home Assistant's patch exception, 1.02 as the security target, pending/history transitions, per-release cache reuse across containers, profile-change invalidation, source failures, API protection and secret redaction.
-- The RomM fixture reproduces the `roms_folder` removal as applies and CORS as does not apply with changelog/profile citations. LLM responses in these regression tests are mocked; this is not evidence of real model quality or your actual configuration.
-- Chromium: dashboard, detail, settings and logs work; light/dark and 390px phone layout checked; no JavaScript page errors. The running cloud UI uses a clearly labelled, separate demo database with six fixtures.
-- Container image `ripe:stage1` builds through the optional verified-wheel offline helper. It starts as UID99/GID100 with a read-only root filesystem, reports healthy, serves the HTTP pages and fixture API, preserves timezone settings, and blocks notifications in demo mode. The smoke container had no homelab mounts or credentials. An initial source-file ownership failure was corrected and the image rebuilt successfully.
-- Unraid XML parses, Compose configuration validates, and `pip check` passes. The saved installation script was rerun successfully. The test runner emits one upstream Starlette/httpx deprecation warning; no tests are skipped or failing.
+- `python -m pytest -q`: **168 passed**, covering version forms, quiet-soak resets, patch exceptions, security targets, pending/history transitions, shared release caches, profile-change invalidation, source failures, API protection and secret redaction.
+- Synthetic RomM regression: obsolete `roms_folder` removal applies when configured; a CORS change does not apply when cross-origin clients are explicitly absent. Model responses are mocked, so these checks do not establish real model quality.
+- Chromium: dashboard, detail, settings and logs; light/dark themes; 390px phone layout; no JavaScript page errors. Demo data is isolated and cannot send notifications.
+- Container image built using the optional verified-wheel offline helper and started as UID99/GID100 with a read-only root filesystem. Health, HTTP pages, fixture APIs, timezone persistence and demo notification blocking passed. The smoke container had no deployment mounts or credentials.
+- Unraid XML parsing, Compose configuration validation and `pip check` passed. The test runner emitted one upstream Starlette/httpx deprecation warning.
 
-Still unverified on the real LAN:
+Per-deployment checks still required:
 
-1. NODE2's installed versions, image mappings/digests, Unraid mounts and HA update inventory.
-2. NODE2's Ollama port, installed model and real classification/applicability quality. No live LLM calls were made.
-3. Household timezone, NPM/Cloudflared exposure, authentication facts, relevant non-secret config keys and app dependencies. These remain editable; arbitrary configuration files are not mounted.
-4. HA token permissions, delivery through `script.notify_household`, and receipt of the scheduled weekly digest. Mocked request-routing/quiet-hour tests pass; no phone notification has been sent from this cloud build.
-5. The normal online Docker build on NODE2. In the cloud, the builder could fetch the official base image but its internal DNS could not reach package/proxy hosts; the offline helper used host-downloaded, TLS-verified wheels without disabling validation.
+1. Installed versions, repository mappings, registry digests, host mounts and Home Assistant inventory.
+2. Local Ollama connectivity, model availability and real classification/applicability quality.
+3. Timezone, exposure, authentication facts, relevant non-secret profile keys and dependency relationships.
+4. Home Assistant token permissions, configured notification script delivery and receipt of the weekly digest.
+5. Normal online Docker build availability. The offline helper was used because the development builder could not resolve package/proxy hosts; TLS and checksum verification stayed enabled.
 
-Public API calls were also restricted by the cloud's current allowlist. Required custom domains and reusable install/start instructions are saved in the environment draft. Saving the draft does not apply or publish it. Review/save the changes in environment settings, then publish when desired.
-
-Use the README's NODE2 acceptance checklist before treating Stage 1 as live-accepted. Ripe has not modified your homelab or run any update.
+Follow the README's deployment acceptance checklist before treating an installation as validated. Stage 1 performs no system updates.

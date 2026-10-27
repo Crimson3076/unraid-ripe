@@ -30,7 +30,7 @@ def validate_settings(data: dict, current: Settings) -> Settings:
     try:
         ZoneInfo(settings.timezone)
     except (ZoneInfoNotFoundError, ValueError):
-        raise ValueError('Choose an IANA timezone, for example America/New_York') from None
+        raise ValueError('Choose an IANA timezone') from None
     for field in ('quiet_start','quiet_end','digest_time'):
         value = getattr(settings,field)
         if not re.fullmatch(r'\d{2}:\d{2}', value):
@@ -38,10 +38,17 @@ def validate_settings(data: dict, current: Settings) -> Settings:
         time.fromisoformat(value)
     if set(settings.soak_days) != {'infrastructure','internet','general'} or any(type(v) is not int or not 0 <= v <= 365 for v in settings.soak_days.values()):
         raise ValueError('Set soak days for all three tiers (0–365)')
-    local_model_url(settings.ollama_url)
+    if settings.ollama_url:
+        local_model_url(settings.ollama_url)
     checked_url(settings.dashboard_url)
-    if not settings.notification_people or len(settings.notification_people)>20 or any(not re.fullmatch(r'[a-zA-Z0-9_-]{1,64}',p) for p in settings.notification_people):
-        raise ValueError('Specify household person names')
+    if len(settings.notification_people)>20 or any(not re.fullmatch(r'[a-zA-Z0-9_-]{1,64}',p) for p in settings.notification_people):
+        raise ValueError('Invalid notification recipients')
+    if settings.notification_script and not re.fullmatch(r'script\.[a-z0-9_]{1,100}',settings.notification_script):
+        raise ValueError('Use a Home Assistant script entity ID')
+    if settings.notifications_enabled and not settings.notification_script:
+        raise ValueError('Configure a Home Assistant script before enabling notifications')
+    if len(settings.notification_channel)>100:
+        raise ValueError('Notification channel is too long')
     if any(not re.fullmatch(r'[a-zA-Z0-9_.:/-]{1,100}',m) for m in (settings.local_model,settings.gemini_model)):
         raise ValueError('Invalid model name')
     return settings
@@ -69,7 +76,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     @app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, exc: RequestValidationError):
         return JSONResponse({'detail':'Invalid request'}, status_code=422)
-    allowed = os.getenv('RIPE_ALLOWED_HOSTS','localhost,127.0.0.1,::1,192.168.0.83,node2,NODE2').split(',')
+    allowed = os.getenv('RIPE_ALLOWED_HOSTS','localhost,127.0.0.1,::1').split(',')
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=[h.strip() for h in allowed])
 
     @app.middleware('http')
@@ -229,11 +236,13 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         if is_quiet(settings):
             raise HTTPException(409,'Quiet hours are active; nothing was sent')
         if not manager.runtime.ha_token:
-            raise HTTPException(409,'Configure HA_TOKEN securely in the Unraid template')
-        sent=await Notifier(manager.store,manager.runtime.ha_url,manager.runtime.ha_token).send(settings,'Test: Ripe is connected to your household notification script. No update has been performed.','ripe-test')
+            raise HTTPException(409,'Configure HA_TOKEN securely in your deployment')
+        if not manager.runtime.ha_url:
+            raise HTTPException(409,'Configure HA_URL in your deployment')
+        sent=await Notifier(manager.store,manager.runtime.ha_url,manager.runtime.ha_token).send(settings,'Test: Ripe is connected to your notification script. No update has been performed.','ripe-test')
         if not sent:
             raise HTTPException(502,'Household script call failed; see the source error log')
-        return {'sent':True,'script':'script.notify_household'}
+        return {'sent':True,'script':settings.notification_script}
 
     return app
 

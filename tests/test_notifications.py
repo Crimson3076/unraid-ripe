@@ -11,6 +11,13 @@ from ripe.notifications import Notifier, is_quiet
 from ripe.store import Store
 
 
+def configured_settings(**overrides):
+    return Settings(notifications_enabled=True,
+                    notification_script='script.send_update_alert',
+                    notification_people=['sample_user'],
+                    notification_channel='Updates', **overrides)
+
+
 def instant(value):
     return datetime.fromisoformat(value.replace('Z', '+00:00'))
 
@@ -51,20 +58,20 @@ def recorder():
     return calls, httpx.MockTransport(handler)
 
 
-async def test_send_only_uses_household_script_and_required_fields(store):
+async def test_send_only_uses_configured_script_and_required_fields(store):
     calls, transport = recorder()
     notifier = Notifier(store, 'http://homeassistant.local:8123', 'test-ha-secret', transport=transport)
-    settings = Settings(timezone='UTC', notifications_enabled=True, dashboard_url='http://192.168.0.83:8087')
+    settings = configured_settings(timezone='UTC', dashboard_url='http://10.20.30.40:8087')
     assert await notifier.send(settings, 'A test update notice', 'ripe-test', now=instant('2026-10-26T12:00:00Z'))
     assert len(calls) == 1
     request = calls[0]
     assert request.method == 'POST'
-    assert request.url.path == '/api/services/script/notify_household'
+    assert request.url.path == '/api/services/script/send_update_alert'
     assert request.headers['authorization'] == 'Bearer test-ha-secret'
     body = json.loads(request.content)
-    assert body == {'people': ['dallas'], 'title': 'Ripe',
-                    'message': 'A test update notice\nhttp://192.168.0.83:8087',
-                    'home_only': False, 'tag': 'ripe-test', 'channel': 'Home Alerts'}
+    assert body == {'people': ['sample_user'], 'title': 'Ripe',
+                    'message': 'A test update notice\nhttp://10.20.30.40:8087',
+                    'home_only': False, 'tag': 'ripe-test', 'channel': 'Updates'}
     assert 'test-ha-secret' not in json.dumps(store.logs())
 
 
@@ -77,7 +84,7 @@ async def test_default_off_missing_token_and_demo_never_send(store):
     settings.notifications_enabled = True
     await notifier.tick(settings, [], now=daytime, demo=True)
     no_token = Notifier(store, 'http://ha.local:8123', None, transport=transport)
-    assert not await no_token.send(settings, 'Notice', 'test', now=daytime)
+    assert not await no_token.send(configured_settings(timezone='UTC'), 'Notice', 'test', now=daytime)
     assert calls == []
 
 
@@ -92,7 +99,7 @@ def security_view():
 
 async def test_security_alert_defers_quiet_hours_then_sends_once_across_restart(store):
     calls, transport = recorder()
-    settings = Settings(timezone='America/New_York', notifications_enabled=True)
+    settings = configured_settings(timezone='America/New_York')
     store.set('digest-sent-for', '2026-10-26')
     notifier = Notifier(store, 'http://ha.local:8123', 'test-ha-secret', transport=transport)
     await notifier.tick(settings, [security_view()], now=instant('2026-10-26T12:59:59Z'))
@@ -109,7 +116,7 @@ async def test_security_alert_defers_quiet_hours_then_sends_once_across_restart(
 
 async def test_weekly_digest_during_quiet_hours_is_deferred_and_persistently_deduplicated(store):
     calls, transport = recorder()
-    settings = Settings(timezone='America/New_York', notifications_enabled=True,
+    settings = configured_settings(timezone='America/New_York',
                         digest_weekday=0, digest_time='07:00')
     notifier = Notifier(store, 'http://ha.local:8123', 'test-ha-secret', transport=transport)
     await notifier.tick(settings, [], now=instant('2026-10-26T11:00:00Z'))
@@ -131,11 +138,19 @@ async def test_failed_script_is_not_marked_delivered_or_logged_with_response_sec
         calls.append(request)
         return httpx.Response(401, text='private rejection payload test-ha-secret')
     notifier = Notifier(store, 'http://ha.local:8123', 'test-ha-secret', transport=httpx.MockTransport(handler))
-    settings = Settings(timezone='UTC', notifications_enabled=True)
+    settings = configured_settings(timezone='UTC')
     await notifier.tick(settings, [], now=instant('2026-10-26T12:00:00Z'))
     assert store.get('digest-sent-for') is None
     assert len(calls) == 1
     output = json.dumps(store.logs())
     assert 'private rejection payload' not in output
     assert 'test-ha-secret' not in output
-    assert 'household script request failed' in output
+    assert 'script request failed' in output
+
+
+async def test_enabled_without_a_configured_script_never_sends(store):
+    calls,transport=recorder()
+    notifier=Notifier(store,'http://ha.local:8123','test-ha-secret',transport=transport)
+    settings=Settings(timezone='UTC',notifications_enabled=True)
+    assert not await notifier.send(settings,'Notice','test',now=instant('2026-10-26T14:00:00Z'))
+    assert calls==[]

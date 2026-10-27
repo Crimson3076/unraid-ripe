@@ -12,7 +12,7 @@ from ripe.models import AppRecord, Release
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv('TZ', 'America/New_York')
-    runtime = Runtime(config_dir=tmp_path, disable_scheduler=True,
+    runtime = Runtime(config_dir=tmp_path, disable_scheduler=True, ha_url='http://ha.local:8123',
                       ha_token='ha-test-secret-do-not-display',
                       github_token='github-test-secret-do-not-display',
                       gemini_key='gemini-test-secret-do-not-display')
@@ -60,7 +60,7 @@ def test_settings_are_timezone_aware_persistent_and_never_return_secrets(client)
     {'timezone': 'Not/A-Timezone'}, {'quiet_start': '25:30'},
     {'quiet_end': '9:00'}, {'digest_time': '09:30:10'}, {'poll_hours': 0},
     {'soak_days': {'general': 14}}, {'ollama_url': 'https://public-model.example.com'},
-    {'ollama_url': 'http://user:secret@192.168.0.83:11434'},
+    {'ollama_url': 'http://user:secret@10.20.30.40:11434'},
     {'dashboard_url': 'http://localhost/?token=do-not-display'},
     {'demo_mode': True}, {'HA_TOKEN': 'do-not-display'},
 ])
@@ -82,7 +82,7 @@ def test_demo_is_isolated_from_real_inventory_and_cannot_notify(client):
     assert len(dashboard['apps']) >= 5
     assert all(v['app']['source'] == 'demo' for v in dashboard['apps'])
     assert real.apps() == []
-    change(client, 'patch', '/api/settings', json={'notifications_enabled': True})
+    change(client, 'patch', '/api/settings', json={'notifications_enabled': True, 'notification_script':'script.send_update_alert'})
     response = change(client, 'post', '/api/notifications/test')
     assert response.status_code == 409
     assert 'Demo' in response.json()['detail']
@@ -160,3 +160,47 @@ def test_mapping_rejects_non_string_without_internal_error(client):
     change(client,'post','/api/demo')
     response=change(client,'patch','/api/apps/demo-romm/mapping',json={'upstream_repo':123})
     assert response.status_code==422
+
+
+def test_public_defaults_do_not_choose_a_deployment_or_recipient():
+    from ripe.models import Settings
+    settings=Settings()
+    assert settings.timezone=='UTC'
+    assert settings.ollama_url==''
+    assert settings.dashboard_url=='http://localhost:8087'
+    assert settings.notification_script==''
+    assert settings.notification_people==[]
+    assert settings.notification_channel==''
+    assert settings.notifications_enabled is False
+
+
+def test_optional_integration_url_can_be_cleared(client):
+    response=change(client,'patch','/api/settings',json={'ollama_url':''})
+    assert response.status_code==200
+    assert response.json()['ollama_url']==''
+
+
+@pytest.mark.parametrize('script', ['notify.mobile_app_example', '../send_update_alert',
+    'script.send_update_alert/other', 'script.send_update_alert?token=private', 'script.', 'script.invalid-name'])
+def test_notification_script_is_limited_to_script_entity_ids(client,script):
+    response=change(client,'patch','/api/settings',json={'notification_script':script})
+    assert response.status_code==422
+
+
+def test_notification_route_is_user_configured_and_required_before_enable(client):
+    response=change(client,'patch','/api/settings',json={'notifications_enabled':True})
+    assert response.status_code==422
+    configured=change(client,'patch','/api/settings',json={
+        'notifications_enabled':True, 'notification_script':'script.send_update_alert',
+        'notification_people':['sample_user'], 'notification_channel':'Updates'})
+    assert configured.status_code==200
+    assert configured.json()['notification_script']=='script.send_update_alert'
+
+
+def test_unconfigured_runtime_does_not_choose_integration_hosts(tmp_path,monkeypatch):
+    for name in ('HA_URL','OLLAMA_URL','DASHBOARD_URL'):
+        monkeypatch.delenv(name,raising=False)
+    runtime=Runtime(config_dir=tmp_path,disable_scheduler=True)
+    assert runtime.ha_url==''
+    assert runtime.initial_settings().ollama_url==''
+    assert runtime.initial_settings().dashboard_url=='http://localhost:8087'

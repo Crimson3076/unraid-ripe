@@ -153,7 +153,7 @@ A :ro socket mount alone does not make the Docker daemon's API read-only.
     """
     ALLOWED = re.compile(r"^/(?:containers/json|containers/[a-fA-F0-9]{12,64}/json|images/(?:sha256%3A|sha256:)?[a-fA-F0-9]{12,64}/json|version)$")
 
-    def __init__(self, client: httpx.AsyncClient, host: str = "192.168.0.83"):
+    def __init__(self, client: httpx.AsyncClient, host: str = "localhost"):
         self.client = client
         self.host = host
 
@@ -469,7 +469,7 @@ def installed_unraid(path: str) -> str | None:
         return None
 
 
-async def collect(settings: Settings, *, github_token: str | None = None, ha_token: str | None = None, ha_url: str = "http://192.168.0.61:8123", docker_socket: str = "/var/run/docker.sock", templates_dir: str = "/host/templates", unraid_version_file: str = "/host/unraid-version", cache_get: Callable | None = None, cache_set: Callable | None = None, existing_apps: list[AppRecord] | None = None) -> tuple[list[AppRecord], list[Release], list[JSON]]:
+async def collect(settings: Settings, *, github_token: str | None = None, ha_token: str | None = None, ha_url: str = "", docker_socket: str = "/var/run/docker.sock", templates_dir: str = "/host/templates", unraid_version_file: str = "/host/unraid-version", cache_get: Callable | None = None, cache_set: Callable | None = None, existing_apps: list[AppRecord] | None = None) -> tuple[list[AppRecord], list[Release], list[JSON]]:
     existing = {a.id:a for a in existing_apps or []}
     apps: list[AppRecord] = []
     releases: list[Release] = []
@@ -483,12 +483,12 @@ async def collect(settings: Settings, *, github_token: str | None = None, ha_tok
             try:
                 transport = httpx.AsyncHTTPTransport(uds=docker_socket)
                 async with httpx.AsyncClient(transport=transport, base_url="http://docker", timeout=15, trust_env=False) as docker:
-                    apps.extend(await DockerReader(docker, host=urlparse(settings.dashboard_url).hostname or "192.168.0.83").apps(read_templates(templates_dir), existing))
+                    apps.extend(await DockerReader(docker, host=urlparse(settings.dashboard_url).hostname or "localhost").apps(read_templates(templates_dir), existing))
             except SourceError as exc:
                 error("docker", str(exc))
         else:
             error("docker", "Docker socket not mounted; mount read-only to enable discovery")
-        if ha_token:
+        if ha_token and ha_url:
             try:
                 states = await ha_states(local, ha_url, ha_token)
                 notes = await ha_release_notes(ha_url, ha_token, [e["entity_id"] for e in states if e.get("state")=="on"])
@@ -498,7 +498,7 @@ async def collect(settings: Settings, *, github_token: str | None = None, ha_tok
             except SourceError as exc:
                 error("home_assistant", str(exc))
         else:
-            error("home_assistant", "HA_TOKEN is not configured; Home Assistant discovery unavailable")
+            error("home_assistant", "HA_URL or HA_TOKEN is not configured; Home Assistant discovery unavailable")
         unraid = AppRecord(id="unraid:os", name="Unraid OS", source="unraid", installed_version=installed_unraid(unraid_version_file), upstream_repo=None, profile=existing["unraid:os"].profile if "unraid:os" in existing else Profile(tier="infrastructure", exposure="lan"))
         if not unraid.installed_version:
             unraid.error = "Unraid version file not mounted or version unrecognised"

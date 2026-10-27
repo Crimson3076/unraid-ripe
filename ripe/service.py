@@ -84,7 +84,7 @@ class Coordinator:
 
     def integration_status(self) -> dict:
         return {'docker_socket': 'present' if __import__('os').path.exists(self.runtime.docker_socket) else 'not mounted',
-                'home_assistant': 'token configured' if self.runtime.ha_token else 'token not configured',
+                'home_assistant': 'URL and token configured' if self.runtime.ha_token and self.runtime.ha_url else 'URL or token not configured',
                 'unraid': 'version file mounted' if __import__('os').path.isfile(self.runtime.unraid_version_file) else 'version file not mounted',
                 'gemini': 'key configured' if self.runtime.gemini_key else 'optional key not configured',
                 'github': 'token configured' if self.runtime.github_token else 'public API (no optional token)',
@@ -103,7 +103,7 @@ class Coordinator:
                 self.store.set('ollama_status', 'model available' if ready else 'configured model not installed')
                 return ready
         except (httpx.HTTPError, ValueError, TypeError, AttributeError):
-            self.store.set('ollama_status','unreachable; verify the Ollama endpoint on NODE2')
+            self.store.set('ollama_status','unreachable; verify the configured local Ollama endpoint')
             return False
 
     def request_poll(self) -> bool:

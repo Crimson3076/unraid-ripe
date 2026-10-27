@@ -38,10 +38,14 @@ def checked_url(value: str) -> str:
     return value.rstrip('/')
 
 
+def optional_url(value: str) -> str:
+    return checked_url(value) if value.strip() else ''
+
+
 @dataclass(repr=False)
 class Runtime:
     config_dir: Path = field(default_factory=lambda: Path(os.getenv('RIPE_CONFIG_DIR', '/config')))
-    ha_url: str = field(default_factory=lambda: checked_url(os.getenv('HA_URL', 'http://192.168.0.61:8123')))
+    ha_url: str = field(default_factory=lambda: optional_url(os.getenv('HA_URL', '')))
     ha_token: str | None = field(default_factory=lambda: os.getenv('HA_TOKEN') or None, repr=False)
     github_token: str | None = field(default_factory=lambda: os.getenv('GITHUB_TOKEN') or None, repr=False)
     gemini_key: str | None = field(default_factory=lambda: os.getenv('GEMINI_API_KEY') or None, repr=False)
@@ -54,10 +58,10 @@ class Runtime:
     def initial_settings(self) -> Settings:
         return Settings(
             timezone=system_timezone(),
-            ollama_url=checked_url(os.getenv('OLLAMA_URL', 'http://192.168.0.83:11434')),
+            ollama_url=optional_url(os.getenv('OLLAMA_URL', '')),
             local_model=os.getenv('LOCAL_MODEL', 'qwen3:8b'),
             gemini_model=os.getenv('GEMINI_MODEL', 'gemini-2.5-flash'),
-            dashboard_url=checked_url(os.getenv('DASHBOARD_URL', 'http://192.168.0.83:8087')),
+            dashboard_url=checked_url(os.getenv('DASHBOARD_URL', 'http://localhost:8087')),
         )
 
     def secret_values(self) -> list[str]:

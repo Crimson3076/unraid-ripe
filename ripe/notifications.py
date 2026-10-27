@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
 import hashlib
+import re
 import httpx
 from .models import Settings, AppView, utcnow
 from .store import Store
@@ -36,16 +37,18 @@ class Notifier:
         self.store, self.ha_url, self.ha_token, self.transport = store, ha_url, ha_token, transport
 
     async def send(self, settings: Settings, message: str, tag: str, *, now: datetime | None = None) -> bool:
-        if not settings.notifications_enabled or not self.ha_token or is_quiet(settings, now):
+        if (not settings.notifications_enabled or not self.ha_url or not self.ha_token
+            or not re.fullmatch(r'script\.[a-z0-9_]{1,100}', settings.notification_script)
+            or is_quiet(settings, now)):
             return False
         payload = {'people': settings.notification_people, 'title': 'Ripe',
                    'message': message + '\n' + settings.dashboard_url, 'home_only': False,
-                   'tag': tag, 'channel': 'Home Alerts'}
+                   'tag': tag, 'channel': settings.notification_channel}
         try:
             # Local HA traffic uses neither public proxy nor redirects, so tokens
             # cannot follow a redirect to another destination.
             async with httpx.AsyncClient(timeout=15, trust_env=False, follow_redirects=False, transport=self.transport) as client:
-                response = await client.post(self.ha_url + '/api/services/script/notify_household',
+                response = await client.post(self.ha_url + '/api/services/script/' + settings.notification_script.removeprefix('script.'),
                     headers={'Authorization': 'Bearer ' + self.ha_token}, json=payload)
                 response.raise_for_status()
             return True

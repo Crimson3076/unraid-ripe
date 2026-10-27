@@ -89,31 +89,31 @@ def test_profile_secrets_and_private_addresses_removed_but_relevant_keys_kept(mo
     monkeypatch.setenv('HA_TOKEN', 'this-is-a-long-secret-token')
     p = sanitize_profile(Profile(config={'filesystem': {'roms_folder':'roms'},
         'password':'dont-store-me', 'apiKey':'api-secret', 'accessToken':'access-secret', 'nested':{'token':'private','enabled':False},
-        'key':'abcd', 'url':'http://NODE2.local:1234/test', 'path':'/mnt/user/romm',
-        'description':'token=this-is-a-long-secret-token', 'host':'192.168.0.83'},
+        'key':'abcd', 'url':'http://test-host.local:1234/test', 'path':'/mnt/user/romm',
+        'description':'token=this-is-a-long-secret-token', 'host':'10.20.30.40'},
         notes='No browser clients on other origins'))
     text = p.model_dump_json()
-    for forbidden in ('dont-store-me','api-secret','access-secret','private"','abcd','NODE2','192.168.0.83','/mnt/user','this-is-a-long-secret-token'):
+    for forbidden in ('dont-store-me','api-secret','access-secret','private"','abcd','test-host','10.20.30.40','/mnt/user','this-is-a-long-secret-token'):
         assert forbidden not in text
     assert p.config['filesystem']['roms_folder'] == 'roms'
     assert p.config['nested']['enabled'] is False
 
 
 def test_cloud_payload_is_explicit_allowlist_and_redacts_network_paths_env():
-    result = public_payload('RomM @ NODE2.local 192.168.0.83', '5.3.0',
+    result = public_payload('RomM @ test-host.local 10.20.30.40', '5.3.0',
         'Public change. /mnt/user/appdata/config.yml HA_TOKEN=very-secret https://private.home/path')
     assert set(result) == {'app','version','public_release_notes'}
     text = json.dumps(result)
-    for forbidden in ('NODE2','192.168.0.83','/mnt/user','HA_TOKEN','very-secret','private.home'):
+    for forbidden in ('test-host','10.20.30.40','/mnt/user','HA_TOKEN','very-secret','private.home'):
         assert forbidden not in text
 
 
-@pytest.mark.parametrize('url', ['http://192.168.0.83:11434','http://ollama:11434','http://localhost:11434','http://127.0.0.1:11434'])
+@pytest.mark.parametrize('url', ['http://10.20.30.40:11434','http://ollama:11434','http://localhost:11434','http://127.0.0.1:11434'])
 def test_local_endpoint_allowed(url):
     assert local_model_url(url) == url
 
 
-@pytest.mark.parametrize('url', ['https://cloud.example.com','http://user:pass@192.168.0.83','http://169.254.169.254','file:///tmp/model'])
+@pytest.mark.parametrize('url', ['https://cloud.example.com','http://user:pass@10.20.30.40','http://169.254.169.254','file:///tmp/model'])
 def test_public_or_credentialed_endpoint_for_profiles_rejected(url):
     with pytest.raises(ValueError):
         local_model_url(url)
