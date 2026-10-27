@@ -16,6 +16,7 @@ import httpx
 import websockets
 
 from ripe.models import AppRecord, Profile, Release, Settings, utcnow
+from ripe.versions import compare_versions, parse_version, version_parts
 
 JSON = dict[str, Any]
 INFRA = re.compile(r"unraid|home.?assistant|adguard|nginx.?proxy.?manager|cloudflar|wireguard|mariadb|mysql|postgres|redis|mongo|pihole|pi.hole|traefik|caddy", re.I)
@@ -120,6 +121,10 @@ def read_templates(directory: str) -> dict[str, JSON]:
     return found
 
 
+# pydantic's ValidationError is a ValueError.
+PARSE_ERRORS = (AttributeError, TypeError, ValueError, KeyError)
+
+
 class SourceError(Exception):
     """Intentionally safe to persist: only fixed source labels and status codes."""
 
@@ -163,11 +168,12 @@ class DockerReader:
 
 A :ro socket mount alone does not make the Docker daemon's API read-only.
     """
-    ALLOWED = re.compile(r"^/(?:containers/json|containers/[a-fA-F0-9]{12,64}/json|images/(?:sha256%3A|sha256:)?[a-fA-F0-9]{12,64}/json|version)$")
+    ALLOWED = re.compile(r"^/(?:containers/json|images/(?:sha256%3A|sha256:)?[a-fA-F0-9]{12,64}/json)$")
 
     def __init__(self, client: httpx.AsyncClient, host: str = "localhost"):
         self.client = client
         self.host = host
+        self.skipped: list[str] = []
 
     async def read(self, path: str, params=None) -> Any:
         if not self.ALLOWED.fullmatch(path):
@@ -186,44 +192,54 @@ A :ro socket mount alone does not make the Docker daemon's API read-only.
             raise SourceError("Docker: invalid container list")
         apps = []
         image_cache = {}
+        self.skipped = []
         for item in containers[:1000]:
             if not isinstance(item, dict):
                 continue
             ident = str(item.get("Id", ""))
             if not re.fullmatch(r"[a-fA-F0-9]{12,64}", ident):
                 continue
-            name = next(iter(item.get("Names") or []), ident[:12]).strip("/")
-            key = "docker:" + name
-            previous = existing.get(key)
-            tpl = templates.get(name.lower(), {})
-            image_id = item.get("ImageID", "")
-            info = {}
-            if re.fullmatch(r"sha256:[a-fA-F0-9]{64}", image_id):
-                if image_id not in image_cache:
-                    image_cache[image_id] = await self.read("/images/" + quote(image_id, safe="") + "/json")
-                info = image_cache[image_id]
-            labels = dict(info.get("Config", {}).get("Labels") or {})
-            labels.update(item.get("Labels") or {})
-            image = item.get("Image", "")
-            # Only OCI metadata is retained. Never persist Config.Env or inspect blobs.
-            installed = usable_version_label(labels.get("org.opencontainers.image.version"))
-            host, repo, tag = parse_image(image)
-            if not installed and tag not in ("latest", "stable", "main", "master", "edge", "develop") and not tag.startswith("sha256:"):
-                installed = tag
-            digests = info.get("RepoDigests") or []
-            digest = next((d.rsplit("@", 1)[-1] for d in digests if "@sha256:" in d), None)
-            upstream = previous.upstream_repo if previous and previous.upstream_repo else github_repo(labels.get("org.opencontainers.image.source")) or tpl.get("repo")
-            if not (previous and previous.upstream_repo) and repo.startswith("linuxserver/"):
-                upstream = LINUXSERVER_UPSTREAM.get(repo.split("/", 1)[1], upstream)
-            profile = previous.profile if previous else inferred_profile(name + " " + repo)
-            ports = [{"private":p.get("PrivatePort"), "public":p.get("PublicPort")} for p in item.get("Ports", []) if isinstance(p, dict)]
-            web_url = tpl.get("web_url")
-            if web_url:
-                port_map = {p["private"]:p["public"] for p in ports if p.get("public")}
-                web_url = re.sub(r"\[PORT:(\d+)\]", lambda match:str(port_map.get(int(match.group(1)), match.group(1))), web_url.replace("[IP]", self.host))
-                web_url = safe_url(web_url)
-            apps.append(AppRecord(id=key, name=name, source="docker", installed_version=installed, image=image, installed_digest=digest, image_created_at=date(info.get("Created")), upstream_repo=upstream, icon=tpl.get("icon"), web_url=web_url, profile=profile, detected={"ports":ports, "revision": str(labels.get("org.opencontainers.image.revision", ""))[:80], "registry": host, "tag": tag}))
+            try:
+                apps.append(await self._app(item, ident, templates, existing, image_cache))
+            except (AttributeError, TypeError, ValueError, KeyError):
+                # One malformed record must not hide every other container.
+                self.skipped.append("docker:" + ident[:12])
         return apps
+
+    async def _app(self, item: JSON, ident: str, templates: dict[str, JSON], existing: dict[str, AppRecord], image_cache: dict) -> AppRecord:
+        name = next(iter(item.get("Names") or []), ident[:12]).strip("/")
+        key = "docker:" + name
+        previous = existing.get(key)
+        tpl = templates.get(name.lower(), {})
+        image_id = item.get("ImageID", "")
+        info = {}
+        if re.fullmatch(r"sha256:[a-fA-F0-9]{64}", image_id):
+            if image_id not in image_cache:
+                image_cache[image_id] = await self.read("/images/" + quote(image_id, safe="") + "/json")
+            info = image_cache[image_id]
+        if not isinstance(info, dict):
+            info = {}
+        labels = dict((info.get("Config") or {}).get("Labels") or {})
+        labels.update(item.get("Labels") or {})
+        image = item.get("Image", "")
+        # Only OCI metadata is retained. Never persist Config.Env or inspect blobs.
+        installed = usable_version_label(labels.get("org.opencontainers.image.version"))
+        host, repo, tag = parse_image(image)
+        if not installed and tag not in ("latest", "stable", "main", "master", "edge", "develop") and not tag.startswith("sha256:"):
+            installed = tag
+        digests = info.get("RepoDigests") or []
+        digest = next((d.rsplit("@", 1)[-1] for d in digests if "@sha256:" in d), None)
+        upstream = previous.upstream_repo if previous and previous.upstream_repo else github_repo(labels.get("org.opencontainers.image.source")) or tpl.get("repo")
+        if not (previous and previous.upstream_repo) and repo.startswith("linuxserver/"):
+            upstream = LINUXSERVER_UPSTREAM.get(repo.split("/", 1)[1], upstream)
+        profile = previous.profile if previous else inferred_profile(name + " " + repo)
+        ports = [{"private":p.get("PrivatePort"), "public":p.get("PublicPort")} for p in item.get("Ports") or [] if isinstance(p, dict)]
+        web_url = tpl.get("web_url")
+        if web_url:
+            port_map = {p["private"]:p["public"] for p in ports if p.get("public")}
+            web_url = re.sub(r"\[PORT:(\d+)\]", lambda match:str(port_map.get(int(match.group(1)), match.group(1))), web_url.replace("[IP]", self.host))
+            web_url = safe_url(web_url)
+        return (AppRecord(id=key, name=name, source="docker", installed_version=installed, image=image, installed_digest=digest, image_created_at=date(info.get("Created")), upstream_repo=upstream, icon=tpl.get("icon"), web_url=web_url, profile=profile, detected={"ports":ports, "revision": str(labels.get("org.opencontainers.image.revision", ""))[:80], "registry": host, "tag": tag}))
 
 
 def parse_image(image: str) -> tuple[str, str, str]:
@@ -321,7 +337,14 @@ class RegistryReader:
 
 
 def version_key(value: str) -> tuple:
+    """Loose ordering for registry tag candidates only; releases use ripe.versions."""
     return tuple(int(v) for v in re.findall(r"\d+", value)[:6])
+
+
+def latest_stable(releases: list[Release]) -> Release | None:
+    """Newest final release; unparseable tags and pre-releases never qualify."""
+    final = [r for r in releases if not r.prerelease and (v := parse_version(r.version)) is not None and not v.is_prerelease]
+    return max(final, key=lambda r: parse_version(r.version)) if final else None
 
 
 async def github_releases(http: CachedHTTP, repo: str, app_id: str, token: str | None = None, installed_version: str | None = None) -> list[Release]:
@@ -349,8 +372,8 @@ async def github_releases(http: CachedHTTP, repo: str, app_id: str, token: str |
             break
         # We intentionally retain historical base releases for the patch rule.
         if installed_version:
-            target = version_key(installed_version)
-            known = [version_key(r.version) for r in releases if version_key(r.version)]
+            target = version_parts(installed_version)
+            known = [k for r in releases if (k := version_parts(r.version))]
             if target and known and min(known) < target and any(len(k)>=3 and k[:2]==target[:2] and k[2]==0 for k in known):
                 complete = True
                 break
@@ -373,17 +396,17 @@ async def unraid_releases(http: CachedHTTP, installed: str | None, token: str | 
     if not isinstance(listing, list):
         raise SourceError("Unraid release notes: invalid directory listing")
     candidates = [r["name"] for r in listing if isinstance(r, dict) and re.fullmatch(r"\d+\.\d+\.\d+\.md", str(r.get("name", "")))]
-    target = version_key(installed or "")
+    target = version_parts(installed) or ()
     # Include the installed minor's base release for the patch exception. Fetch
     # only the documented selected span rather than all previous Unraid eras.
     if len(target) >= 2:
-        candidates = [n for n in candidates if version_key(n)[:2] >= target[:2]]
+        candidates = [n for n in candidates if version_parts(n[:-3])[:2] >= target[:2]]
     else:
-        candidates = sorted(candidates, key=version_key)[-10:]
+        candidates = sorted(candidates, key=lambda n: version_parts(n[:-3]))[-10:]
     releases = []
     if len(candidates) > 100:
         raise SourceError("Unraid release notes: selected history exceeds 100 records")
-    for filename in sorted(candidates, key=version_key):
+    for filename in sorted(candidates, key=lambda n: version_parts(n[:-3])):
         data = await http.get(prefix + "/" + filename + "?ref=main", headers=headers, source="Unraid release notes")
         if not isinstance(data, dict) or data.get("encoding") != "base64":
             raise SourceError("Unraid release notes: unsupported document encoding")
@@ -415,7 +438,7 @@ async def ha_states(client: httpx.AsyncClient, ha_url: str, token: str) -> list[
         # Copy only documented public update metadata; entity attributes can
         # contain arbitrary integration state which must not be persisted.
         keys = ("installed_version", "latest_version", "release_url", "release_summary", "title", "friendly_name", "entity_picture")
-        return [{"entity_id":e["entity_id"], "state":e.get("state"), "attributes":{k:e.get("attributes", {}).get(k) for k in keys}} for e in data if isinstance(e, dict) and str(e.get("entity_id", "")).startswith("update.")]
+        return [{"entity_id":e["entity_id"], "state":e.get("state"), "attributes":{k:(e.get("attributes") if isinstance(e.get("attributes"), dict) else {}).get(k) for k in keys}} for e in data if isinstance(e, dict) and str(e.get("entity_id", "")).startswith("update.")]
     except (httpx.HTTPError, ValueError, KeyError):
         raise SourceError("Home Assistant: connection or JSON error") from None
 
@@ -491,20 +514,32 @@ async def collect(settings: Settings, *, github_token: str | None = None, ha_tok
             try:
                 transport = httpx.AsyncHTTPTransport(uds=docker_socket)
                 async with httpx.AsyncClient(transport=transport, base_url="http://docker", timeout=15, trust_env=False) as docker:
-                    apps.extend(await DockerReader(docker, host=urlparse(settings.dashboard_url).hostname or "localhost").apps(read_templates(templates_dir), existing))
+                    reader = DockerReader(docker, host=urlparse(settings.dashboard_url).hostname or "localhost")
+                    apps.extend(await reader.apps(read_templates(templates_dir), existing))
+                    for skipped in reader.skipped:
+                        error(skipped, "Docker: container record parse error")
             except SourceError as exc:
                 error("docker", str(exc))
+            except PARSE_ERRORS:
+                error("docker", "Docker: parse error")
         else:
             error("docker", "Docker socket not mounted; mount read-only to enable discovery")
         if ha_token and ha_url:
             try:
                 states = await ha_states(local, ha_url, ha_token)
                 notes = await ha_release_notes(ha_url, ha_token, [e["entity_id"] for e in states if e.get("state")=="on"])
-                ha_apps, ha_notes = ha_records(states, notes, existing)
-                apps.extend(ha_apps)
-                releases.extend(ha_notes)
+                for state in states:
+                    try:
+                        ha_apps, ha_notes = ha_records([state], notes, existing)
+                    except PARSE_ERRORS:
+                        error("ha:" + str(state.get("entity_id")), "Home Assistant: entity parse error")
+                        continue
+                    apps.extend(ha_apps)
+                    releases.extend(ha_notes)
             except SourceError as exc:
                 error("home_assistant", str(exc))
+            except PARSE_ERRORS:
+                error("home_assistant", "Home Assistant: parse error")
         else:
             error("home_assistant", "Home Assistant connection is not configured; open Ripe Settings to enable discovery")
         unraid = AppRecord(id="unraid:os", name="Unraid OS", source="unraid", installed_version=installed_unraid(unraid_version_file), upstream_repo=None, profile=existing["unraid:os"].profile if "unraid:os" in existing else Profile(tier="infrastructure", exposure="lan"))
@@ -515,12 +550,14 @@ async def collect(settings: Settings, *, github_token: str | None = None, ha_tok
         try:
             os_releases = await unraid_releases(cached, unraid.installed_version, github_token)
             releases.extend(os_releases)
-            stable = [r for r in os_releases if not r.prerelease]
-            if stable:
-                unraid.latest_version = max(stable, key=lambda r:version_key(r.version)).version
+            if latest := latest_stable(os_releases):
+                unraid.latest_version = latest.version
         except SourceError as exc:
             unraid.error = str(exc)
             error("unraid", str(exc))
+        except PARSE_ERRORS:
+            unraid.error = "Unraid release notes: parse error"
+            error("unraid", unraid.error)
         apps.append(unraid)
         # Pagination can stop at an installed version's historical base. A
         # repository-only cache would silently give older installations the
@@ -550,6 +587,8 @@ async def collect(settings: Settings, *, github_token: str | None = None, ha_tok
                         error(app.id, "Registry tag list is incomplete; latest-only status is unknown")
                 except SourceError as exc:
                     error(app.id, str(exc))
+                except PARSE_ERRORS:
+                    error(app.id, "Registry: parse error")
             if app.upstream_repo:
                 cache_key = (app.upstream_repo, app.installed_version)
                 try:
@@ -559,23 +598,27 @@ async def collect(settings: Settings, *, github_token: str | None = None, ha_tok
                     if isinstance(upstream, str):
                         raise SourceError(upstream)
                     app_releases = [r.model_copy(update={"app_id":app.id}) for r in upstream]
-                    stable = [r for r in app_releases if not r.prerelease]
                     # GitHub's list is ordered by published_at, not semantic version.
-                    # For pinned/LTS/CalVer images, maximum numeric release is the
+                    # For pinned/LTS/CalVer images, the highest final release is the
                     # best public upstream candidate; channel differences remain visible.
-                    if stable:
-                        latest = max(stable, key=lambda r: version_key(r.version))
+                    if latest := latest_stable(app_releases):
                         if app.source != "home_assistant" or not app.latest_version:
                             app.latest_version = latest.version
                     # Prefer GitHub's dated full release over HA's undated summary.
-                    releases[:] = [r for r in releases if not (r.app_id==app.id and any(version_key(r.version)==version_key(g.version) for g in app_releases))]
+                    releases[:] = [r for r in releases if not (r.app_id==app.id and any(r.version==g.version or compare_versions(r.version, g.version)==0 for g in app_releases))]
                     releases.extend(app_releases)
                 except SourceError as exc:
                     upstream_cache[cache_key] = str(exc)
                     app.error = str(exc)
                     error(app.id, str(exc))
+                except PARSE_ERRORS:
+                    upstream_cache[cache_key] = "GitHub: parse error"
+                    app.error = "GitHub: parse error"
+                    error(app.id, "GitHub: parse error")
             elif app.source == "docker":
-                app.error = "No upstream repository mapping; choose one in the app profile"
+                # A missing mapping is a hint, not a source failure: the digest
+                # logic still gives a valid status for unmapped :latest images.
+                app.detected["mapping_hint"] = "No upstream repository mapping; choose one in the app profile"
             if not app.installed_version and app.image_created_at:
                 app.detected["version_fallback"] = "unknown (image date " + app.image_created_at.date().isoformat() + ")"
     return apps, releases, errors
