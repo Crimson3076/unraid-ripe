@@ -8,7 +8,7 @@ from ripe.models import AppRecord
 from ripe.sources.collector import (
     CachedHTTP, DockerReader, SourceError, RegistryReader, github_repo,
     github_releases, ha_records, ha_states, installed_unraid, parse_image,
-    read_templates,
+    read_templates, usable_version_label,
 )
 
 
@@ -257,3 +257,13 @@ async def test_same_repo_different_installed_versions_fetch_complete_spans(monke
     assert next(a for a in found_apps if a.id=='docker:old').latest_version == '2.1.98'
     # Public page response caching still avoids duplicate network traffic.
     assert requests == [1,2,3]
+
+
+@pytest.mark.parametrize('value', ['24.04', '22.04', 'debian', 'Alpine', 'bookworm', 'jammy', 'noble', '$APP_VERSION', '${APP_VERSION}', 'latest', '', None])
+def test_base_image_version_label_is_ignored(value):
+    assert usable_version_label(value) is None
+
+
+@pytest.mark.parametrize('value', ['1.37.4', 'v0.9.0-rc.3', '2024.10.1', '24.04.1'])
+def test_real_version_label_is_accepted(value):
+    assert usable_version_label(value) == value

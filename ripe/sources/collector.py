@@ -32,6 +32,18 @@ LINUXSERVER_UPSTREAM = {
 }
 ACCEPT_MANIFEST = ", ".join(("application/vnd.oci.image.index.v1+json", "application/vnd.docker.distribution.manifest.list.v2+json", "application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.v2+json"))
 
+BASE_OS_LABEL = re.compile(r"\d{2}\.\d{2}|\$\{?\w+\}?|(?:ubuntu|debian|alpine|bookworm|bullseye|buster|trixie|focal|jammy|noble|oracular|plucky|centos|fedora|rockylinux|almalinux|busybox|scratch)(?:[-: ]?[\d.]+)?", re.I)
+
+
+def usable_version_label(value: Any) -> str | None:
+    """Return the OCI version label unless it is unset, a placeholder or a base-image release."""
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value or len(value) > 100 or value.lower() in ("latest", "unknown", "develop", "master", "main"):
+        return None
+    return None if BASE_OS_LABEL.fullmatch(value) else value
+
 
 def date(value: Any) -> datetime | None:
     if not isinstance(value, str):
@@ -194,11 +206,7 @@ A :ro socket mount alone does not make the Docker daemon's API read-only.
             labels.update(item.get("Labels") or {})
             image = item.get("Image", "")
             # Only OCI metadata is retained. Never persist Config.Env or inspect blobs.
-            installed = labels.get("org.opencontainers.image.version")
-            if not isinstance(installed, str):
-                installed = None
-            if installed and (len(installed) > 100 or installed.lower() in ("latest", "unknown", "develop", "master", "main")):
-                installed = None
+            installed = usable_version_label(labels.get("org.opencontainers.image.version"))
             host, repo, tag = parse_image(image)
             if not installed and tag not in ("latest", "stable", "main", "master", "edge", "develop") and not tag.startswith("sha256:"):
                 installed = tag
