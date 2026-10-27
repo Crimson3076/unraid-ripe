@@ -12,4 +12,4 @@ Guidance for coding agents and reviewers. Coding agents also follow CLAUDE.md.
 - Flag behaviour changes that have no test, and tests that no longer exercise the code they claim to cover.
 
 ### Scope
-- Flag changes to CI workflows, Dockerfiles, dependency/lock files or migrations unless the linked issue asks for them.
+- Flag changes to CI workflows, Dockerfiles, dependency/lock files, migrations, or auth and secret-handling code unless the linked issue asks for them.
