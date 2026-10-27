@@ -202,6 +202,28 @@
     try{connection=await api('/api/connections/home-assistant');$('#ha-url').value=connection.url||'';render();}
     catch(error){text('#ha-connection-result',error.message);}
   }
+  async function initApiCredential(name) {
+    const form=$(`#${name}-form`),input=$(`#${name}-secret`),route=`/api/connections/${name}`;let state=null,working=false;
+    const render=()=>{
+      const locked=working||!state||state.demo;
+      $$('input,button',form).forEach(field=>field.disabled=locked);
+      $(`#${name}-test`).disabled=locked||!state.configured;
+      $(`#${name}-clear`).disabled=locked||state.source!=='app';
+      text(`#${name}-status`,state?(state.demo?'Leave demo mode to configure live credentials.':state.status):'');
+    };
+    const action=async kind=>{
+      if(working||state?.demo)return;
+      working=true;render();text(`#${name}-result`,'Working…');
+      try{
+        if(kind==='save'){const body=name==='github'?{token:input.value}:{api_key:input.value};state=await api(route,{method:'PUT',body:JSON.stringify(body)});input.value='';text(`#${name}-result`,'Saved.');}
+        else if(kind==='clear'){state=await api(route,{method:'DELETE'});input.value='';text(`#${name}-result`,'Saved value cleared.');}
+        else{const result=await api(route+'/test',{method:'POST'});text(`#${name}-result`,result.message);}
+      }catch(error){text(`#${name}-result`,error.message);}finally{working=false;render();}
+    };
+    form.onsubmit=event=>{event.preventDefault();void action('save');};
+    $(`#${name}-test`).onclick=()=>action('test');$(`#${name}-clear`).onclick=()=>action('clear');render();
+    try{state=await api(route);render();}catch(error){text(`#${name}-result`,error.message);}
+  }
   function initIconCopy(){
     $('#copy-icon-url').onclick=async event=>{
       const field=$('#unraid-icon-url'),button=event.currentTarget;let copied=false;
@@ -211,7 +233,7 @@
     };
   }
   async function initSettings() {
-    void initHomeAssistant();initIconCopy();
+    void initHomeAssistant();void initApiCredential('github');void initApiCredential('gemini');initIconCopy();
     let settings;
     try{settings=await api('/api/settings');zone=settings.timezone||zone;demoContext(settings.demo_mode);if(settings.demo_mode){$('#test-notification').disabled=true;$('#test-notification').title='Demo mode never sends notifications';$('#settings-form').insertAdjacentHTML('beforebegin','<div class="demo-banner">'+icon('flask')+'Demo preferences are isolated from your live settings. Leave the demo from Overview to configure your homelab.</div>');}setForm($('#settings-form'),settings);$('#settings-form').hidden=false;$('#settings-loading').hidden=true;text('#footer-timezone',`Ripe · ${zone}`);}catch(error){$('#settings-loading').hidden=true;errorAt('#settings-error',error);return;}
     $('#browser-timezone').onclick=()=>{$('#settings-form').elements.timezone.value=Intl.DateTimeFormat().resolvedOptions().timeZone;};

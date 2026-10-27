@@ -73,11 +73,26 @@ recipients, tokens or app profiles.
 | `RIPE_CONFIG_DIR` | Private Ripe data directory | `/config` |
 | `RIPE_ALLOWED_HOSTS` | Comma-separated UI hostnames/IPs without ports | Loopback names/addresses |
 
-The Home Assistant token is entered in its own password field in Ripe Settings.
-GitHub/Gemini secrets still use masked template fields or a local `.env`. Saved
-token values are never returned to the browser. A GitHub token needs no write
-permissions. Gemini is optional and falls back to local classification on errors
-or rate limits.
+The Home Assistant token, GitHub token and Gemini API key can each be entered in
+their own password field in Ripe Settings; the environment variables above remain
+a fallback. Saved values are never returned to the browser: Settings shows only
+"Set (from Settings)", "Set (from environment)" or "Not set".
+
+- **Precedence:** a value saved in Settings overrides the environment variable;
+  with nothing saved, the environment variable is used.
+- **Blank submit:** an empty field keeps the current value and never copies an
+  environment value into Settings.
+- **Clear:** removes only that provider's saved value and restores the
+  environment fallback immediately and after restart ("Not set" if there is none).
+- **Test:** checks the currently effective credential. GitHub calls
+  `/rate_limit` and shows the hourly core limit; Gemini lists models. A new value
+  must be saved before it is tested.
+- **Storage:** `/config/secrets/github.json` and `gemini.json` (0600, directory
+  0700), separate from settings and profiles. Changes apply to the next poll
+  without a restart.
+
+A GitHub token needs no write permissions. Gemini is optional and falls back to
+local classification on errors or rate limits.
 
 ### Home Assistant connection
 

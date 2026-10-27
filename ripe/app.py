@@ -227,6 +227,51 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         except ValueError:
             raise HTTPException(409, 'Save a valid Home Assistant connection in Settings, then test it again') from None
 
+    def credential_routes(name, label):
+        route = '/api/connections/' + name
+
+        @app.get(route, name=name + '_get')
+        async def get_credential(request: Request):
+            manager = request.app.state.manager
+            if manager.demo:
+                return {'source': 'demo', 'configured': False, 'status': 'Not set', 'last_test': None, 'demo': True}
+            return {**manager.api_credentials[name].public(), 'demo': False}
+
+        @app.put(route, name=name + '_put')
+        async def put_credential(request: Request, data: dict = Body(...)):
+            manager = request.app.state.manager
+            if manager.demo:
+                raise HTTPException(409, f'Leave demo mode before configuring the live {label}')
+            try:
+                return {**manager.change_api_credential(name, data), 'demo': False}
+            except ValueError:
+                raise HTTPException(422, f'Invalid {label}: use a value without spaces or control characters') from None
+            except OSError:
+                raise HTTPException(500, f'Could not save the private {label}; check /config permissions') from None
+
+        @app.delete(route, name=name + '_delete')
+        async def delete_credential(request: Request):
+            manager = request.app.state.manager
+            if manager.demo:
+                raise HTTPException(409, f'Leave demo mode before changing the live {label}')
+            try:
+                return {**manager.change_api_credential(name, clear=True), 'demo': False}
+            except (ValueError, OSError):
+                raise HTTPException(500, f'Could not clear the private {label}; check /config permissions') from None
+
+        @app.post(route + '/test', name=name + '_test')
+        async def test_credential(request: Request):
+            manager = request.app.state.manager
+            if manager.demo:
+                raise HTTPException(409, f'Demo mode never uses your live {label}')
+            try:
+                return await manager.api_credentials[name].test()
+            except ValueError:
+                raise HTTPException(409, f'Set a {label} in Settings (or the environment), then test it again') from None
+
+    credential_routes('github', 'GitHub token')
+    credential_routes('gemini', 'Gemini API key')
+
     @app.patch('/api/settings')
     async def save_settings(request:Request,data:dict=Body(...)):
         manager=request.app.state.manager

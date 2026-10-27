@@ -29,6 +29,11 @@ class Coordinator:
         from .connections import HomeAssistantConnection
         self.ha_connection = HomeAssistantConnection(runtime.config_dir, runtime.ha_url, runtime.ha_token)
         runtime.ha_url, runtime.ha_token = self.ha_connection.credentials()
+        from .connections import ApiCredential
+        self.api_credentials = {
+            'github': ApiCredential(runtime.config_dir, 'github', 'token', runtime.github_token),
+            'gemini': ApiCredential(runtime.config_dir, 'gemini', 'api_key', runtime.gemini_key)}
+        self.apply_api_credentials()
         self.real_store = Store(runtime.config_dir / 'ripe.sqlite3', runtime.secret_values())
         if self.real_store.get('settings') is None:
             self.real_store.save_settings(runtime.initial_settings())
@@ -53,6 +58,25 @@ class Coordinator:
             raise ValueError('Leave demo mode before changing the live Home Assistant connection')
         public = self.ha_connection.disconnect() if disconnect else self.ha_connection.save(data)
         self.runtime.ha_url, self.runtime.ha_token = self.ha_connection.credentials()
+        for store in (self.real_store, self.demo_store):
+            if store:
+                store.secrets = self.runtime.secret_values()
+        if self.polling:
+            self.real_store.set('poll_again', True)
+        else:
+            self.request_poll()
+        return public
+
+    def apply_api_credentials(self):
+        self.runtime.github_token = self.api_credentials['github'].effective()
+        self.runtime.gemini_key = self.api_credentials['gemini'].effective()
+
+    def change_api_credential(self, name: str, data: dict | None = None, *, clear=False) -> dict:
+        if self.demo:
+            raise ValueError('Leave demo mode before changing live credentials')
+        credential = self.api_credentials[name]
+        public = credential.clear() if clear else credential.save(data)
+        self.apply_api_credentials()
         for store in (self.real_store, self.demo_store):
             if store:
                 store.secrets = self.runtime.secret_values()
