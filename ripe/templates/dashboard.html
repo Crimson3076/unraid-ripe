@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}Overview{% endblock %}
+{% block page %}dashboard{% endblock %}
+{% block content %}
+  <div id="demo-banner" class="demo-banner" hidden><span data-icon="flask"></span><div><strong>Demo orchard</strong> · This is synthetic data. No connection to your homelab and no notifications.</div></div>
+  <section class="page-heading">
+    <div><div class="eyebrow">YOUR UPDATES, WITHOUT THE GUESSWORK</div><h1>Good updates take time<span class="accent">.</span></h1><p>See what changed. Understand what matters. Update when it’s ripe.</p></div>
+    <button id="poll-button" class="button primary" type="button"><span data-icon="refresh"></span>Check for updates</button>
+  </section>
+  <section class="summary-grid" aria-label="Update status summary" id="summary-grid">
+    <button class="summary-card" data-filter="ripe" type="button"><span class="summary-icon ripe" data-icon="check"></span><span class="summary-number" id="count-ripe">—</span><span class="summary-label">Ripe for an update</span><span class="summary-note">The waiting period is over</span></button>
+    <button class="summary-card" data-filter="recommended_now" type="button"><span class="summary-icon recommended_now" data-icon="shield"></span><span class="summary-number" id="count-recommended_now">—</span><span class="summary-label">Security recommendations</span><span class="summary-note">Worth your attention now</span></button>
+    <button class="summary-card" data-filter="read_first" type="button"><span class="summary-icon read_first" data-icon="book"></span><span class="summary-number" id="count-read_first">—</span><span class="summary-label">Read first</span><span class="summary-note">Changes that may affect you</span></button>
+    <button class="summary-card" data-filter="waiting" type="button"><span class="summary-icon waiting" data-icon="clock"></span><span class="summary-number" id="count-waiting">—</span><span class="summary-label">Still ripening</span><span class="summary-note">A little more time on the branch</span></button>
+  </section>
+  <section aria-labelledby="inventory-title" class="inventory-section">
+    <div class="section-heading"><div><h2 id="inventory-title">Your applications <span class="count-pill" id="app-count">0</span></h2><p id="last-check" class="muted">Connecting to your inventory…</p></div><label class="search-field"><span data-icon="search"></span><span class="sr-only">Search applications</span><input id="app-search" type="search" placeholder="Find an application…" autocomplete="off"></label></div>
+    <div class="filters" aria-label="Filter application status"><button class="filter active" data-filter="all" type="button">All apps</button><button class="filter" data-filter="attention" type="button">Needs attention</button><button class="filter" data-filter="ripe" type="button">Ripe</button><button class="filter" data-filter="waiting" type="button">Waiting</button><button class="filter" data-filter="up_to_date" type="button">Up to date</button></div>
+    <div id="dashboard-error" class="notice danger" role="alert" hidden></div>
+    <div id="app-groups" aria-live="polite"><div class="loading-panel"><span class="spinner"></span> Gathering your update picture…</div></div>
+    <div id="empty-state" class="empty-state" hidden><div class="empty-illustration"><img src="/static/icon.svg" width="74" height="74" alt=""></div><div class="eyebrow">A LITTLE SETUP, THEN A LITTLE PATIENCE</div><h2>Your homelab starts here.</h2><p>Connect the read-only Docker socket, Unraid version file, and Home Assistant in your Unraid template. Ripe will build your inventory on its next check.</p><div class="button-row"><a class="button primary" href="/settings">Review settings <span data-icon="arrow"></span></a><button class="button secondary" type="button" id="demo-button"><span data-icon="flask"></span>Explore a sample dashboard</button></div><p class="fine-print">Sample data is clearly labeled and never sends notifications.</p></div>
+  </section>
+  <section id="integration-panel" class="integration-panel" aria-label="Data source status" hidden></section>
+  <div class="explanation-bar"><span data-icon="sprout"></span><p><strong>Patience is a feature.</strong> Ripe watches release notes and waits for things to settle. Security fixes and relevant breaking changes rise to the top.</p></div>
+{% endblock %}

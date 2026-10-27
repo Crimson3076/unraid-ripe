@@ -1,0 +1,41 @@
+services:
+  ripe:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: ripe:stage1
+    container_name: ripe
+    restart: unless-stopped
+    user: "99:100"
+    group_add:
+      - "${DOCKER_GID:-0}"
+    ports:
+      - "${RIPE_BIND_IP:-127.0.0.1}:8087:8087"
+    environment:
+      RIPE_CONFIG_DIR: /config
+      RIPE_ALLOWED_HOSTS: "${RIPE_ALLOWED_HOSTS:-localhost,127.0.0.1,::1,192.168.0.83,node2,NODE2}"
+      TZ: "${TZ:-America/New_York}"
+      HA_URL: "${HA_URL:-http://192.168.0.61:8123}"
+      HA_TOKEN: "${HA_TOKEN:-}"
+      GITHUB_TOKEN: "${GITHUB_TOKEN:-}"
+      GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
+      OLLAMA_URL: "${OLLAMA_URL:-http://192.168.0.83:11434}"
+      LOCAL_MODEL: "${LOCAL_MODEL:-qwen3:8b}"
+      GEMINI_MODEL: "${GEMINI_MODEL:-gemini-2.5-flash}"
+    volumes:
+      - "${RIPE_APPDATA:-/mnt/user/appdata/ripe}:/config"
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /boot/config/plugins/dockerMan/templates-user:/host/templates:ro
+      - /etc/unraid-version:/host/unraid-version:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

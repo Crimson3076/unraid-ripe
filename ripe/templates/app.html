@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block title %}Application{% endblock %}
+{% block page %}app{% endblock %}
+{% block content %}
+  <a href="/" class="back-link"><span data-icon="arrow-left"></span>All applications</a>
+  <div id="detail-error" class="notice danger" role="alert" hidden></div>
+  <div id="app-detail"><div class="loading-panel"><span class="spinner"></span> Reading this application’s release history…</div></div>
+{% endblock %}

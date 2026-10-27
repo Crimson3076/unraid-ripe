@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Container version="2">
+  <Name>ripe</Name>
+  <Repository>ripe:stage1</Repository>
+  <Registry/>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/Crimson3076/unraid-ripe/issues</Support>
+  <Project>https://github.com/Crimson3076/unraid-ripe</Project>
+  <Overview>Read-only, evidence-backed updates for Unraid, Docker and Home Assistant. Stage 1 tracks and explains updates; it never pulls images, executes commands or installs updates. Build ripe:stage1 locally before installing. Notifications start disabled. Review the timezone, LAN binding, Ollama URL and read-only mounts.</Overview>
+  <Category>Tools: Network:Management</Category>
+  <WebUI>http://192.168.0.83:8087/</WebUI>
+  <TemplateURL>https://raw.githubusercontent.com/Crimson3076/unraid-ripe/main/deploy/my-ripe.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/Crimson3076/unraid-ripe/main/ripe/static/icon.svg</Icon>
+  <ExtraParams>--publish=192.168.0.83:8087:8087 --user=99:100 --group-add=0 --read-only --tmpfs=/tmp:rw,nosuid,nodev,size=32m --cap-drop=ALL --security-opt=no-new-privileges:true</ExtraParams>
+  <PostArgs/>
+  <CPUset/>
+  <DateInstalled/>
+  <DonateText/>
+  <DonateLink/>
+  <Requires>Locally built ripe:stage1 image; NODE2 LAN access; HA long-lived token for HA discovery and optional household notifications; Ollama on NODE2 for classification.</Requires>
+  <Config Name="Appdata" Target="/config" Default="/mnt/user/appdata/ripe" Mode="rw" Description="Ripe SQLite database and local cache. The container writes only its own appdata." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/ripe</Config>
+  <Config Name="Docker socket (read-only mount)" Target="/var/run/docker.sock" Default="/var/run/docker.sock" Mode="ro" Description="Ripe restricts the Docker client to container/image GET requests. The ro mount alone does not restrict Docker API methods." Type="Path" Display="always" Required="true" Mask="false">/var/run/docker.sock</Config>
+  <Config Name="Unraid templates (read only)" Target="/host/templates" Default="/boot/config/plugins/dockerMan/templates-user" Mode="ro" Description="Only project, icon and WebUI mapping metadata is read. Template environment variables are ignored." Type="Path" Display="advanced" Required="true" Mask="false">/boot/config/plugins/dockerMan/templates-user</Config>
+  <Config Name="Unraid version (read only)" Target="/host/unraid-version" Default="/etc/unraid-version" Mode="ro" Description="Installed Unraid version file." Type="Path" Display="advanced" Required="true" Mask="false">/etc/unraid-version</Config>
+  <Config Name="Allowed WebUI hosts" Target="RIPE_ALLOWED_HOSTS" Default="localhost,127.0.0.1,::1,192.168.0.83,node2,NODE2" Mode="" Description="Comma-separated WebUI hostnames/IPs, without ports. Change this if NODE2 has a different LAN address. Do not use a wildcard." Type="Variable" Display="advanced" Required="true" Mask="false">localhost,127.0.0.1,::1,192.168.0.83,node2,NODE2</Config>
+  <Config Name="Timezone" Target="TZ" Default="America/New_York" Mode="" Description="Use NODE2's IANA timezone (for example America/New_York). Quiet hours and digest scheduling use this timezone. Editable in Ripe Settings." Type="Variable" Display="always" Required="true" Mask="false">America/New_York</Config>
+  <Config Name="Home Assistant URL" Target="HA_URL" Default="http://192.168.0.61:8123" Mode="" Description="Home Assistant on the Raspberry Pi." Type="Variable" Display="always" Required="true" Mask="false">http://192.168.0.61:8123</Config>
+  <Config Name="Home Assistant token" Target="HA_TOKEN" Default="" Mode="" Description="Long-lived token, entered here securely. Required for update entity discovery and script.notify_household. Never paste it into the UI profile or Git." Type="Variable" Display="always" Required="false" Mask="true"/>
+  <Config Name="Ollama URL on NODE2" Target="OLLAMA_URL" Default="http://192.168.0.83:11434" Mode="" Description="Confirm the published port on NODE2. Do not point at the gaming PC. Local profile analysis always uses this service." Type="Variable" Display="always" Required="true" Mask="false">http://192.168.0.83:11434</Config>
+  <Config Name="Local model" Target="LOCAL_MODEL" Default="qwen3:8b" Mode="" Description="Installed Ollama model name; a 14B model can be selected instead. Ripe does not pull models." Type="Variable" Display="always" Required="true" Mask="false">qwen3:8b</Config>
+  <Config Name="GitHub token (optional)" Target="GITHUB_TOKEN" Default="" Mode="" Description="Optional token for higher public GitHub release API rate limits. No write scopes are needed." Type="Variable" Display="advanced" Required="false" Mask="true"/>
+  <Config Name="Gemini API key (optional)" Target="GEMINI_API_KEY" Default="" Mode="" Description="Optional public changelog classification or second opinion. Profiles and configs never go to Gemini." Type="Variable" Display="advanced" Required="false" Mask="true"/>
+  <Config Name="Gemini model" Target="GEMINI_MODEL" Default="gemini-2.5-flash" Mode="" Description="Model identifier; availability and free-tier quotas vary. Gemini is optional and falls back to local." Type="Variable" Display="advanced" Required="false" Mask="false">gemini-2.5-flash</Config>
+</Container>

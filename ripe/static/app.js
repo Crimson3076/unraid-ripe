@@ -1,0 +1,216 @@
+'use strict';
+(() => {
+  const paths = {
+    grid:'<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>',
+    activity:'<path d="M3 12h4l3-8 4 16 3-8h4"/>',
+    settings:'<path d="m9 3-1 3-3 1-2 4 2 3v4l4 2 3-1 3 1 4-2v-4l2-3-2-4-3-1-1-3Z"/><circle cx="12" cy="12" r="3"/>',
+    shield:'<path d="M12 3 4 6v5c0 5 4 8 8 10 4-2 8-5 8-10V6l-8-3Z"/><path d="m8.5 12 2.5 2.5 4.5-5"/>',
+    lock:'<rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/>',
+    moon:'<path d="M20.5 13A8.5 8.5 0 0 1 11 3.5 8.5 8.5 0 1 0 20.5 13Z"/>',
+    sun:'<circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5"/>',
+    refresh:'<path d="M20 8a8 8 0 0 0-14-2L3 9m0-6v6h6M4 16a8 8 0 0 0 14 2l3-3m0 6v-6h-6"/>',
+    check:'<path d="m5 12 4 4L19 6"/>',
+    book:'<path d="M12 5c-3-2-6-2-9-1v15c3-1 6-1 9 1 3-2 6-2 9-1V4c-3-1-6-1-9 1Zm0 0v15"/>',
+    clock:'<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+    search:'<circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/>',
+    arrow:'<path d="M4 12h16m-6-6 6 6-6 6"/>',
+    'arrow-left':'<path d="M20 12H4m6-6-6 6 6 6"/>',
+    chevron:'<path d="m9 5 7 7-7 7"/>',
+    sprout:'<path d="M12 21v-9M12 13C5 13 3 8 3 4c7-1 10 3 9 9Zm0 4c0-7 4-10 9-10 0 6-3 10-9 10Z"/>',
+    flask:'<path d="M9 3h6m-5 0v6l-6 10c-.5 1 0 2 1.5 2h13c1.5 0 2-1 1.5-2L14 9V3M7 15h10"/>',
+    bell:'<path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4"/>',
+    sparkles:'<path d="m12 3 2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5L12 3ZM20 2v4m-2-2h4"/>',
+    server:'<rect x="3" y="3" width="18" height="7" rx="2"/><rect x="3" y="14" width="18" height="7" rx="2"/><path d="M7 6.5h.01M7 17.5h.01M11 6.5h6m-6 11h6"/>',
+    globe:'<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a17 17 0 0 1 0 18 17 17 0 0 1 0-18Z"/>',
+    box:'<path d="m12 3 9 5v9l-9 5-9-5V8l9-5Zm0 9v10M3 8l9 4 9-4M7 5.5l9 4.5"/>',
+    alert:'<path d="m12 3 10 18H2L12 3Zm0 6v5m0 3h.01"/>',
+    bug:'<rect x="7" y="7" width="10" height="13" rx="5"/><path d="m9 3 1 4m5-4-1 4M3 9l4 2m10 0 4-2M3 15h4m10 0h4M5 21l3-3m8 0 3 3M7 12h10"/>',
+    external:'<path d="M14 3h7v7m0-7L10 14M10 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-5"/>',
+    help:'<circle cx="12" cy="12" r="9"/><path d="M9 9a3 3 0 0 1 6 0c0 2-3 2-3 4m0 4h.01"/>',
+    scales:'<path d="M12 3v18m-5 0h10M4 7h16M6 7l-4 7h8L6 7Zm12 0-4 7h8l-4-7Z"/>',
+    history:'<path d="M3 11a9 9 0 1 1 2 7M3 5v6h6m3-4v5l3 2"/>',
+  };
+  const icon = name => `<svg viewBox="0 0 24 24" aria-hidden="true">${paths[name] || paths.box}</svg>`;
+  const h = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const $ = (selector, scope=document) => scope.querySelector(selector);
+  const $$ = (selector, scope=document) => [...scope.querySelectorAll(selector)];
+  const text = (selector, value) => {const el=$(selector);if(el)el.textContent=value;};
+  const hydrateIcons = (scope=document) => $$('[data-icon]', scope).forEach(el => {el.innerHTML=icon(el.dataset.icon);});
+  const page = document.body.dataset.page;
+  const labels = {ripe:'Ripe', waiting:'Waiting', recommended_now:'Recommended now', read_first:'Read first', up_to_date:'Up to date', unknown:'Unknown'};
+  const statusIcons = {ripe:'check',waiting:'clock',recommended_now:'shield',read_first:'book',up_to_date:'check',unknown:'help'};
+  const tags = {bugfix:['bug','Fixes'],security:['shield','Security'],breaking:['alert','Breaking'],migration:['arrow','Migration'],big_feature:['sparkles','Big features'],deprecation:['clock','Deprecation'],performance:['activity','Performance'],docs_only:['book','Documentation']};
+  const tiers = {infrastructure:{name:'Infrastructure',description:'The foundations of your homelab',icon:'server'},internet:{name:'Internet-facing apps',description:'Applications exposed to the outside world',icon:'globe'},general:{name:'Everything else',description:'Media, tools, and the rest of your world',icon:'box'}};
+  const sources = {docker:'Docker container',home_assistant:'Home Assistant',unraid:'Unraid OS',demo:'Sample application'};
+  let zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  let toastTimer;
+  let dashboardData;
+  let filter='all';
+  let appSearch='';
+  let detailData;
+
+  function toast(message) {const el=$('#toast');if(!el)return;el.textContent=message;el.hidden=false;clearTimeout(toastTimer);toastTimer=setTimeout(()=>el.hidden=true,6000);}
+  function errorAt(selector,error) {const el=$(selector);if(!el)return;el.textContent=error?.message || String(error);el.hidden=false;}
+  function clearError(selector) {const el=$(selector);if(el){el.hidden=true;el.textContent='';}}
+  function demoContext(active){const badge=$('#demo-context');if(badge)badge.hidden=!active;}
+  async function api(url, options={}) {
+    const method=(options.method || 'GET').toUpperCase();
+    const response=await fetch(url,{...options,headers:{Accept:'application/json',...(options.body ? {'Content-Type':'application/json'} : {}),...(!['GET','HEAD'].includes(method) ? {'X-Ripe-Request':'1'} : {}),...(options.headers||{})}});
+    let data;try{data=await response.json();}catch{data={};}
+    if(!response.ok){let message=data.detail || data.message || `Request failed (${response.status}).`;if(Array.isArray(message))message=message.map(x=>`${x.loc?.slice(1).join('.') || 'Value'}: ${x.msg || 'invalid'}`).join('; ');if(typeof message==='object')message=JSON.stringify(message);throw new Error(message);}
+    return data;
+  }
+  function date(value, includeTime=false) {if(!value)return'Unknown date';const d=new Date(value);if(!Number.isFinite(d.valueOf()))return'Unknown date';try{return new Intl.DateTimeFormat(undefined,{month:'short',day:'numeric',year:'numeric',...(includeTime?{hour:'numeric',minute:'2-digit'}:{}),timeZone:zone}).format(d);}catch{return d.toLocaleDateString();}}
+  function safeURL(value) {try{const u=new URL(value);return ['http:','https:'].includes(u.protocol)&&!u.username&&!u.password ? u.href : null;}catch{return null;}}
+  function sourceLink(value, label='Source notes') {const url=safeURL(value);return url?`<a href="${h(url)}" target="_blank" rel="noopener noreferrer">${h(label)} ${icon('external')}</a>`:'';}
+  function chip(status,label) {const valid=Object.hasOwn(labels,status)?status:'unknown';return `<span class="status-chip ${valid}">${icon(statusIcons[valid])}${h(label || labels[valid])}</span>`;}
+  function tagChips(values,quotes={}) {return (values || []).filter(t=>Object.hasOwn(tags,t)).map(t=>`<span class="tag-chip ${h(t)}"${quotes[t]?` title="Evidence: ${h(quotes[t])}"`:''}>${icon(tags[t][0])}${h(tags[t][1])}</span>`).join('');}
+  function avatar(app) {const initials=app.name.split(/[\s_-]+/).slice(0,2).map(w=>w[0]||'').join('').toUpperCase();let hash=0;for(const c of app.name)hash=(hash*31+c.charCodeAt(0))|0;const palettes=[['#eaf0e5','#62844b'],['#e7f0f4','#5c8197'],['#fff0e5','#ce8454'],['#efeaf5','#9580ad'],['#f6ede9','#b78d77']];const palette=Math.abs(hash)%palettes.length;return `<span class="app-avatar avatar-p${palette}" aria-hidden="true">${h(initials)}</span>`;}
+  function versions(view) {const app=view.app;return `<div class="version-track"><div><span class="track-label">Installed</span><span class="track-value">${h(app.installed_version || 'Unknown')}</span></div><span class="track-arrow">→</span><div><span class="track-label">Recommended</span><span class="track-value target-value">${h(view.recommended_version || '—')}</span></div><span class="track-arrow">→</span><div><span class="track-label">Latest</span><span class="track-value">${h(view.latest_version || app.latest_version || 'Unknown')}</span></div></div>`;}
+  function statusLabel(view) {return view.status==='waiting' && Number.isFinite(view.days_remaining) ? `${view.days_remaining} ${view.days_remaining===1?'day':'days'} to go` : view.status_label || labels[view.status];}
+  function hardSignals(signals) {return (signals||[]).map(s=>`<div class="hard-signal">${icon('alert')}${h(s)}</div>`).join('');}
+  function appCard(view) {const app=view.app;const quotes={};for(const release of view.pending||[]){const c=release.classification||{};for(const tag of c.tags||[]){if(!quotes[tag]&&hasEvidence(c.tag_evidence?.[tag],release.notes))quotes[tag]=`${release.version}: ${c.tag_evidence[tag]}`;}}return `<a class="app-card" href="/apps/${encodeURIComponent(app.id)}"><div class="app-card-top">${avatar(app)}<div class="app-card-title"><h3>${h(app.name)}</h3><div class="app-source">${h(sources[app.source]||app.source)}</div></div><span class="card-chevron">${icon('chevron')}</span></div><div class="card-status">${chip(view.status,statusLabel(view))}<span class="behind">${view.releases_behind?`${h(view.releases_behind)} ${view.releases_behind===1?'release':'releases'} behind`:view.status==='up_to_date'?'All caught up':''}</span></div>${versions(view)}<p class="card-reason">${h(view.reason || app.error || 'Open the release notes for details.')}</p>${app.latest_only?`<div class="hard-signal">${icon('box')}Latest only · ${app.image_changed_at?'image changed '+h(date(app.image_changed_at)):'no versioned target available'}</div>`:''}${view.hard_signals?.length?hardSignals(view.hard_signals.slice(0,2)):''}<div class="tag-list">${tagChips(view.tags,quotes)}</div></a>`;}
+  function renderGroups() {
+    if(!dashboardData)return;
+    const all=dashboardData.apps||[];
+    const filtered=all.filter(v=>{
+      const status=filter==='all'||(filter==='attention'?['recommended_now','read_first','unknown'].includes(v.status):v.status===filter);
+      const search=`${v.app.name} ${v.app.image||''} ${v.app.upstream_repo||''}`.toLowerCase().includes(appSearch);
+      return status && search;
+    });
+    $('#empty-state').hidden=all.length!==0;
+    const groups=Object.keys(tiers).map(tier=>{
+      const values=filtered.filter(v=>(v.app.profile?.tier||'general')===tier);
+      if(!values.length)return'';
+      const info=tiers[tier];
+      return `<section class="tier-group"><h3 class="tier-heading">${icon(info.icon)}${h(info.name)}<span class="count-pill">${values.length}</span><span class="tier-description">${h(info.description)}</span></h3><div class="app-grid">${values.map(appCard).join('')}</div></section>`;
+    }).join('');
+    $('#app-groups').innerHTML=groups|| (all.length?'<div class="no-results">No applications match this view. Try another filter or search.</div>':'');
+    $$('[data-filter]').forEach(b=>{b.classList.toggle('active',b.dataset.filter===filter);b.setAttribute('aria-pressed',String(b.dataset.filter===filter));});
+  }
+  function renderIntegrations(value) {
+    const panel=$('#integration-panel');if(!panel || !value)return;
+    let values=Array.isArray(value)?value:Object.entries(value).map(([source,status])=> typeof status==='object'&&status!==null ? {source,...status} : {source,status});
+    if(!values.length){panel.hidden=true;return;}
+    panel.hidden=false;
+    panel.innerHTML='<h3>Data sources</h3>'+values.map(item=>{
+      const name=item.source||item.name||'Source';const state=item.status||item.state||'unknown';const ok=['ok','connected','ready','success','model available'].includes(String(state))||state===true;const failed=/unreachable|failed|error|not mounted/i.test(String(state));const unknown=!ok&&!failed;
+      return `<div class="integration-item" title="${h(item.message||String(state))}"><span class="live-dot ${ok?'':unknown?'unknown':'error'}"></span>${h(name)} <span class="muted">· ${h(item.message||String(state))}</span></div>`;
+    }).join('');
+  }
+  async function loadDashboard(quiet=false) {
+    try {
+      const data=await api('/api/dashboard');dashboardData=data;zone=data.timezone||zone;demoContext(data.demo);
+      text('#footer-timezone',`Ripe · ${zone}`);text('#app-count',(data.apps||[]).length);
+      const count=data.summary||{};['ripe','recommended_now','read_first','waiting'].forEach(key=>text(`#count-${key}`,count[key]??data.apps.filter(v=>v.status===key).length));
+      text('#last-check',data.last_poll?`Last checked ${date(data.last_poll,true)} · ${data.apps.length} applications`:'No completed check yet · Inventory will appear after your first scan');
+      $('#demo-banner').hidden=!data.demo;
+      if(data.demo&&!$('#exit-demo'))$('#demo-banner').insertAdjacentHTML('beforeend','<button id="exit-demo" type="button">Leave demo</button>');
+      if($('#exit-demo'))$('#exit-demo').onclick=async()=>{try{await api('/api/demo',{method:'DELETE'});await loadDashboard();toast('Demo closed. Your live inventory is active.');}catch(e){errorAt('#dashboard-error',e);}};
+      renderGroups();renderIntegrations(data.integration_status);clearError('#dashboard-error');
+    } catch(e) {if(!quiet){$('#app-groups').innerHTML='';errorAt('#dashboard-error',e);}}
+  }
+  function initDashboard() {
+    $$('[data-filter]').forEach(button=>button.addEventListener('click',()=>{filter=button.dataset.filter;renderGroups();}));
+    $('#app-search').addEventListener('input',e=>{appSearch=e.target.value.toLowerCase().trim();renderGroups();});
+    $('#poll-button').onclick=async()=>{const button=$('#poll-button');button.disabled=true;try{const result=await api('/api/poll',{method:'POST'});toast(result.message || (result.status==='demo'?'Demo mode uses sample data and does not scan your homelab.':result.status==='already running'?'An update check is already running.':'Update check started. This may take a little while.'));setTimeout(()=>loadDashboard(true),1500);}catch(e){errorAt('#dashboard-error',e);}finally{button.disabled=false;}};
+    $('#demo-button').onclick=async()=>{const button=$('#demo-button');button.disabled=true;try{await api('/api/demo',{method:'POST'});filter='all';await loadDashboard();toast('Exploring synthetic examples. No live actions or notifications.');}catch(e){errorAt('#dashboard-error',e);}finally{button.disabled=false;}};
+    loadDashboard();setInterval(()=>{if(!document.hidden)loadDashboard(true);},30000);
+  }
+
+  function normalized(value) {return String(value??'').toLowerCase().replace(/\s+/g,' ').trim();}
+  function hasEvidence(quote, notes) {const q=normalized(quote);return q.length>0&&normalized(notes).includes(q);}
+  function evidence(quote,label='Release notes') {return `<blockquote class="quote"><span class="quote-label">${h(label)}</span>“${h(quote)}”</blockquote>`;}
+  function applicability(release,kind,index) {
+    const result=(release.applicability||[]).find(item=>item.kind===kind&&item.index===index);
+    if(!result||!result.verified||!hasEvidence(result.evidence,release.notes)||!result.profile_evidence)return '<div class="applicability"><span class="status-chip waiting">'+icon('help')+'Treated as applies</span><p>Personal impact has not been verified by the local model. Review this item before updating.</p></div>';
+    const states={applies:['read_first','Applies to you'],might_apply:['waiting','Might apply'],does_not_apply:['ripe','Does not apply']};
+    const [color,label]=states[result.status]||states.applies;
+    return `<div class="applicability ${h(result.status)}">${chip(color,label)}<p>${h(result.reason)}</p>${evidence(result.evidence,'Changelog evidence')}${evidence(result.profile_evidence,'Your profile')}</div>`;
+  }
+  function finding(release,item,kind,index) {
+    if(!hasEvidence(item.evidence,release.notes))return'';
+    const kinds={security:['shield','Security'],breaking:['alert','Breaking change'],migration:['arrow','Migration'],big_features:['sparkles','Feature']};
+    const [sym,label]=kinds[kind];
+    const extra=kind==='security'?`<p>${item.severity?`<strong>Severity:</strong> ${h(item.severity)}. `:''}${item.requires?`<strong>Requires:</strong> ${h(item.requires)}`:''}</p>`:kind==='breaking'&&item.action_needed?`<p><strong>Action needed:</strong> ${h(item.action_needed)}</p>`:kind==='migration'&&Array.isArray(item.steps)?`<ol>${item.steps.map(s=>`<li>${h(s)}</li>`).join('')}</ol>`:'';
+    return `<div class="finding"><div class="finding-title">${icon(sym)}${h(label)}</div><p>${h(item.description)}</p>${extra}${evidence(item.evidence)}${['security','breaking','migration'].includes(kind)?applicability(release,kind,index):''}</div>`;
+  }
+  function releaseCard(release,history=false) {
+    const c=release.classification||{};
+    const supportedTags=(c.tags||[]).filter(t=>hasEvidence(c.tag_evidence?.[t],release.notes));
+    const summary=c.summary && hasEvidence(c.summary_evidence,release.notes) ? `<p class="release-summary">${h(c.summary)}</p>${evidence(c.summary_evidence)}` : '';
+    const warnings=(c.keyword_warnings||[]).map(w=>`<div class="notice warning">${icon('alert')} ${h(w.message||`Mentions “${w.term}”, not addressed by the model; worth a look.`)}${w.quote&&hasEvidence(w.quote,release.notes)?evidence(w.quote,'Unaddressed passage'):''}</div>`).join('');
+    const addressed=(c.keyword_hits_addressed||[]).filter(a=>hasEvidence(a.quote||a.evidence,release.notes));
+    const coverage=addressed.length?`<details><summary>Context checks · ${addressed.length} passages addressed</summary>${addressed.map(a=>`<div class="finding"><div class="finding-title">${h(a.term)} · ${a.matters?'Relevant':'Not a concern in context'}</div><p>${h(a.why)}</p>${evidence(a.quote||a.evidence)}</div>`).join('')}</details>`:'';
+    const findings=['security','breaking','migration','big_features'].map(kind=>(c[kind]||[]).map((item,i)=>finding(release,item,kind,i)).join('')).join('');
+    return `<article class="release-card"><div class="release-heading"><h3>${h(release.version)}</h3>${release.prerelease?'<span class="tag-chip breaking">Pre-release</span>':''}${history?'<span class="tag-chip">History</span>':''}<time class="release-date">${h(date(release.published_at))}</time></div>${supportedTags.length?`<div class="tag-list">${tagChips(supportedTags,c.tag_evidence)}</div>`:''}${release.model_disagreement?`<div class="notice warning">${icon('scales')} Models disagree on tags or severity. Read the source notes before deciding.</div>`:''}${summary||(!findings?'<p class="muted release-summary">No evidence-backed classification available yet. The source notes are still available below.</p>':'')}${findings}${supportedTags.length?`<details class="tag-evidence"><summary>Classification evidence · ${supportedTags.length} tags</summary>${supportedTags.map(tag=>`<div class="finding-title">${h(tags[tag]?.[1]||tag)}</div>${evidence(c.tag_evidence[tag])}`).join('')}</details>`:''}${warnings}${coverage}${c.model?`<div class="model-meta"><span>${h(c.provider||'Local')} · ${h(c.model)}</span><span>Prompt ${h(c.prompt_version||'unknown')}</span>${c.confidence?`<span>${h(c.confidence)} confidence</span>`:''}</div>`:''}<div class="release-footer">${sourceLink(release.source_url)}${release.source_url?'':'<span>No source URL available</span>'}</div><details><summary>Read the original release notes</summary><pre class="raw-notes">${h(release.notes||'No release notes were available from this source.')}</pre></details></article>`;
+  }
+  function profileForm(app) {
+    const profile=app.profile||{};
+    return `<aside class="detail-sidebar"><section class="profile-card" id="profile"><h2>Your setup</h2><p>Help the local model understand what matters to this application.</p><form id="profile-form"><div class="form-grid"><label>Priority tier<select name="tier">${Object.entries(tiers).map(([key,value])=>`<option value="${key}"${profile.tier===key?' selected':''}>${h(value.name)}</option>`).join('')}</select></label><label>Exposure<select name="exposure">${[['unknown','Not yet determined'],['lan','LAN only'],['internet','Internet-facing'],['vpn','VPN only']].map(([key,label])=>`<option value="${key}"${profile.exposure===key?' selected':''}>${h(label)}</option>`).join('')}</select></label><label>Has its own login?<select name="own_login"><option value="unknown"${profile.own_login==null?' selected':''}>Not yet determined</option><option value="true"${profile.own_login===true?' selected':''}>Yes</option><option value="false"${profile.own_login===false?' selected':''}>No</option></select></label><label>Dependencies<input name="dependencies" value="${h((profile.dependencies||[]).join(', '))}" placeholder="postgres, mariadb"><span class="field-help">Comma-separated app names or IDs.</span></label><label class="full-width">Relevant config keys (JSON)<textarea name="config" spellcheck="false" rows="7">${h(JSON.stringify(profile.config||{},null,2))}</textarea><span class="field-help">Only the keys needed to understand a change. Passwords, tokens, and keys are stripped before storage.</span></label><label class="full-width">Context for the local model<textarea name="notes" rows="3" placeholder="For example: No browser clients on other origins.">${h(profile.notes||'')}</textarea></label></div><button class="button primary" type="submit">${icon('check')}Save profile</button></form><div class="privacy-note">${icon('lock')}<div><strong>Local eyes only.</strong><p>Your profile goes only to your Unraid Ollama. Gemini never receives it.</p></div></div><section class="mapping-section"><h3>Upstream repository</h3><form id="mapping-form"><label>GitHub owner/repository<input name="upstream_repo" value="${h(app.upstream_repo||'')}" placeholder="rommapp/romm" pattern="[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"><span class="field-help">Override automatic mapping when a container points to the wrong release source.</span></label><button class="button secondary small" type="submit">Save mapping</button></form></section></section></aside>`;
+  }
+  function renderDetail(view) {
+    detailData=view;const app=view.app;demoContext(app.source==='demo');
+    document.title=`${app.name} · Ripe`;
+    text('#breadcrumb-page',app.name);
+    $('#app-detail').innerHTML=`${app.source==='demo'?'<div class="demo-banner">'+icon('flask')+'Synthetic example · no live homelab data</div>':''}<div class="detail-heading">${avatar(app)}<div><h1>${h(app.name)}<span class="accent">.</span></h1><div class="app-source">${h(sources[app.source]||app.source)}${app.image?' · '+h(app.image):''}</div></div>${chip(view.status,statusLabel(view))}</div><div class="detail-overview">${versions(view)}<div class="detail-reason"><strong>${h(view.status_label||labels[view.status])}</strong>${h(view.reason||'Open the evidence below to understand this update.')}${view.next_ripe_at?`<div class="field-help">Next ripening: ${h(date(view.next_ripe_at,true))}</div>`:''}</div></div>${app.error?`<div class="notice warning">${h(app.error)}</div>`:''}${view.hard_signals?.length?`<div class="notice warning">${hardSignals(view.hard_signals)}</div>`:''}<nav class="detail-tabs" aria-label="Application sections"><a href="#pending">Pending releases <span class="count-pill">${(view.pending||[]).length}</span></a><a href="#profile">Your setup</a><a href="#history">History <span class="count-pill">${(view.history||[]).length}</span></a></nav><div class="detail-layout"><div class="detail-main"><section id="pending"><div class="subsection-title"><h2>What’s ahead</h2><p>Each release, its own evidence.</p></div>${view.pending?.length?view.pending.map(r=>releaseCard(r)).join(''):'<div class="empty-section">No pending releases in the current inventory. If a version or source is unknown, set the repository mapping and check again.</div>'}</section>${view.available_notes?.length?`<section class="history-section"><div class="subsection-title"><h2>Available notes — update span unknown</h2><p>The installed version cannot be ordered against these releases. These are not counted as pending.</p></div>${view.available_notes.map(r=>releaseCard(r)).join('')}</section>`:''}<section class="history-section" id="history"><div class="subsection-title"><h2>Update history</h2></div>${view.history?.length?view.history.map(r=>releaseCard(r,true)).join(''):'<div class="empty-section">Releases at or below your installed version appear here after a scan detects that you have updated.</div>'}</section></div>${profileForm(app)}</div>`;
+    $('#profile-form').onsubmit=async e=>{
+      e.preventDefault();const form=e.currentTarget;const data=new FormData(form);let config;
+      try{config=JSON.parse(data.get('config'));if(!config||typeof config!=='object'||Array.isArray(config))throw new Error();}catch{toast('Relevant config keys must be a JSON object.');return;}
+      const profile={tier:data.get('tier'),exposure:data.get('exposure'),own_login:data.get('own_login')==='unknown'?null:data.get('own_login')==='true',config,dependencies:String(data.get('dependencies')).split(',').map(x=>x.trim()).filter(Boolean),notes:data.get('notes')};
+      const button=$('button[type=submit]',form);button.disabled=true;
+      try{await api(`/api/apps/${encodeURIComponent(app.id)}/profile`,{method:'PATCH',body:JSON.stringify(profile)});toast('Profile saved. Relevant changes will be analyzed locally.');await loadDetail();}catch(error){errorAt('#detail-error',error);}finally{button.disabled=false;}
+    };
+    $('#mapping-form').onsubmit=async e=>{e.preventDefault();const form=e.currentTarget;const button=$('button',form);button.disabled=true;try{await api(`/api/apps/${encodeURIComponent(app.id)}/mapping`,{method:'PATCH',body:JSON.stringify({upstream_repo:new FormData(form).get('upstream_repo').trim()||null})});toast('Repository mapping saved. Check for updates to fetch releases.');await loadDetail();}catch(error){errorAt('#detail-error',error);}finally{button.disabled=false;}};
+  }
+  async function loadDetail() {try{const id=decodeURIComponent(location.pathname.split('/').filter(Boolean).pop());renderDetail(await api(`/api/apps/${encodeURIComponent(id)}`));clearError('#detail-error');}catch(error){$('#app-detail').innerHTML='';errorAt('#detail-error',error);}}
+
+  function setForm(form,settings) {
+    const data={...settings,soak_infrastructure:settings.soak_days.infrastructure,soak_internet:settings.soak_days.internet,soak_general:settings.soak_days.general,notification_people:settings.notification_people.join(', ')};
+    for(const [name,value] of Object.entries(data)){const field=form.elements.namedItem(name);if(!field)continue;if(field.type==='checkbox')field.checked=!!value;else field.value=value??'';}
+  }
+  async function initSettings() {
+    let settings;
+    try{settings=await api('/api/settings');zone=settings.timezone||zone;demoContext(settings.demo_mode);if(settings.demo_mode){$('#test-notification').disabled=true;$('#test-notification').title='Demo mode never sends notifications';$('#settings-form').insertAdjacentHTML('beforebegin','<div class="demo-banner">'+icon('flask')+'Demo preferences are isolated from your live settings. Leave the demo from Overview to configure your homelab.</div>');}setForm($('#settings-form'),settings);$('#settings-form').hidden=false;$('#settings-loading').hidden=true;text('#footer-timezone',`Ripe · ${zone}`);}catch(error){$('#settings-loading').hidden=true;errorAt('#settings-error',error);return;}
+    $('#browser-timezone').onclick=()=>{$('#settings-form').elements.timezone.value=Intl.DateTimeFormat().resolvedOptions().timeZone;};
+    $('#settings-form').onsubmit=async e=>{
+      e.preventDefault();const form=e.currentTarget;const data=new FormData(form);const button=$('button[type=submit]',form);button.disabled=true;clearError('#settings-error');
+      const fields=['quiet_start','quiet_end','timezone','digest_time','dashboard_url','ollama_url','local_model','gemini_model','classification_provider'];const values={};fields.forEach(name=>values[name]=data.get(name));
+      ['patch_soak_days','poll_hours','digest_weekday'].forEach(name=>values[name]=Number(data.get(name)));
+      ['patch_exception','notifications_enabled','second_opinion'].forEach(name=>values[name]=form.elements.namedItem(name).checked);
+      values.soak_days={infrastructure:Number(data.get('soak_infrastructure')),internet:Number(data.get('soak_internet')),general:Number(data.get('soak_general'))};
+      values.notification_people=String(data.get('notification_people')).split(',').map(x=>x.trim()).filter(Boolean);
+      try{const saved=await api('/api/settings',{method:'PATCH',body:JSON.stringify(values)});settings={...settings,...values,...saved};setForm(form,settings);zone=settings.timezone;text('#footer-timezone',`Ripe · ${zone}`);text('#settings-save-state','Saved. Your preferences are active.');toast('Settings saved.');}catch(error){errorAt('#settings-error',error);}finally{button.disabled=false;}
+    };
+    $('#test-notification').onclick=async()=>{const button=$('#test-notification');button.disabled=true;try{const result=await api('/api/notifications/test',{method:'POST'});toast(result.message||(result.sent?'Test sent through script.notify_household.':'Test notification requested through script.notify_household.'));}catch(error){errorAt('#settings-error',error);}finally{button.disabled=false;}};
+  }
+
+  function stringify(value) {return typeof value==='string'?value:JSON.stringify(value,null,2);}
+  function logRow(item) {
+    const passed=item.evidence_passed??item.evidence_valid??item.evidence_checks_passed;
+    const evidenceStatus=passed===true?'Evidence checked':passed===false?'Evidence rejected':item.status==='error'?'Call failed':'View evidence results';
+    const ms=item.duration_ms??(item.duration!=null?item.duration*1000:null);
+    const input=item.input_size??item.input_chars??item.input_characters;
+    const rows={...item};delete rows.model;
+    return `<details class="log-entry"><summary><span class="log-model">${h(item.model||item.provider||'Model call')}</span><span class="log-meta">${item.prompt_version?`<span>Prompt ${h(item.prompt_version)}</span>`:''}${ms!=null?`<span>${h((ms/1000).toFixed(1))}s</span>`:''}${input!=null?`<span>${h(input)} chars</span>`:''}<span>${h(item.retries??item.retry??item.attempt??0)} retries</span></span><span class="status-chip ${passed===false?'read_first':passed===true?'ripe':'unknown'}">${h(evidenceStatus)}</span><time class="log-time">${h(date(item.created_at||item.timestamp||item.at,true))}</time></summary><pre class="raw-notes">${h(stringify(rows))}</pre></details>`;
+  }
+  async function loadLogs() {
+    try{const [data,context]=await Promise.all([api('/api/logs'),api('/api/dashboard')]);demoContext(context.demo);const calls=data.llm||[];const errors=data.errors||[];let rate=Number(data.disagreement_rate||0);if(rate<=1)rate*=100;
+      $('#logs-content').innerHTML=`<div class="log-summary"><div class="log-stat"><strong>${calls.length}</strong><span>Recorded model calls</span><p>Prompt versions, timing, and output</p></div><div class="log-stat"><strong>${h(rate.toFixed(1))}%</strong><span>Model disagreement rate</span><p>Compared releases with differing conclusions</p></div><div class="log-stat"><strong>${errors.length}</strong><span>Data-source errors</span><p>Failed or unavailable source requests</p></div></div><section class="log-panel"><h2>Model calls</h2>${calls.length?calls.map(logRow).join(''):'<div class="empty-section">No model calls yet. Ripe logs classification and local profile analysis as releases are collected.</div>'}</section><section class="log-panel"><h2>Data sources</h2>${errors.length?errors.map(item=>`<article class="source-error"><div class="error-top">${icon('alert')}<strong>${h(item.source||item.category||'Source error')}</strong><time>${h(date(item.created_at||item.timestamp||item.at,true))}</time></div><p>${h(item.message||item.error||stringify(item))}</p></article>`).join(''):'<div class="empty-section">No data-source errors recorded.</div>'}</section><div class="privacy-note">${icon('lock')}<div><strong>A useful trail, without your secrets.</strong><p>Model output and diagnostic records are sanitized before storage. Profiles are used only for local analysis.</p></div></div>`;clearError('#logs-error');
+    }catch(error){errorAt('#logs-error',error);}
+  }
+  function initTheme() {
+    let selected;try{selected=localStorage.getItem('ripe-theme');}catch{}
+    const theme=selected|| (matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');
+    const setTheme=value=>{document.documentElement.dataset.theme=value;$('#theme-toggle').innerHTML=icon(value==='dark'?'sun':'moon');$('#theme-toggle').setAttribute('aria-label',`Switch to ${value==='dark'?'light':'dark'} theme`);};
+    setTheme(theme);$('#theme-toggle').onclick=()=>{const next=document.documentElement.dataset.theme==='dark'?'light':'dark';setTheme(next);try{localStorage.setItem('ripe-theme',next);}catch{}};
+  }
+  hydrateIcons();initTheme();
+  const active=page==='app'?'dashboard':page;
+  const link=$(`[data-nav="${active}"]`);if(link){link.classList.add('active');link.setAttribute('aria-current','page');}
+  text('#breadcrumb-page',{dashboard:'Overview',settings:'Settings',logs:'Activity & logs',app:'Application'}[page]||'Overview');
+  if(page==='dashboard')initDashboard();
+  if(page==='app')loadDetail();
+  if(page==='settings')initSettings();
+  if(page==='logs'){loadLogs();$('#refresh-logs').onclick=loadLogs;}
+})();

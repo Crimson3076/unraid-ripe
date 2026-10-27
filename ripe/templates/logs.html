@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block title %}Activity & logs{% endblock %}
+{% block page %}logs{% endblock %}
+{% block content %}
+  <section class="page-heading"><div><div class="eyebrow">TRUST, WITH A PAPER TRAIL</div><h1>Every answer has a story<span class="accent">.</span></h1><p>See the models, evidence checks, and source errors behind your recommendations.</p></div><button id="refresh-logs" class="button secondary" type="button"><span data-icon="refresh"></span>Refresh logs</button></section>
+  <div id="logs-error" class="notice danger" role="alert" hidden></div>
+  <div id="logs-content"><div class="loading-panel"><span class="spinner"></span>Opening the activity log…</div></div>
+{% endblock %}
