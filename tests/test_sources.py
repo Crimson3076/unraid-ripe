@@ -267,3 +267,99 @@ def test_base_image_version_label_is_ignored(value):
 @pytest.mark.parametrize('value', ['1.37.4', 'v0.9.0-rc.3', '2024.10.1', '24.04.1'])
 def test_real_version_label_is_accepted(value):
     assert usable_version_label(value) == value
+
+
+def _gh(tag, prerelease=False):
+    return {'id': tag, 'tag_name': tag, 'body': 'notes', 'published_at': '2026-10-01T00:00:00Z', 'prerelease': prerelease}
+
+
+async def _collect(monkeypatch, tmp_path, apps, github=None, registry_digest='sha256:' + 'f' * 64):
+    from ripe.models import Settings
+    from ripe.sources import collector
+    socket = tmp_path / 'docker.sock'
+    socket.touch()
+    async def docker_apps(self, *args, **kwargs):
+        return apps
+    async def no_unraid(*args, **kwargs):
+        return []
+    async def registry_meta(self, image, installed_digest, match_version=True):
+        return {'latest_digest': registry_digest, 'latest_only': True, 'update_available': installed_digest != registry_digest}
+    monkeypatch.setattr(collector.DockerReader, 'apps', docker_apps)
+    monkeypatch.setattr(collector.RegistryReader, 'metadata', registry_meta)
+    monkeypatch.setattr(collector, 'unraid_releases', no_unraid)
+    def handler(request):
+        return httpx.Response(200, json=github or [])
+    original_client = httpx.AsyncClient
+    def make_client(*args, **kwargs):
+        kwargs['transport'] = httpx.MockTransport(handler)
+        return original_client(*args, **kwargs)
+    monkeypatch.setattr(collector.httpx, 'AsyncClient', make_client)
+    cache = {}
+    return await collector.collect(Settings(), docker_socket=str(socket), unraid_version_file=str(tmp_path / 'no-version'), cache_get=cache.get, cache_set=cache.__setitem__)
+
+
+async def test_unmapped_latest_app_uses_digest_logic(monkeypatch, tmp_path):
+    from datetime import timedelta
+    from ripe.models import Settings, utcnow
+    from ripe.ripeness import build_view
+    digest = 'sha256:' + 'f' * 64
+    same = AppRecord(id='docker:same', name='same', source='docker', image='ghcr.io/o/same:latest', installed_digest=digest)
+    old = AppRecord(id='docker:old', name='old', source='docker', image='ghcr.io/o/old:latest', installed_digest='sha256:' + '1' * 64)
+    apps, releases, errors = await _collect(monkeypatch, tmp_path, [same, old])
+    by_id = {a.id: a for a in apps}
+    assert not by_id['docker:same'].error and not by_id['docker:old'].error
+    assert by_id['docker:same'].detected['mapping_hint']
+    assert not any(e['source'].startswith('docker:') for e in errors)
+    assert build_view(by_id['docker:same'], [], Settings()).status == 'up_to_date'
+    by_id['docker:old'].image_changed_at = utcnow()
+    assert build_view(by_id['docker:old'], [], Settings()).status == 'waiting'
+    by_id['docker:old'].image_changed_at = utcnow() - timedelta(days=400)
+    assert build_view(by_id['docker:old'], [], Settings()).status == 'ripe'
+
+
+async def test_rc_without_prerelease_flag_does_not_beat_final(monkeypatch, tmp_path):
+    app = AppRecord(id='docker:a', name='a', source='docker', installed_version='1.0.0', upstream_repo='o/a')
+    data = [_gh('2.0.0-rc.1'), _gh('2.0.0'), _gh('nightly-20261027'), _gh('chart-4.5.6'), _gh('1.9.0')]
+    apps, _, _ = await _collect(monkeypatch, tmp_path, [app], github=data)
+    assert next(a for a in apps if a.id == 'docker:a').latest_version == '2.0.0'
+
+
+async def test_only_unparseable_tags_leave_latest_unset(monkeypatch, tmp_path):
+    app = AppRecord(id='docker:a', name='a', source='docker', installed_version='1.0.0', upstream_repo='o/a')
+    apps, _, _ = await _collect(monkeypatch, tmp_path, [app], github=[_gh('nightly-20261027'), _gh('chart-4.5.6')])
+    assert next(a for a in apps if a.id == 'docker:a').latest_version is None
+
+
+async def test_malformed_docker_record_only_fails_its_own_app():
+    ident_ok, ident_bad = 'a' * 64, 'b' * 64
+    image_id = 'sha256:' + 'c' * 64
+    def handler(request):
+        if request.url.path == '/containers/json':
+            return httpx.Response(200, json=[
+                {'Id': ident_bad, 'Names': ['/bad'], 'Image': 'x:1', 'ImageID': image_id, 'Ports': None, 'Labels': 5},
+                {'Id': ident_ok, 'Names': ['/ok'], 'Image': 'x:1', 'ImageID': image_id, 'Ports': None},
+            ])
+        return httpx.Response(200, json={'Config': None, 'RepoDigests': None})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url='http://docker') as client:
+        reader = DockerReader(client)
+        apps = await reader.apps({}, {})
+    assert [a.name for a in apps] == ['ok']
+    assert reader.skipped == ['docker:' + ident_bad[:12]]
+
+
+async def test_malformed_ha_entity_only_fails_its_own_app(monkeypatch, tmp_path):
+    from ripe.sources import collector
+    def handler(request):
+        return httpx.Response(200, json=[{'entity_id': 'update.bad', 'state': 'on', 'attributes': None}, {'entity_id': 'update.ok', 'state': 'off', 'attributes': {'title': 'Ok', 'installed_version': '1', 'latest_version': '1'}}])
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        states = await ha_states(client, 'http://ha.local', 'token')
+    apps, _ = ha_records(states, {}, {})
+    assert {a.id for a in apps} == {'ha:update.bad', 'ha:update.ok'}
+
+
+async def test_docker_allowlist_excludes_container_inspect_and_version():
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={})), base_url='http://docker') as client:
+        reader = DockerReader(client)
+        for path in ('/containers/' + 'a' * 64 + '/json', '/version'):
+            with pytest.raises(SourceError):
+                await reader.read(path)
