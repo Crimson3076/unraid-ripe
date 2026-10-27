@@ -40,7 +40,7 @@ def test_custom_daytime_or_all_day_quiet_window():
     assert is_quiet(settings, instant('2026-10-26T10:00:00Z'))
     assert not is_quiet(settings, instant('2026-10-26T12:00:00Z'))
     settings.quiet_end = '10:00'
-    assert is_quiet(settings, instant('2026-10-26T17:00:00Z'))
+    assert not is_quiet(settings, instant('2026-10-26T17:00:00Z'))
 
 
 @pytest.fixture
@@ -118,6 +118,7 @@ async def test_weekly_digest_during_quiet_hours_is_deferred_and_persistently_ded
     calls, transport = recorder()
     settings = configured_settings(timezone='America/New_York',
                         digest_weekday=0, digest_time='07:00')
+    store.set('digest-sent-for', '2026-10-19')
     notifier = Notifier(store, 'http://ha.local:8123', 'test-ha-secret', transport=transport)
     await notifier.tick(settings, [], now=instant('2026-10-26T11:00:00Z'))
     assert calls == []
@@ -139,8 +140,9 @@ async def test_failed_script_is_not_marked_delivered_or_logged_with_response_sec
         return httpx.Response(401, text='private rejection payload test-ha-secret')
     notifier = Notifier(store, 'http://ha.local:8123', 'test-ha-secret', transport=httpx.MockTransport(handler))
     settings = configured_settings(timezone='UTC')
+    store.set('digest-sent-for', '2026-10-19')
     await notifier.tick(settings, [], now=instant('2026-10-26T12:00:00Z'))
-    assert store.get('digest-sent-for') is None
+    assert store.get('digest-sent-for') == '2026-10-19'
     assert len(calls) == 1
     output = json.dumps(store.logs())
     assert 'private rejection payload' not in output
@@ -154,3 +156,20 @@ async def test_enabled_without_a_configured_script_never_sends(store):
     settings=Settings(timezone='UTC',notifications_enabled=True)
     assert not await notifier.send(settings,'Notice','test',now=instant('2026-10-26T14:00:00Z'))
     assert calls==[]
+
+
+def test_equal_quiet_times_mean_no_quiet_hours():
+    settings = Settings(timezone='UTC', quiet_start='10:00', quiet_end='10:00')
+    assert not is_quiet(settings, instant('2026-10-26T10:00:00Z'))
+    assert not is_quiet(settings, instant('2026-10-26T03:00:00Z'))
+
+
+async def test_first_run_seeds_digest_instead_of_sending(store):
+    calls, transport = recorder()
+    settings = configured_settings(timezone='UTC', digest_weekday=0, digest_time='07:00')
+    notifier = Notifier(store, 'http://ha.local:8123', 'test-ha-secret', transport=transport)
+    await notifier.tick(settings, [], now=instant('2026-10-28T12:00:00Z'))
+    assert calls == []
+    assert store.get('digest-sent-for') == '2026-10-26'
+    await notifier.tick(settings, [], now=instant('2026-11-02T12:00:00Z'))
+    assert len(calls) == 1

@@ -17,7 +17,7 @@ def is_quiet(settings: Settings, now: datetime | None = None) -> bool:
     local = (now or utcnow()).astimezone(ZoneInfo(settings.timezone)).time().replace(tzinfo=None)
     start, end = clock(settings.quiet_start), clock(settings.quiet_end)
     if start == end:
-        return True  # Safe interpretation of a full quiet day.
+        return False  # Equal times mean no quiet hours, so alerts are never silently suppressed.
     return start <= local < end if start < end else local >= start or local < end
 
 
@@ -56,9 +56,26 @@ class Notifier:
             self.store.log_error({'source':'notifications','message':'Home Assistant household script request failed; check connection, token permissions and script fields.'})
             return False
 
+    @staticmethod
+    def digest_due_key(settings: Settings, now: datetime) -> str:
+        local = now.astimezone(ZoneInfo(settings.timezone))
+        # Most recent scheduled occurrence, so a quiet-time schedule is deferred
+        # until the next permitted time instead of being lost for a week.
+        scheduled = local.replace(hour=clock(settings.digest_time).hour, minute=clock(settings.digest_time).minute, second=0, microsecond=0)
+        scheduled -= timedelta(days=(local.weekday() - settings.digest_weekday) % 7)
+        if scheduled > local:
+            scheduled -= timedelta(days=7)
+        return scheduled.date().isoformat()
+
     async def tick(self, settings: Settings, views: list[AppView], *, now: datetime | None = None, demo: bool = False):
         now = now or utcnow()
-        if demo or not settings.notifications_enabled or not self.ha_token or is_quiet(settings, now):
+        if demo:
+            return
+        due_key = self.digest_due_key(settings, now)
+        if self.store.get('digest-sent-for') is None:
+            # First run: seed the current occurrence so the first digest follows the schedule.
+            self.store.set('digest-sent-for', due_key)
+        if not settings.notifications_enabled or not self.ha_token or is_quiet(settings, now):
             return
         # Stable item/version keys prevent repeat alerts; unsent keys persist
         # across quiet hours and process restarts by remaining absent here.
@@ -71,15 +88,6 @@ class Notifier:
                 continue
             if await self.send(settings, f'{view.app.name}: applicable security fix available. Review {view.recommended_version or "the release notes"}; no update has been performed.', 'ripe-security-' + hashlib.sha256(view.app.id.encode()).hexdigest()[:12], now=now):
                 self.store.set(key, now.isoformat())
-        local = now.astimezone(ZoneInfo(settings.timezone))
-        # Most recent scheduled occurrence, so a quiet-time schedule is deferred
-        # until the next permitted time instead of being lost for a week.
-        scheduled = local.replace(hour=clock(settings.digest_time).hour, minute=clock(settings.digest_time).minute, second=0, microsecond=0)
-        scheduled -= timedelta(days=(local.weekday() - settings.digest_weekday) % 7)
-        if scheduled > local:
-            scheduled -= timedelta(days=7)
-        due_key = scheduled.date().isoformat()
-        previous = self.store.get('digest-sent-for')
-        if previous != due_key:
+        if self.store.get('digest-sent-for') != due_key:
             if await self.send(settings, digest_text(views), 'ripe-weekly', now=now):
                 self.store.set('digest-sent-for', due_key)
