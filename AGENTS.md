@@ -9,7 +9,7 @@ Guidance for coding agents and reviewers. Coding agents also follow CLAUDE.md.
 - Flag changes that weaken authentication, CSRF/same-origin checks or permission checks.
 
 ### Tests
-- Flag behaviour changes that have no test, and tests that no longer exercise the code they claim to cover.
+- Flag code behaviour changes that have no test, and tests that no longer exercise the code they claim to cover. Workflow, documentation and configuration-only changes are exempt.
 
 ### Scope
 - Flag changes to CI workflows, Dockerfiles, dependency/lock files, migrations, or auth and secret-handling code unless the linked issue asks for them.
