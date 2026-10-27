@@ -1,0 +1,27 @@
+# The PR gate in n8n listens for this workflow by its name: keep `name: CI`.
+# Adjust the steps for the project's language. This example is for a Python project with pytest.
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install --no-deps -r requirements-dev.lock
+      - run: python -m pytest -q
+# Node example instead:
+#     - uses: actions/setup-node@v4
+#       with: { node-version: 22 }
+#     - run: npm ci
+#     - run: npm test
