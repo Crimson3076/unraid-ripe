@@ -1,4 +1,4 @@
-"""Runtime inputs. Secret values are never part of Settings or persisted."""
+"""Runtime inputs. Secrets never enter general Settings; HA also supports private app credentials."""
 from __future__ import annotations
 import os
 from dataclasses import dataclass, field

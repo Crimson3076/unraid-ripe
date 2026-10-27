@@ -11,3 +11,4 @@ build/
 dist/
 .coverage
 .ripe-state/
+secrets/

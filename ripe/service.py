@@ -26,6 +26,9 @@ def fingerprint(value: Any) -> str:
 class Coordinator:
     def __init__(self, runtime: Runtime):
         self.runtime = runtime
+        from .connections import HomeAssistantConnection
+        self.ha_connection = HomeAssistantConnection(runtime.config_dir, runtime.ha_url, runtime.ha_token)
+        runtime.ha_url, runtime.ha_token = self.ha_connection.credentials()
         self.real_store = Store(runtime.config_dir / 'ripe.sqlite3', runtime.secret_values())
         if self.real_store.get('settings') is None:
             self.real_store.save_settings(runtime.initial_settings())
@@ -44,6 +47,20 @@ class Coordinator:
         if self.demo_store:
             self.demo_store.close()
         self.real_store.close()
+
+    def save_ha_connection(self, data: dict | None = None, *, disconnect=False) -> dict:
+        if self.demo:
+            raise ValueError('Leave demo mode before changing the live Home Assistant connection')
+        public = self.ha_connection.disconnect() if disconnect else self.ha_connection.save(data)
+        self.runtime.ha_url, self.runtime.ha_token = self.ha_connection.credentials()
+        for store in (self.real_store, self.demo_store):
+            if store:
+                store.secrets = self.runtime.secret_values()
+        if self.polling:
+            self.real_store.set('poll_again', True)
+        else:
+            self.request_poll()
+        return public
 
     def enter_demo(self):
         if self.real_store.apps():

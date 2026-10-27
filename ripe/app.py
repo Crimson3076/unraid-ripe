@@ -188,6 +188,45 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     async def settings(request:Request):
         return request.app.state.manager.settings()
 
+    @app.get('/api/connections/home-assistant')
+    async def ha_connection(request: Request):
+        manager = request.app.state.manager
+        if manager.demo:
+            return {'url': '', 'has_token': False, 'configured': False, 'source': 'demo', 'last_test': None, 'demo': True}
+        return {**manager.ha_connection.public(), 'demo': False}
+
+    @app.put('/api/connections/home-assistant')
+    async def save_ha_connection(request: Request, data: dict = Body(...)):
+        manager = request.app.state.manager
+        if manager.demo:
+            raise HTTPException(409, 'Leave demo mode before configuring the live Home Assistant connection')
+        try:
+            return manager.save_ha_connection(data)
+        except ValueError:
+            raise HTTPException(422, 'Invalid Home Assistant connection: use a valid server URL and long-lived token; changing servers requires a new token or removal of the saved token') from None
+        except OSError:
+            raise HTTPException(500, 'Could not save the private Home Assistant settings; check /config permissions') from None
+
+    @app.delete('/api/connections/home-assistant')
+    async def disconnect_ha(request: Request):
+        manager = request.app.state.manager
+        if manager.demo:
+            raise HTTPException(409, 'Leave demo mode before changing the live Home Assistant connection')
+        try:
+            return manager.save_ha_connection(disconnect=True)
+        except (ValueError, OSError):
+            raise HTTPException(500, 'Could not remove the private Home Assistant connection; check /config permissions') from None
+
+    @app.post('/api/connections/home-assistant/test')
+    async def test_ha_connection(request: Request):
+        manager = request.app.state.manager
+        if manager.demo:
+            raise HTTPException(409, 'Demo mode never connects to your live Home Assistant')
+        try:
+            return await manager.ha_connection.test()
+        except ValueError:
+            raise HTTPException(409, 'Save a valid Home Assistant connection in Settings, then test it again') from None
+
     @app.patch('/api/settings')
     async def save_settings(request:Request,data:dict=Body(...)):
         manager=request.app.state.manager
@@ -236,9 +275,9 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         if is_quiet(settings):
             raise HTTPException(409,'Quiet hours are active; nothing was sent')
         if not manager.runtime.ha_token:
-            raise HTTPException(409,'Configure HA_TOKEN securely in your deployment')
+            raise HTTPException(409,'Configure your Home Assistant long-lived access token in Settings')
         if not manager.runtime.ha_url:
-            raise HTTPException(409,'Configure HA_URL in your deployment')
+            raise HTTPException(409,'Configure your Home Assistant server URL in Settings')
         sent=await Notifier(manager.store,manager.runtime.ha_url,manager.runtime.ha_token).send(settings,'Test: Ripe is connected to your notification script. No update has been performed.','ripe-test')
         if not sent:
             raise HTTPException(502,'Household script call failed; see the source error log')

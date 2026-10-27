@@ -7,6 +7,7 @@ import re
 from typing import Any
 from urllib.parse import urlparse
 from ripe.models import Profile
+from ripe.privacy import registered_secrets
 
 _REDACTED = '[redacted]'
 # Credential words remain sensitive inside camelCase/suffixed fields (for
@@ -32,7 +33,7 @@ _LONG_CREDENTIAL = re.compile(r'\b(?:gh[pousr]_[A-Za-z0-9_]{12,}|github_pat_[A-Z
 
 def _secret_values() -> list[str]:
     # Presence is never logged. Values are used only as a redaction denylist.
-    return [value for name, value in os.environ.items()
+    return list(registered_secrets()) + [value for name, value in os.environ.items()
             if re.search(r'(?:TOKEN|PASSWORD|PASSWD|SECRET|API_KEY|PRIVATE_KEY|GEMINI_KEY)', name, re.I)
             and len(value) >= 6]
 

@@ -14,3 +14,4 @@ scratch
 *.db
 *.sqlite*
 .ripe-state
+**/secrets

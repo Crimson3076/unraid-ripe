@@ -13,7 +13,7 @@
   <Category>Tools: Network:Management</Category>
   <WebUI>http://[IP]:[PORT:8087]/</WebUI>
   <TemplateURL>https://raw.githubusercontent.com/Crimson3076/unraid-ripe/main/deploy/my-ripe.xml</TemplateURL>
-  <Icon>https://raw.githubusercontent.com/Crimson3076/unraid-ripe/main/ripe/static/icon.svg</Icon>
+  <Icon>https://raw.githubusercontent.com/Crimson3076/unraid-ripe/main/ripe/static/icon.png</Icon>
   <ExtraParams>--publish=127.0.0.1:8087:8087 --user=99:100 --group-add=0 --read-only --tmpfs=/tmp:rw,nosuid,nodev,size=32m --cap-drop=ALL --security-opt=no-new-privileges:true</ExtraParams>
   <PostArgs/>
   <CPUset/>
@@ -27,8 +27,8 @@
   <Config Name="Unraid version (read only)" Target="/host/unraid-version" Default="/etc/unraid-version" Mode="ro" Description="Installed Unraid version file." Type="Path" Display="advanced" Required="true" Mask="false">/etc/unraid-version</Config>
   <Config Name="Allowed WebUI hosts" Target="RIPE_ALLOWED_HOSTS" Default="localhost,127.0.0.1,::1" Mode="" Description="Comma-separated WebUI hostnames/IPs, without ports. Add the private interface address or hostname used to reach the WebUI. Do not use a wildcard." Type="Variable" Display="advanced" Required="true" Mask="false">localhost,127.0.0.1,::1</Config>
   <Config Name="Timezone" Target="TZ" Default="UTC" Mode="" Description="Choose an IANA timezone for your installation. Quiet hours and digest scheduling use this timezone. Editable in Ripe Settings." Type="Variable" Display="always" Required="true" Mask="false">UTC</Config>
-  <Config Name="Home Assistant URL (optional)" Target="HA_URL" Default="" Mode="" Description="Home Assistant base URL. Leave blank to disable this integration." Type="Variable" Display="always" Required="false" Mask="false"/>
-  <Config Name="Home Assistant token" Target="HA_TOKEN" Default="" Mode="" Description="Long-lived token, entered here securely. Required for Home Assistant discovery and any configured notification script. Never paste it into the UI profile or Git." Type="Variable" Display="always" Required="false" Mask="true"/>
+  <Config Name="Home Assistant URL (optional)" Target="HA_URL" Default="" Mode="" Description="Legacy fallback only. Prefer the Home Assistant connection in Ripe Settings; saved app settings override this value." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="Home Assistant token" Target="HA_TOKEN" Default="" Mode="" Description="Legacy fallback only. Configure the long-lived token in Ripe Settings. Do not put it in an application profile or Git." Type="Variable" Display="advanced" Required="false" Mask="true"/>
   <Config Name="Local Ollama URL (optional)" Target="OLLAMA_URL" Default="" Mode="" Description="Private local Ollama endpoint for release and profile analysis. Leave blank until configured; Ripe does not install models." Type="Variable" Display="always" Required="false" Mask="false"/>
   <Config Name="Dashboard URL" Target="DASHBOARD_URL" Default="http://localhost:8087" Mode="" Description="URL reachable by notification recipients. Configure this for your installation before enabling notifications." Type="Variable" Display="advanced" Required="false" Mask="false">http://localhost:8087</Config>
   <Config Name="Local model" Target="LOCAL_MODEL" Default="qwen3:8b" Mode="" Description="Installed Ollama model name; a 14B model can be selected instead. Ripe does not pull models." Type="Variable" Display="always" Required="true" Mask="false">qwen3:8b</Config>

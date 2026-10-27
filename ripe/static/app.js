@@ -169,7 +169,49 @@
     const data={...settings,soak_infrastructure:settings.soak_days.infrastructure,soak_internet:settings.soak_days.internet,soak_general:settings.soak_days.general,notification_people:settings.notification_people.join(', ')};
     for(const [name,value] of Object.entries(data)){const field=form.elements.namedItem(name);if(!field)continue;if(field.type==='checkbox')field.checked=!!value;else field.value=value??'';}
   }
+  async function initHomeAssistant() {
+    const form=$('#ha-connection-form');let connection=null,working=false;
+    const render=()=>{
+      const locked=working||!connection||connection.demo;
+      $$('input,button',form).forEach(field=>field.disabled=locked);
+      $('#ha-test').disabled=locked||!connection.configured;
+      $('#ha-disconnect').disabled=locked||!connection.configured&&!connection.has_token&&!connection.url;
+      if(!connection)return;
+      $('#ha-token').placeholder=connection.has_token?'Saved token · leave blank to keep':'Paste your long-lived access token';
+      text('#ha-token-help',connection.has_token?'A token is saved. Leave this field empty to keep it, or paste a replacement. It is never returned to the browser.':'Create a token in your Home Assistant profile → Security → Long-lived access tokens. It stays in Ripe’s private config.');
+      text('#ha-connection-status',connection.demo?'Leave demo mode to configure your live Home Assistant connection.':connection.last_test?.message||(connection.source==='environment'?'Using the deployment fallback. Save here to move this connection into private app settings.':connection.configured?'Connection saved. Test it to verify access.':'Not connected. Discovery and scripted notifications need a saved connection.'));
+    };
+    const action=async kind=>{
+      if(working||connection?.demo)return;
+      const url=$('#ha-url').value.trim(),token=$('#ha-token').value;
+      working=true;render();text('#ha-connection-result','Working…');
+      try{
+        if(kind==='save'){
+          connection=await api('/api/connections/home-assistant',{method:'PUT',body:JSON.stringify({url,token})});
+          $('#ha-token').value='';text('#ha-connection-result','Connection saved. Discovery will check again; notification preferences are unchanged.');
+        }else if(kind==='remove'){
+          connection=await api('/api/connections/home-assistant',{method:'DELETE'});$('#ha-token').value='';text('#ha-connection-result','Connection removed. Environment credentials will not be reactivated.');
+        }else{
+          const result=await api('/api/connections/home-assistant/test',{method:'POST'});connection.last_test=result;text('#ha-connection-result',result.message);
+        }
+        $('#ha-url').value=connection.url||'';
+      }catch(error){text('#ha-connection-result',error.message);}finally{working=false;render();}
+    };
+    form.onsubmit=event=>{event.preventDefault();void action('save');};
+    $('#ha-test').onclick=()=>action('test');$('#ha-disconnect').onclick=()=>action('remove');render();
+    try{connection=await api('/api/connections/home-assistant');$('#ha-url').value=connection.url||'';render();}
+    catch(error){text('#ha-connection-result',error.message);}
+  }
+  function initIconCopy(){
+    $('#copy-icon-url').onclick=async event=>{
+      const field=$('#unraid-icon-url'),button=event.currentTarget;let copied=false;
+      try{if(navigator.clipboard?.writeText){await navigator.clipboard.writeText(field.value);copied=true;}}catch{}
+      if(!copied){field.focus();field.select();try{copied=!!document.execCommand?.('copy');}catch{}}
+      button.textContent=copied?'Copied!':'Select the URL above and copy it';
+    };
+  }
   async function initSettings() {
+    void initHomeAssistant();initIconCopy();
     let settings;
     try{settings=await api('/api/settings');zone=settings.timezone||zone;demoContext(settings.demo_mode);if(settings.demo_mode){$('#test-notification').disabled=true;$('#test-notification').title='Demo mode never sends notifications';$('#settings-form').insertAdjacentHTML('beforebegin','<div class="demo-banner">'+icon('flask')+'Demo preferences are isolated from your live settings. Leave the demo from Overview to configure your homelab.</div>');}setForm($('#settings-form'),settings);$('#settings-form').hidden=false;$('#settings-loading').hidden=true;text('#footer-timezone',`Ripe · ${zone}`);}catch(error){$('#settings-loading').hidden=true;errorAt('#settings-error',error);return;}
     $('#browser-timezone').onclick=()=>{$('#settings-form').elements.timezone.value=Intl.DateTimeFormat().resolvedOptions().timeZone;};

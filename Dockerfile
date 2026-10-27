@@ -1,5 +1,7 @@
 FROM python:3.12-slim
 
+LABEL net.unraid.docker.icon="https://raw.githubusercontent.com/Crimson3076/unraid-ripe/main/ripe/static/icon.png"
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \

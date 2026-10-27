@@ -498,7 +498,7 @@ async def collect(settings: Settings, *, github_token: str | None = None, ha_tok
             except SourceError as exc:
                 error("home_assistant", str(exc))
         else:
-            error("home_assistant", "HA_URL or HA_TOKEN is not configured; Home Assistant discovery unavailable")
+            error("home_assistant", "Home Assistant connection is not configured; open Ripe Settings to enable discovery")
         unraid = AppRecord(id="unraid:os", name="Unraid OS", source="unraid", installed_version=installed_unraid(unraid_version_file), upstream_repo=None, profile=existing["unraid:os"].profile if "unraid:os" in existing else Profile(tier="infrastructure", exposure="lan"))
         if not unraid.installed_version:
             unraid.error = "Unraid version file not mounted or version unrecognised"

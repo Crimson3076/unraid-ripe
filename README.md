@@ -12,6 +12,17 @@ The image is not yet published to a registry. Build it from this checkout:
 docker build -t ripe:stage1 .
 ```
 
+To update an existing Compose installation, pull the source and rebuild using
+the same private `.env` and appdata mount:
+
+```sh
+git pull --ff-only
+docker compose --env-file .env -f deploy/compose.yaml up -d --build
+```
+
+For the Unraid template's locally built `ripe:stage1` image, rebuild that tag and
+recreate the container through its existing template, retaining `/config`.
+
 The normal Docker build needs PyPI access. If the builder has no package-network access, [deploy/build-offline.sh](deploy/build-offline.sh) can download exact locked wheels on the host and install them offline in a temporary build context. It preserves TLS/checksum verification and currently requires Linux x86_64 with Python 3.12.
 
 ### Docker Compose
@@ -43,12 +54,15 @@ The v1 WebUI has no login. Keep it on a trusted network; do not publish it direc
 
 ## Configure integrations
 
-Configuration belongs in local environment variables, the Unraid template, or Ripe's private Settings database. Do not commit deployment-specific addresses, recipients, tokens or app profiles.
+Configure Home Assistant directly in **Ripe Settings → Connect Home Assistant**.
+Other configuration belongs in local environment variables, the Unraid template,
+or Ripe's Settings database. Do not commit deployment-specific addresses,
+recipients, tokens or app profiles.
 
 | Variable | Purpose | Default |
 |---|---|---|
-| `HA_URL` | Home Assistant base URL | Unset |
-| `HA_TOKEN` | Home Assistant long-lived token | Unset |
+| `HA_URL` | Legacy Home Assistant URL fallback; saved app connection takes precedence | Unset |
+| `HA_TOKEN` | Legacy token fallback; prefer the private field in Ripe Settings | Unset |
 | `OLLAMA_URL` | Local Ollama endpoint for private profile analysis | Unset |
 | `LOCAL_MODEL` | Already installed Ollama model | `qwen3:8b` |
 | `GITHUB_TOKEN` | Optional public-release API rate limit increase | Unset |
@@ -59,7 +73,49 @@ Configuration belongs in local environment variables, the Unraid template, or Ri
 | `RIPE_CONFIG_DIR` | Private Ripe data directory | `/config` |
 | `RIPE_ALLOWED_HOSTS` | Comma-separated UI hostnames/IPs without ports | Loopback names/addresses |
 
-Enter secrets in masked template fields or a local `.env`. Ripe never displays their values. A GitHub token needs no write permissions. Gemini is optional and falls back to local classification on errors or rate limits.
+The Home Assistant token is entered in its own password field in Ripe Settings.
+GitHub/Gemini secrets still use masked template fields or a local `.env`. Saved
+token values are never returned to the browser. A GitHub token needs no write
+permissions. Gemini is optional and falls back to local classification on errors
+or rate limits.
+
+### Home Assistant connection
+
+Open **Settings → Connect Home Assistant**, enter its server URL and a long-lived
+access token, then save. Create the token in your Home Assistant profile →
+**Security → Long-lived access tokens**. **Test saved connection** checks the
+read-only REST API; it does not run the household notification script. Saving
+also requests another inventory check. If collection is already running, a new
+check is queued afterward. The connection serves both update discovery and the
+existing script notifications.
+
+The token is stored separately from general settings and profiles in
+`/config/secrets/home-assistant.json` (directory mode 0700, file mode 0600).
+Back up this small private file alongside the SQLite database; never put it in
+Git or a shared diagnostic export. Tokens loaded from this file are included in
+the secret-redaction denylist for storage, logs, profiles and model payloads.
+
+A blank token field keeps the current token. A changed server URL requires a
+new token or removal of the old one. **Remove connection** disables the live
+connection and persists that choice, so old environment credentials are not
+silently reactivated after a restart. Existing `HA_URL`/`HA_TOKEN` deployments
+continue working as a fallback until a connection is saved in the app. The
+interface identifies that fallback. Demo mode cannot view, edit or test live
+connection details. TLS/proxy redirects are not followed with the token.
+
+### Unraid dashboard icon
+
+New templates and rebuilt images use the glossy fruit icon. For an existing
+container, copy its URL from Ripe Settings, edit the Unraid template in Advanced
+View and replace **Icon URL**, then apply:
+
+```text
+https://raw.githubusercontent.com/Crimson3076/unraid-ripe/main/ripe/static/icon.png
+```
+
+The image also carries `net.unraid.docker.icon`. An older saved template label
+can override it. Refresh the dashboard if Unraid still shows a cached icon.
+The fruit also appears in Ripe's own sidebar and browser favicon.
 
 Use an Ollama endpoint that you control on the local network. Ripe does not pull models. Select an already installed model, including a larger model if suitable for your hardware. A successful `/api/tags` request confirms model availability, not classification quality.
 
@@ -104,6 +160,11 @@ The script must accept the fields `people` (list), `title`, `message`, `home_onl
 Weekly digests summarize ripe, security and read-first counts plus the next ripening. New applicable security findings are queued immediately; quiet hours defer delivery. Test notifications honor quiet hours too. Mocked request success does not establish phone delivery; verify the configured script in the actual deployment.
 
 ## Develop and test
+
+The optional settings interaction check uses Node and `jsdom@26.1.0`:
+`RIPE_PYTHON=.venv/bin/python RIPE_JSDOM=/path/to/node_modules/jsdom node tests/test_settings_ui.cjs`.
+It checks the private connection form, token clearing, general-settings isolation,
+saved connection tests, disconnect behavior, icon URL copying and demo protection.
 
 Python 3.12 or newer is required. Use the existing checkout; an isolated cloud task does not need a Git worktree.
 
