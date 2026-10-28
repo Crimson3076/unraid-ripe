@@ -508,3 +508,18 @@ async def _collect_existing(monkeypatch, tmp_path, apps, existing):
 
 
 from ripe.sources.collector import RateLimited as collector_RateLimited  # noqa: E402
+
+
+def test_retry_after_garbage_and_date():
+    from ripe.sources.collector import retry_after_seconds
+    assert retry_after_seconds('\u00b2') is None
+    assert retry_after_seconds('abc') is None
+    assert retry_after_seconds('7') == 7.0
+    assert retry_after_seconds('Wed, 21 Oct 2015 07:28:00 GMT') == 0.0
+
+
+def test_official_image_without_digest_stays_tracked_if_seen_before():
+    from ripe.sources.collector import is_local_image
+    assert is_local_image('nginx:latest', None) is True
+    assert is_local_image('nginx:latest', None, previously_tracked=True) is False
+    assert is_local_image('nginx:latest', 'sha256:a') is False

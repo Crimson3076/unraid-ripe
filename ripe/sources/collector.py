@@ -279,7 +279,7 @@ def retry_after_seconds(value: str | None) -> float | None:
     if not value:
         return None
     value = value.strip()
-    if value.isdigit():
+    if re.fullmatch(r"\d+", value, re.ASCII):
         return float(value)
     try:
         when = parsedate_to_datetime(value)
@@ -290,8 +290,11 @@ def retry_after_seconds(value: str | None) -> float | None:
     return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
 
 
-def is_local_image(image: str, digest: str | None) -> bool:
-    """Never pulled from a registry: a bare image ID, or an unnamespaced name with no RepoDigests."""
+def is_local_image(image: str, digest: str | None, previously_tracked: bool = False) -> bool:
+    """Never pulled from a registry: a bare image ID, or an unnamespaced name with no RepoDigests.
+
+    previously_tracked: registry data was found for this app before, so a missing digest
+    (e.g. a retagged pulled image) must not turn an official image into a local build."""
     image = (image or "").strip()
     if not image or re.fullmatch(r"(?:sha256:)?[a-fA-F0-9]{12,64}", image):
         return True
@@ -301,7 +304,7 @@ def is_local_image(image: str, digest: str | None) -> bool:
     first = name.split("/", 1)[0]
     if "/" in name and (first in LOCAL_HOSTS or first.startswith("localhost:")):
         return True
-    return "/" not in name
+    return "/" not in name and not previously_tracked
 
 
 class RegistryReader:
@@ -675,7 +678,7 @@ async def collect(settings: Settings, *, github_token: str | None = None, ha_tok
         # shorter span fetched for a newer installation of the same app.
         upstream_cache: dict[tuple[str, str | None], list[Release] | str] = {}
         for app in apps:
-            if app.source == "docker" and app.image and is_local_image(app.image, app.installed_digest):
+            if app.source == "docker" and app.image and is_local_image(app.image, app.installed_digest, bool(existing.get(app.id) and existing[app.id].latest_digest)):
                 # Never pulled from a registry: nothing to look up, and not an error.
                 app.detected["local_build"] = "local build (not tracked)"
             elif app.source == "docker" and app.image:
