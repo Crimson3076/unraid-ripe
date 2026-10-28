@@ -405,12 +405,22 @@ async def test_404_mapping_flagged_once_and_not_retried(monkeypatch, tmp_path):
     assert not hits and again.detected['invalid_mapping'] == flagged.detected['invalid_mapping']
     assert 'mapping needs attention' in again.error
     assert not any(e['source'] == 'docker:tdarr' for e in errors)
+    # A token change or an expired flag retries too.
+    hits.clear()
+    await _collect_404(monkeypatch, tmp_path, [make()], hits, existing=[flagged], token='x')
+    assert hits
+    hits.clear()
+    stale = flagged.model_copy(deep=True)
+    stale.detected['invalid_mapping']['at'] -= 7 * 3600
+    await _collect_404(monkeypatch, tmp_path, [make()], hits, existing=[stale])
+    assert hits
+    hits.clear()
     # Changing the mapping retries.
     apps, _, _ = await _collect_404(monkeypatch, tmp_path, [make('HaveAGitGat/Tdarr')], hits, existing=[flagged])
     assert hits
 
 
-async def _collect_404(monkeypatch, tmp_path, apps, hits, existing=None):
+async def _collect_404(monkeypatch, tmp_path, apps, hits, existing=None, token=None):
     from ripe.models import Settings
     from ripe.sources import collector
     socket = tmp_path / 'docker.sock'
@@ -432,4 +442,17 @@ async def _collect_404(monkeypatch, tmp_path, apps, hits, existing=None):
         kwargs['transport'] = httpx.MockTransport(handler)
         return original_client(*args, **kwargs)
     monkeypatch.setattr(collector.httpx, 'AsyncClient', make_client)
-    return await collector.collect(Settings(), docker_socket=str(socket), unraid_version_file=str(tmp_path / 'none'), existing_apps=existing)
+    return await collector.collect(Settings(), docker_socket=str(socket), unraid_version_file=str(tmp_path / 'none'), existing_apps=existing, github_token=token)
+
+
+async def test_backport_at_page_boundary_does_not_stop_early():
+    pages = []
+    def handler(request):
+        page = int(request.url.params['page'])
+        pages.append(page)
+        if page == 1:  # backport published late sits above the newer minor
+            return httpx.Response(200, json=[_gh('1.149.5')] + [_gh(f'1.150.{i}') for i in range(99, 0, -1)])
+        return httpx.Response(200, json=[_gh('1.150.0')] + [_gh(f'1.149.{i}') for i in range(4, -95, -1)][:99])
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        releases = await github_releases(CachedHTTP(client), 'o/a', 'docker:a', None, '1.150.0')
+    assert 2 in pages and any(r.version == '1.150.0' for r in releases)
