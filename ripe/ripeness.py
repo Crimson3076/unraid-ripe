@@ -138,7 +138,9 @@ def _build_view(app: AppRecord, releases: list[Release], settings: Settings,
     available_notes = [r for r in releases
                        if compare_versions(r.version, app.installed_version) is None
                        and (compare_versions(r.version, latest) in (None, -1, 0))]
-    tags = sorted({tag for r in pending for tag in _classification(r).get("tags", [])},
+    # A card-level tag must hold for the whole pending span, not for one release in it.
+    tag_sets = [set(_classification(r).get("tags", [])) for r in pending]
+    tags = sorted(set.intersection(*tag_sets) if tag_sets else set(),
                   key=lambda tag: (_TAG_ORDER.get(tag, 99), tag))
     signals: list[str] = []
     if app.latest_only:
@@ -150,7 +152,8 @@ def _build_view(app: AppRecord, releases: list[Release], settings: Settings,
         if _DATABASE.search(f"{app.name} {app.image or ''}"):
             signals.append("Database image major version change")
     view = AppView(app=app, status="unknown", status_label="Unknown", latest_version=latest,
-                   pending=pending, history=history, available_notes=available_notes, releases_behind=len(pending), tags=tags,
+                   pending=pending, history=history, available_notes=available_notes,
+                   no_notes=[r.version for r in pending if not r.notes.strip()], releases_behind=len(pending), tags=tags,
                    hard_signals=signals, reason="Could not determine an installed version or release notes.")
     if app.detected.get("local_build"):
         view.status_label, view.reason = "Local build (not tracked)", "Built locally, never pulled from a registry. Map it to a GitHub repository to track its releases."

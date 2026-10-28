@@ -18,11 +18,13 @@ const view=(id,name,extra)=>({status:'up_to_date',status_label:'Up to date',reas
  const dom=new JSDOM(html,{url:'http://localhost/',runScripts:'outside-only'}),w=dom.window,d=w.document,errors=[];
  w.matchMedia=()=>({matches:false});w.scrollTo=()=>{};w.addEventListener('error',e=>errors.push(e.error));
  const hint='No upstream repository mapping; choose one in the app profile';
- const apps=[view('docker:mapped','Mapped',{upstream_repo:'a/b'}),view('docker:bare','Unmapped <img src=x onerror=alert(1)>',{detected:{mapping_hint:hint}}),view('docker:stale','Stale',{upstream_repo:'a/c',detected:{mapping_hint:hint}})];
+ const apps=[view('docker:mapped','Mapped',{upstream_repo:'a/b'}),view('docker:bare','Unmapped <img src=x onerror=alert(1)>',{detected:{mapping_hint:hint}}),view('docker:stale','Stale',{upstream_repo:'a/c',detected:{mapping_hint:hint}}),{...view('docker:rolled','Rolled',{upstream_repo:'a/d'}),rollup:{headline:'New features: Added sensors (+2 more)'}}];
  w.fetch=async url=>{if(url!=='/api/dashboard')throw new Error('Unexpected API: '+url);return {ok:true,json:async()=>({apps,summary:{},timezone:'UTC'})};};
  w.eval(fs.readFileSync(path.join(root,'ripe/static/app.js'),'utf8'));await tick();await tick();
  const cards=[...d.querySelectorAll('.app-card')],hintOf=id=>cards.find(c=>c.getAttribute('href')==='/apps/'+encodeURIComponent(id)).querySelector('.mapping-hint');
- assert.equal(cards.length,3);
+ assert.equal(cards.length,4);
+ assert.equal(cards.find(c=>c.getAttribute('href')==='/apps/docker%3Arolled').querySelector('.card-reason').textContent,'New features: Added sensors (+2 more)','Overview card shows the rollup headline instead of the generic reason');
+ assert.equal(cards.find(c=>c.getAttribute('href')==='/apps/docker%3Amapped').querySelector('.card-reason').textContent,'ok');
  assert.equal(hintOf('docker:mapped'),null,'Mapped app has no hint');
  assert.equal(hintOf('docker:stale'),null,'Hint is hidden once a repo is mapped');
  const el=hintOf('docker:bare');assert(el);

@@ -11,12 +11,17 @@ from .config import Runtime
 from .models import AppRecord, AppView, Profile, Release, Settings, utcnow
 from .store import Store
 from .sources import collect
-from .intelligence import classify_release, analyze_applicability, sanitize_profile, classification_key, prompt_digest
+from .intelligence import (classify_release, analyze_applicability, sanitize_profile, classification_key,
+                           prompt_digest, build_rollup, rollup_key)
 from .intelligence.evidence import conservative_applicability, keyword_warnings
 from .ripeness import build_view, dashboard_sort_key
 from .versions import compare_versions
 from .notifications import Notifier
 from .demo import seed_demo
+
+
+def rollup_latest(app: AppRecord, pending: list[Release]) -> str | None:
+    return pending[-1].version if pending else app.latest_version
 
 
 def fingerprint(value: Any) -> str:
@@ -107,13 +112,40 @@ class Coordinator:
         settings = self.store.settings(self.runtime.initial_settings())
         return settings.model_copy(update={'demo_mode': self.demo})
 
+    def with_rollup(self, view: AppView) -> AppView:
+        # A stored rollup is shown only while it still describes this installed -> latest span.
+        stored = (self.store.get('rollup:' + view.app.id) or {}).get('result')
+        if stored and stored.get('installed') == view.app.installed_version and stored.get('latest') == rollup_latest(view.app, view.pending):
+            view.rollup = stored
+        return view
+
     def views(self, now: datetime | None = None) -> list[AppView]:
         settings = self.settings()
-        return sorted([build_view(app, self.store.releases(app.id), settings, now) for app in self.store.apps()],key=dashboard_sort_key)
+        return sorted([self.with_rollup(build_view(app, self.store.releases(app.id), settings, now)) for app in self.store.apps()],key=dashboard_sort_key)
 
     def view(self, app_id: str) -> AppView | None:
         app = self.store.app(app_id)
-        return build_view(app, self.store.releases(app_id), self.settings()) if app else None
+        return self.with_rollup(build_view(app, self.store.releases(app_id), self.settings())) if app else None
+
+    async def refresh_rollup(self, app: AppRecord, settings: Settings, local_ready) -> None:
+        """Regenerate the app's rollup only when installed, latest, their notes or the model setup changed."""
+        pending = build_view(app, self.store.releases(app.id), settings).pending
+        image_diff, manifest = app.detected.get('image_diff'), app.detected.get('manifest_diff')
+        if not app.installed_version or not (pending or image_diff):
+            self.store.set('rollup:' + app.id, None)
+            return
+        latest = rollup_latest(app, pending)
+        key = rollup_key(app, app.installed_version, latest, pending, image_diff, manifest, settings)
+        stored = self.store.get('rollup:' + app.id) or {}
+        if stored.get('key') == key and stored['result'].get('status') == 'ok':
+            return
+        unavailable = None
+        if (any(r.notes.strip() for r in pending) or manifest) and settings.classification_provider == 'local' and not await local_ready():
+            unavailable = 'Local model is unavailable; no summary was inferred.'
+        result = await build_rollup(app, app.installed_version, latest, pending, settings, image_diff=image_diff,
+                                    manifest_diff=manifest, gemini_key=self.runtime.gemini_key,
+                                    model_unavailable=unavailable, log_call=self.store.log_llm)
+        self.store.set('rollup:' + app.id, {'key': key if result['status'] == 'ok' else None, 'result': result})
 
     def dashboard(self) -> dict:
         views = self.views()
@@ -234,6 +266,13 @@ class Coordinator:
                         if self.store.get('generation:' + app.id, 0) != generation:
                             break
                         self.store.save_release(release)
+                    if self.store.get('generation:' + app.id, 0) == generation:
+                        async def ready():
+                            nonlocal local_ready
+                            if local_ready is None:
+                                local_ready = await self.local_ready(settings)
+                            return local_ready
+                        await self.refresh_rollup(app, settings, ready)
                 # Mark a source failure as stale rather than silently deleting its
                 # previous records; these visible errors prevent a fresh-data claim.
                 current_ids = {a.id for a in apps}
