@@ -705,7 +705,8 @@ async def collect(settings: Settings, *, github_token: str | None = None, ha_tok
                 except RateLimited:
                     # Keep the last known registry data and retry on the next poll.
                     previous = existing.get(app.id)
-                    if previous:
+                    # Only reuse it when this is still the same installation.
+                    if previous and previous.image == app.image and previous.installed_digest == app.installed_digest:
                         app.latest_digest, app.latest_only = previous.latest_digest, previous.latest_only
                         app.update_available, app.image_changed_at = previous.update_available, previous.image_changed_at
                         app.installed_version = app.installed_version or previous.installed_version

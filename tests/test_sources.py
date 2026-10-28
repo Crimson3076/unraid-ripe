@@ -485,12 +485,25 @@ async def test_local_image_not_an_error_and_rate_limit_keeps_data(monkeypatch, t
         assert 'ripe' not in image
         raise collector.RateLimited('Registry: rate limited', 60)
     monkeypatch.setattr(collector.RegistryReader, 'metadata', limited_meta)
-    apps, _, errors = await _collect_existing(monkeypatch, tmp_path, [local, limited], [AppRecord(id='docker:lim', name='lim', source='docker', latest_digest='sha256:old', update_available=True)])
+    apps, _, errors = await _collect_existing(monkeypatch, tmp_path, [local, limited], [AppRecord(id='docker:lim', name='lim', source='docker', image=limited.image, installed_digest=limited.installed_digest, latest_digest='sha256:old', update_available=True)])
     by_id = {a.id: a for a in apps}
     assert not any(e['source'].startswith('docker:') for e in errors)
     assert by_id['docker:ripe'].detected['local_build'] and not by_id['docker:ripe'].error
     assert build_view(by_id['docker:ripe'], [], Settings()).status_label == 'Local build (not tracked)'
     assert by_id['docker:lim'].latest_digest == 'sha256:old' and by_id['docker:lim'].update_available is True
+
+
+async def test_rate_limit_does_not_reuse_data_after_installation_changed(monkeypatch, tmp_path):
+    from ripe.sources import collector
+    app = AppRecord(id='docker:lim', name='lim', source='docker', image='lscr.io/linuxserver/x:latest', installed_digest='sha256:' + '2' * 64)
+    previous = AppRecord(id='docker:lim', name='lim', source='docker', image=app.image, installed_digest='sha256:' + '1' * 64,
+                         latest_digest='sha256:old', latest_only=True, update_available=False, installed_version='1.0')
+    async def limited_meta(self, image, installed_digest, match_version=True):
+        raise collector.RateLimited('Registry: rate limited', 60)
+    monkeypatch.setattr(collector.RegistryReader, 'metadata', limited_meta)
+    apps, _, _ = await _collect_existing(monkeypatch, tmp_path, [app], [previous])
+    got = apps[0]
+    assert got.latest_digest is None and got.update_available is None and not got.latest_only and got.installed_version is None
 
 
 async def _collect_existing(monkeypatch, tmp_path, apps, existing):
