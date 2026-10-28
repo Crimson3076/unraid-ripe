@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 
 import httpx
@@ -173,3 +173,25 @@ async def test_first_run_seeds_digest_instead_of_sending(store):
     assert store.get('digest-sent-for') == '2026-10-26'
     await notifier.tick(settings, [], now=instant('2026-11-02T12:00:00Z'))
     assert len(calls) == 1
+
+
+async def test_security_alert_ignores_target_change_but_realerts_when_new_fix_soaks(store):
+    calls, transport = recorder()
+    settings = configured_settings(timezone='UTC')
+    store.set('digest-sent-for', '2026-10-26')
+    notifier = Notifier(store, 'http://ha.local:8123', 'test-ha-secret', transport=transport)
+    now = instant('2026-10-26T15:00:00Z')
+    view = security_view()
+    await notifier.tick(settings, [view], now=now)
+    view.recommended_version = '1.03'  # a non-security release finished its soak
+    await notifier.tick(settings, [view], now=now)
+    assert len(calls) == 1
+    low = {'tags': ['security'], 'security': [{'description': 'Minor hardening.', 'severity': 'low',
+           'requires': 'none', 'evidence': 'Hardened parser.'}]}
+    later = Release(id='github:example/gateway:103', app_id=view.app.id, version='1.03', notes='Hardened parser.',
+                    classification=low, published_at=now - timedelta(days=1))
+    view.pending.append(later)
+    await notifier.tick(settings, [view], now=now)
+    assert len(calls) == 1  # still soaking
+    await notifier.tick(settings, [view], now=now + timedelta(days=settings.patch_soak_days))
+    assert len(calls) == 2

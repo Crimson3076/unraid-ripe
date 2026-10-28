@@ -6,6 +6,7 @@ import hashlib
 import re
 import httpx
 from .models import Settings, AppView, utcnow
+from .ripeness import _security_ready
 from .store import Store
 
 
@@ -82,8 +83,10 @@ class Notifier:
         for view in views:
             if view.status != 'recommended_now':
                 continue
-            fixes = [(r.version, (r.classification or {}).get('security', [])) for r in view.pending if (r.classification or {}).get('security')]
-            key = 'security-sent:' + hashlib.sha256(repr((view.app.id, fixes, view.recommended_version)).encode()).hexdigest()
+            # Only fixes past their soak are keyed, so a later fix finishing its soak alerts
+            # again, while an unrelated non-security target change does not.
+            fixes = [(r.version, (r.classification or {}).get('security', [])) for r in view.pending if _security_ready(r, settings, now)]
+            key = 'security-sent:' + hashlib.sha256(repr((view.app.id, fixes)).encode()).hexdigest()
             if self.store.get(key):
                 continue
             if await self.send(settings, f'{view.app.name}: applicable security fix available. Review {view.recommended_version or "the release notes"}; no update has been performed.', 'ripe-security-' + hashlib.sha256(view.app.id.encode()).hexdigest()[:12], now=now):
