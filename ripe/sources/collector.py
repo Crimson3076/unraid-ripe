@@ -16,11 +16,11 @@ from xml.etree import ElementTree
 import httpx
 import websockets
 
+from ripe.autoprofile import AUTO_FIELDS, INFRA, derive, probe_login, read_cloudflared_targets, read_facts, read_npm_targets
 from ripe.models import AppRecord, Profile, Release, Settings, utcnow
 from ripe.versions import compare_versions, parse_version, version_parts
 
 JSON = dict[str, Any]
-INFRA = re.compile(r"unraid|home.?assistant|adguard|nginx.?proxy.?manager|cloudflar|wireguard|mariadb|mysql|postgres|redis|mongo|pihole|pi.hole|traefik|caddy", re.I)
 REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 LINUXSERVER_UPSTREAM = {
     "sonarr":"Sonarr/Sonarr", "radarr":"Radarr/Radarr", "lidarr":"Lidarr/Lidarr",
@@ -87,7 +87,16 @@ def safe_url(value: Any) -> str | None:
 
 
 def inferred_profile(name: str) -> Profile:
-    return Profile(tier="infrastructure" if INFRA.search(name) else "general", exposure="unknown")
+    return Profile(tier="infrastructure" if INFRA.search(name) else "general", exposure="unknown", origin={f: "auto" for f in AUTO_FIELDS})
+
+
+def clean_webui(value: Any) -> str | None:
+    """A WebUI template string, kept only if it resolves to a plain http(s) URL."""
+    webui = str(value or "").strip()
+    if "[IP]" in webui:
+        probe = re.sub(r"\[PORT:(\d+)\]", r"\1", webui.replace("[IP]", "127.0.0.1"))
+        return webui if safe_url(probe) else None
+    return safe_url(webui)
 
 
 def read_templates(directory: str) -> dict[str, JSON]:
@@ -108,12 +117,7 @@ def read_templates(directory: str) -> dict[str, JSON]:
             name = (tree.findtext("Name") or "").strip()
             image = (tree.findtext("Repository") or "").strip()
             project = github_repo(tree.findtext("Project")) or github_repo(tree.findtext("Support"))
-            webui = (tree.findtext("WebUI") or "").strip()
-            if "[IP]" in webui:
-                probe = re.sub(r"\[PORT:(\d+)\]", r"\1", webui.replace("[IP]", "127.0.0.1"))
-                webui = webui if safe_url(probe) else None
-            else:
-                webui = safe_url(webui)
+            webui = clean_webui(tree.findtext("WebUI"))
             metadata = {"repo": project, "icon": safe_url(tree.findtext("Icon")), "web_url": webui, "image": image}
             if name:
                 found[name.lower()] = metadata
@@ -169,12 +173,13 @@ class DockerReader:
 
 A :ro socket mount alone does not make the Docker daemon's API read-only.
     """
-    ALLOWED = re.compile(r"^/(?:containers/json|images/(?:sha256%3A|sha256:)?[a-fA-F0-9]{12,64}/json)$")
+    ALLOWED = re.compile(r"^/(?:containers/json|containers/[a-fA-F0-9]{12,64}/json|images/(?:sha256%3A|sha256:)?[a-fA-F0-9]{12,64}/json)$")
 
     def __init__(self, client: httpx.AsyncClient, host: str = "localhost"):
         self.client = client
         self.host = host
         self.skipped: list[str] = []
+        self.facts: dict[str, dict] = {}
 
     async def read(self, path: str, params=None) -> Any:
         if not self.ALLOWED.fullmatch(path):
@@ -187,13 +192,14 @@ A :ro socket mount alone does not make the Docker daemon's API read-only.
         except (httpx.HTTPError, ValueError):
             raise SourceError("Docker: connection or JSON error") from None
 
-    async def apps(self, templates: dict[str, JSON], existing: dict[str, AppRecord]) -> list[AppRecord]:
+    async def apps(self, templates: dict[str, JSON], existing: dict[str, AppRecord], proxy_targets: list[JSON] | None = None, prober=None) -> list[AppRecord]:
         containers = await self.read("/containers/json", {"all": "1"})
         if not isinstance(containers, list):
             raise SourceError("Docker: invalid container list")
         apps = []
         image_cache = {}
         self.skipped = []
+        self.facts = {}
         for item in containers[:1000]:
             if not isinstance(item, dict):
                 continue
@@ -205,6 +211,7 @@ A :ro socket mount alone does not make the Docker daemon's API read-only.
             except (AttributeError, TypeError, ValueError, KeyError):
                 # One malformed record must not hide every other container.
                 self.skipped.append("docker:" + ident[:12])
+        await derive(apps, self.facts, proxy_targets or [], prober, self.host)
         return apps
 
     async def _app(self, item: JSON, ident: str, templates: dict[str, JSON], existing: dict[str, AppRecord], image_cache: dict) -> AppRecord:
@@ -220,27 +227,44 @@ A :ro socket mount alone does not make the Docker daemon's API read-only.
             info = image_cache[image_id]
         if not isinstance(info, dict):
             info = {}
+        try:
+            inspect = await self.read(f"/containers/{ident}/json")
+        except SourceError:
+            inspect = {}
+        inspect = inspect if isinstance(inspect, dict) else {}
         labels = dict((info.get("Config") or {}).get("Labels") or {})
         labels.update(item.get("Labels") or {})
         image = item.get("Image", "")
-        # Only OCI metadata is retained. Never persist Config.Env or inspect blobs.
+        # Only OCI metadata and the autoprofile facts are retained; env values pass the
+        # allowlist in ripe.autoprofile and inspect payloads are never stored.
         installed = usable_version_label(labels.get("org.opencontainers.image.version"))
         host, repo, tag = parse_image(image)
         if not installed and tag not in ("latest", "stable", "main", "master", "edge", "develop") and not tag.startswith("sha256:"):
             installed = tag
         digests = info.get("RepoDigests") or []
         digest = next((d.rsplit("@", 1)[-1] for d in digests if "@sha256:" in d), None)
-        upstream = previous.upstream_repo if previous and previous.upstream_repo else github_repo(labels.get("org.opencontainers.image.source")) or tpl.get("repo")
-        if not (previous and previous.upstream_repo) and repo.startswith("linuxserver/"):
-            upstream = LINUXSERVER_UPSTREAM.get(repo.split("/", 1)[1], upstream)
-        profile = previous.profile if previous else inferred_profile(name + " " + repo)
+        evidence = {}
+        label_repo, template_repo = github_repo(labels.get("org.opencontainers.image.source")), tpl.get("repo")
+        upstream = previous.upstream_repo if previous and previous.upstream_repo else label_repo or template_repo
+        if label_repo and upstream == label_repo and not (previous and previous.upstream_repo):
+            evidence["upstream_repo"] = "OCI image source label"
+        elif template_repo and upstream == template_repo and not (previous and previous.upstream_repo):
+            evidence["upstream_repo"] = "Unraid template Project/Support link"
+        if not (previous and previous.upstream_repo) and repo.startswith("linuxserver/") and repo.split("/", 1)[1] in LINUXSERVER_UPSTREAM:
+            upstream = LINUXSERVER_UPSTREAM[repo.split("/", 1)[1]]
+            evidence["upstream_repo"] = "known mapping for the linuxserver image (the image repo is only a wrapper)"
+        profile = inferred_profile(name + " " + repo)
         ports = [{"private":p.get("PrivatePort"), "public":p.get("PublicPort")} for p in item.get("Ports") or [] if isinstance(p, dict)]
-        web_url = tpl.get("web_url")
+        web_url = tpl.get("web_url") or clean_webui(labels.get("net.unraid.docker.webui"))
         if web_url:
             port_map = {p["private"]:p["public"] for p in ports if p.get("public")}
             web_url = re.sub(r"\[PORT:(\d+)\]", lambda match:str(port_map.get(int(match.group(1)), match.group(1))), web_url.replace("[IP]", self.host))
             web_url = safe_url(web_url)
-        return (AppRecord(id=key, name=name, source="docker", installed_version=installed, image=image, installed_digest=digest, image_created_at=date(info.get("Created")), upstream_repo=upstream, icon=tpl.get("icon"), web_url=web_url, profile=profile, detected={"ports":ports, "revision": str(labels.get("org.opencontainers.image.revision", ""))[:80], "registry": host, "tag": tag}))
+        self.facts[key] = read_facts(item, info, inspect)
+        detected = {"ports":ports, "revision": str(labels.get("org.opencontainers.image.revision", ""))[:80], "registry": host, "tag": tag, "profile_evidence": evidence}
+        if upstream and evidence.get("upstream_repo"):
+            detected["upstream_auto"] = True
+        return (AppRecord(id=key, name=name, source="docker", installed_version=installed, image=image, installed_digest=digest, image_created_at=date(info.get("Created")), upstream_repo=upstream, icon=tpl.get("icon"), web_url=web_url, profile=profile, detected=detected))
 
 
 def parse_image(image: str) -> tuple[str, str, str]:
@@ -595,8 +619,13 @@ def ha_records(states: list[JSON], notes: dict[str, str], existing: dict[str, Ap
             repo = "home-assistant/core"
         if not repo and re.search(r"home assistant (?:operating system|os)", title, re.I):
             repo = "home-assistant/operating-system"
-        profile = existing[key].profile if key in existing else inferred_profile(title)
-        apps.append(AppRecord(id=key, name=title, source="home_assistant", installed_version=installed, latest_version=latest, update_available=item.get("state")=="on" if item.get("state") in ("on", "off") else None, upstream_repo=repo, icon=safe_url(attr.get("entity_picture")), profile=profile, detected={"entity_id":entity_id}, error="Entity unavailable" if item.get("state") in ("unavailable", "unknown") else None))
+        profile = inferred_profile(title)
+        evidence = {}
+        if repo and repo == github_repo(url) and not (key in existing and existing[key].upstream_repo):
+            evidence["upstream_repo"] = "Home Assistant update entity release_url"
+        if INFRA.search(title):
+            evidence["tier"] = f"name matches '{INFRA.search(title).group(0).lower()}'"
+        apps.append(AppRecord(id=key, name=title, source="home_assistant", installed_version=installed, latest_version=latest, update_available=item.get("state")=="on" if item.get("state") in ("on", "off") else None, upstream_repo=repo, icon=safe_url(attr.get("entity_picture")), profile=profile, detected={"entity_id":entity_id, "profile_evidence":evidence}, error="Entity unavailable" if item.get("state") in ("unavailable", "unknown") else None))
         text = notes.get(entity_id) or attr.get("release_summary") or ""
         if latest and text:
             # HA update states do not include publication date. Do not start an
@@ -629,7 +658,11 @@ async def collect(settings: Settings, *, github_token: str | None = None, ha_tok
                 transport = httpx.AsyncHTTPTransport(uds=docker_socket)
                 async with httpx.AsyncClient(transport=transport, base_url="http://docker", timeout=15, trust_env=False) as docker:
                     reader = DockerReader(docker, host=urlparse(settings.dashboard_url).hostname or "localhost")
-                    apps.extend(await reader.apps(read_templates(templates_dir), existing))
+                    # Optional, off by default: only paths the user set are read (read-only).
+                    targets = read_npm_targets(settings.npm_database_path) + read_cloudflared_targets(settings.cloudflared_config_path)
+                    async def prober(url: str):
+                        return await probe_login(local, url)
+                    apps.extend(await reader.apps(read_templates(templates_dir), existing, targets, prober))
                     for skipped in reader.skipped:
                         error(skipped, "Docker: container record parse error")
             except SourceError as exc:
@@ -656,7 +689,7 @@ async def collect(settings: Settings, *, github_token: str | None = None, ha_tok
                 error("home_assistant", "Home Assistant: parse error")
         else:
             error("home_assistant", "Home Assistant connection is not configured; open Ripe Settings to enable discovery")
-        unraid = AppRecord(id="unraid:os", name="Unraid OS", source="unraid", installed_version=installed_unraid(unraid_version_file), upstream_repo=None, profile=existing["unraid:os"].profile if "unraid:os" in existing else Profile(tier="infrastructure", exposure="lan"))
+        unraid = AppRecord(id="unraid:os", name="Unraid OS", source="unraid", installed_version=installed_unraid(unraid_version_file), upstream_repo=None, profile=Profile(tier="infrastructure", exposure="lan", origin={f: "auto" for f in AUTO_FIELDS}), detected={"profile_evidence": {"tier": "Unraid OS is the host everything else runs on"}})
         if not unraid.installed_version:
             unraid.error = "Unraid version file not mounted or version unrecognised"
             error("unraid", unraid.error)
@@ -735,8 +768,14 @@ async def collect(settings: Settings, *, github_token: str | None = None, ha_tok
                     releases.extend(app_releases)
                 except SourceError as exc:
                     upstream_cache[cache_key] = str(exc)
-                    app.error = str(exc)
-                    error(app.id, str(exc))
+                    if str(exc) == "GitHub: HTTP 404" and app.detected.pop("upstream_auto", False):
+                        # An automatically detected repo that does not exist is dropped, not trusted.
+                        app.upstream_repo = None
+                        app.detected.get("profile_evidence", {}).pop("upstream_repo", None)
+                        app.detected["mapping_hint"] = "Detected upstream repository was not found; choose one in the app profile"
+                    else:
+                        app.error = str(exc)
+                        error(app.id, str(exc))
                 except PARSE_ERRORS:
                     upstream_cache[cache_key] = "GitHub: parse error"
                     app.error = "GitHub: parse error"

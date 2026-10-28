@@ -79,7 +79,7 @@ def sanitize_profile(profile: Profile) -> Profile:
 
 
 def profile_text(profile: Profile) -> str:
-    return json.dumps(sanitize_profile(profile).model_dump(), sort_keys=True, ensure_ascii=False)
+    return json.dumps(sanitize_profile(profile).model_dump(exclude={'origin'}), sort_keys=True, ensure_ascii=False)
 
 
 def public_payload(app_name: str, version: str, notes: str) -> dict[str, str]:

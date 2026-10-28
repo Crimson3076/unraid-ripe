@@ -19,6 +19,7 @@ from .config import Runtime, checked_url
 from .models import Settings, Profile
 from .service import Coordinator
 from .intelligence import sanitize_profile, local_model_url
+from .autoprofile import edited_origin
 from .notifications import Notifier, is_quiet
 
 PACKAGE = Path(__file__).parent
@@ -48,6 +49,9 @@ def validate_settings(data: dict, current: Settings) -> Settings:
         raise ValueError('Use a Home Assistant script entity ID')
     if settings.notifications_enabled and not settings.notification_script:
         raise ValueError('Configure a Home Assistant script before enabling notifications')
+    for path in (settings.npm_database_path,settings.cloudflared_config_path):
+        if path and (not re.fullmatch(r'/[\w.\- /]{1,300}',path) or '..' in path.split('/')):
+            raise ValueError('Use an absolute path to a mounted file')
     if len(settings.notification_channel)>100:
         raise ValueError('Notification channel is too long')
     if any(not re.fullmatch(r'[a-zA-Z0-9_.:/-]{1,100}',m) for m in (settings.local_model,settings.gemini_model)):
@@ -147,9 +151,11 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         if set(data)-set(Profile.model_fields):
             raise HTTPException(422,'Unknown profile field')
         try:
-            profile = sanitize_profile(Profile.model_validate({**app_record.profile.model_dump(),**data}))
+            profile = sanitize_profile(Profile.model_validate({**app_record.profile.model_dump(),**data,'origin':app_record.profile.origin}))
         except ValueError:
             raise HTTPException(422,'Invalid profile') from None
+        # Whatever the user changed is theirs from now on; later scans leave it alone.
+        profile.origin = edited_origin(app_record.profile,profile)
         manager.mark_changed(app_id)
         manager.store.set('profile:'+app_id,profile.model_dump(mode='json'))
         app_record.profile = profile
@@ -162,6 +168,11 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             manager.store.save_release(release)
         manager.request_poll()
         return {'profile':profile,'sanitized':True}
+
+    @app.post('/api/auto-profiles/review')
+    async def review_auto_profiles(request:Request):
+        request.app.state.manager.review_auto_profiles()
+        return {'reviewed':True}
 
     @app.patch('/api/apps/{app_id}/mapping')
     async def mapping(request:Request,app_id:str,data:dict=Body(...)):
