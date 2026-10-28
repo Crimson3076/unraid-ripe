@@ -173,6 +173,7 @@ class Coordinator:
         """Treat a poll older than the timeout as dead so the next one can run."""
         if self.poll_task and not self.poll_task.done():
             self.poll_task.cancel()
+        self.poll_task = None  # a cancelling task must not block the next poll
         self.polling = False
         self.poll_token = None
         self.store.log_error({'source':'collector','message':'An earlier update check exceeded its time limit and was abandoned.'})

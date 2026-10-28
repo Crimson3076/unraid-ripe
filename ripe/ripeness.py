@@ -189,7 +189,7 @@ def _build_view(app: AppRecord, releases: list[Release], settings: Settings,
     elif applicable_break or attention or any(s in signals for s in ("Semver major version change", "Database image major version change", "Pending span includes a pre-release")):
         view.status, view.status_label = "read_first", "Read first"
         view.reason = "Review the applicable breaking/migration items and hard signals before deciding." if applicable_break or signals else ""
-    elif unknown and not latest_missing and all(r.classification is None for r in pending if r.notes.strip()) \
+    elif unknown and not latest_missing and any(r.classification is None for r in pending) \
             and all(r.notes.strip() for r in pending):
         view.status_label = "Summary pending"
         view.reason = "Release summaries are still being generated; no safety conclusion can be made yet."

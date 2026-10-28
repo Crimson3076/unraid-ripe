@@ -261,3 +261,80 @@ async def test_stale_poll_is_abandoned_so_the_next_can_run(tmp_path,monkeypatch)
         hang.set()
         manager.closing=True
         manager.close()
+
+
+@pytest.mark.asyncio
+async def test_local_provider_down_keeps_queue_and_stops(tmp_path,monkeypatch):
+    manager=Coordinator(runtime(tmp_path))
+    slow_setup(manager,monkeypatch)
+    async def down(*args):
+        return False
+    monkeypatch.setattr(manager,'local_ready',down)
+    calls=[]
+    async def classify(release,app,settings,**kwargs):
+        calls.append(release.id)
+        return release
+    monkeypatch.setattr(service,'classify_release',classify)
+    try:
+        await manager.poll()
+        await manager.classify_task
+        assert calls==[] and manager.queue_length()==1
+        assert manager.store.get('last_classification') is None
+        assert 'Pending classifications stay queued' in str(manager.store.logs())
+    finally:
+        manager.close()
+
+
+@pytest.mark.asyncio
+async def test_classify_budget_stops_run_and_cooldown_delays_restart(tmp_path,monkeypatch):
+    releases=[release_at('1.1.0',30),release_at('1.2.0',20)]
+    manager=Coordinator(runtime(tmp_path))
+    slow_setup(manager,monkeypatch,releases).latest_version='1.2.0'
+    manager.classify_budget=0
+    async def classify(release,app,settings,**kwargs):
+        return release.model_copy(update={'classification':{'status':'ok','tags':['bugfix'],'tag_evidence':{'bugfix':'Fixed an error.'}},'classification_key':classification_key(release,app,settings)})
+    monkeypatch.setattr(service,'classify_release',classify)
+    try:
+        await manager.poll()
+        await manager.classify_task
+        assert manager.queue_length()==2 and manager.classify_ended is not None
+        manager.classify_budget=60
+        await manager.cycle()  # inside the cooldown: nothing restarts
+        assert manager.classify_task.done() and manager.queue_length()==2
+        manager.classify_cooldown=0
+        await manager.cycle()
+        await manager.classify_task
+        assert manager.queue_length()==0
+    finally:
+        manager.close()
+
+
+@pytest.mark.asyncio
+async def test_abandoned_poll_cannot_clear_newer_poll_flag(tmp_path,monkeypatch):
+    manager=Coordinator(runtime(tmp_path))
+    slow_setup(manager,monkeypatch)
+    hang,release_second=asyncio.Event(),asyncio.Event()
+    real=service.collect
+    async def hung(*args,**kwargs):
+        await hang.wait()
+    monkeypatch.setattr(service,'collect',hung)
+    try:
+        assert manager.request_poll()
+        first=manager.poll_task
+        await asyncio.sleep(0)
+        manager.poll_timeout=0.01
+        await asyncio.sleep(0.05)
+        async def second_collect(*args,**kwargs):
+            await release_second.wait()
+            return await real(*args,**kwargs)
+        monkeypatch.setattr(service,'collect',second_collect)
+        await manager.cycle()  # stale poll is abandoned; the due poll starts fresh
+        await asyncio.sleep(0.01)
+        assert manager.polling and manager.poll_task is not first
+        release_second.set()
+        await manager.poll_task
+        assert manager.polling is False and manager.store.get('last_poll')
+    finally:
+        hang.set(); release_second.set()
+        manager.closing=True
+        manager.close()
