@@ -66,7 +66,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             yield
         finally:
             manager.closing = True
-            for task in (manager.task,manager.poll_task):
+            for task in (manager.task,manager.poll_task,manager.classify_task):
                 if task:
                     task.cancel()
                     with suppress(asyncio.CancelledError):
@@ -107,7 +107,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
 
     @app.get('/health')
     async def health():
-        return {'status':'ok','stage':1,'read_only':True}
+        return {'status':'ok','stage':1,'read_only':True,**app.state.manager.progress(),'polling':app.state.manager.polling}
 
     @app.get('/')
     async def home(request:Request):

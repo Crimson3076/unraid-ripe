@@ -37,7 +37,10 @@ async def test_public_release_cache_shared_and_installed_version_moves_history(t
     monkeypatch.setattr(manager,'local_ready',ready)
     try:
         await manager.poll()
+        await manager.classify_task
         await manager.poll()
+        assert not manager.classify_task or manager.classify_task.done()
+        assert manager.queue_length()==0
         assert calls==['github:example/app:1']
         assert len(manager.store.releases('one'))==len(manager.store.releases('two'))==1
         assert manager.view('one').releases_behind==1
@@ -71,7 +74,8 @@ async def test_profile_edit_during_inference_cannot_restore_old_exclusion(tmp_pa
     monkeypatch.setattr(service,'collect',collect)
     monkeypatch.setattr(service,'analyze_applicability',analyze)
     monkeypatch.setattr(manager,'local_ready',ready)
-    task=asyncio.create_task(manager.poll())
+    await manager.poll()
+    task=manager.classify_task
     try:
         await asyncio.wait_for(started.wait(),2)
         manager.mark_changed(app.id)
@@ -116,3 +120,144 @@ async def test_scheduler_loop_survives_an_exception(tmp_path,monkeypatch):
         assert 'secret' not in str(manager.store.logs())
     finally:
         manager.close() if hasattr(manager,'close') else None
+
+
+def slow_setup(manager,monkeypatch,releases=None):
+    a,r=inventory()
+    releases=releases or [r]
+    async def collect(*args,**kwargs):
+        return [a],[x.model_copy() for x in releases],[]
+    async def ready(*args):
+        return True
+    monkeypatch.setattr(service,'collect',collect)
+    monkeypatch.setattr(manager,'local_ready',ready)
+    return a
+
+
+def release_at(version,days):
+    return Release(id='github:example/app:'+version,app_id='one',version=version,published_at=utcnow()-timedelta(days=days),notes='Fixed an error.')
+
+
+@pytest.mark.asyncio
+async def test_collection_finishes_before_slow_classification(tmp_path,monkeypatch):
+    manager=Coordinator(runtime(tmp_path))
+    slow_setup(manager,monkeypatch)
+    started,finish=asyncio.Event(),asyncio.Event()
+    async def classify(release,app,settings,**kwargs):
+        started.set()
+        await finish.wait()
+        return release.model_copy(update={'classification':{'status':'ok','tags':['bugfix'],'tag_evidence':{'bugfix':'Fixed an error.'}},'classification_key':classification_key(release,app,settings)})
+    monkeypatch.setattr(service,'classify_release',classify)
+    try:
+        await asyncio.wait_for(manager.poll(),2)
+        assert manager.store.get('last_poll') and manager.store.get('last_collection')
+        assert not manager.polling
+        data=manager.dashboard()
+        assert data['classification_queue_length']==1 and data['last_classification'] is None
+        view=manager.view('one')
+        assert view.status_label=='Summary pending' and view.status=='unknown'
+        await asyncio.wait_for(started.wait(),2)
+        finish.set()
+        await manager.classify_task
+        assert manager.dashboard()['classification_queue_length']==0
+        assert manager.dashboard()['last_classification']
+        assert manager.view('one').status_label!='Summary pending'
+    finally:
+        finish.set()
+        manager.closing=True
+        if manager.classify_task:
+            await manager.classify_task
+        manager.close()
+
+
+@pytest.mark.asyncio
+async def test_queue_is_newest_first_and_resumes_after_restart(tmp_path,monkeypatch):
+    releases=[release_at('1.1.0',30),release_at('1.2.0',20),release_at('1.3.0',10)]
+    first=Coordinator(runtime(tmp_path))
+    slow_setup(first,monkeypatch,releases).latest_version='1.3.0'
+    order=[]
+    async def classify(release,app,settings,**kwargs):
+        order.append(release.version)
+        if len(order)==1:
+            assert [i['release_id'] for i in first.store.get('classification_queue')]==['github:example/app:1.3.0','github:example/app:1.2.0','github:example/app:1.1.0']
+        if len(order)==2:
+            first.closing=True  # simulate the container stopping mid-queue
+        return release.model_copy(update={'classification':{'status':'ok','tags':['bugfix'],'tag_evidence':{'bugfix':'Fixed an error.'}},'classification_key':classification_key(release,app,settings)})
+    monkeypatch.setattr(service,'classify_release',classify)
+    try:
+        await first.poll()
+        await first.classify_task
+        assert order==['1.3.0','1.2.0'] and first.queue_length()==1
+    finally:
+        first.close()
+    second=Coordinator(runtime(tmp_path))
+    monkeypatch.setattr(second,'local_ready',lambda *a: asyncio.sleep(0,True))
+    try:
+        assert second.queue_length()==1
+        assert second.request_classification()
+        await second.classify_task
+        assert order==['1.3.0','1.2.0','1.1.0'] and second.queue_length()==0
+    finally:
+        second.close()
+
+
+@pytest.mark.asyncio
+async def test_classified_releases_are_not_requeued_or_resent(tmp_path,monkeypatch):
+    manager=Coordinator(runtime(tmp_path))
+    slow_setup(manager,monkeypatch)
+    calls=[]
+    async def classify(release,app,settings,**kwargs):
+        calls.append(release.id)
+        return release.model_copy(update={'classification':{'status':'ok','tags':['bugfix'],'tag_evidence':{'bugfix':'Fixed an error.'}},'classification_key':classification_key(release,app,settings)})
+    monkeypatch.setattr(service,'classify_release',classify)
+    try:
+        await manager.poll()
+        await manager.classify_task
+        # A fresh store row without the carried-over fields still hits the key cache.
+        await manager.poll()
+        assert manager.queue_length()==0 and manager.classify_task.done()
+        assert len(calls)==1
+    finally:
+        manager.close()
+
+
+@pytest.mark.asyncio
+async def test_polling_resets_after_exception(tmp_path,monkeypatch):
+    manager=Coordinator(runtime(tmp_path))
+    async def collect(*args,**kwargs):
+        raise RuntimeError('boom secret')
+    monkeypatch.setattr(service,'collect',collect)
+    try:
+        assert manager.request_poll()
+        await manager.poll_task
+        assert manager.polling is False
+        assert manager.store.get('last_poll') is None
+        assert 'secret' not in str(manager.store.logs())
+    finally:
+        manager.close()
+
+
+@pytest.mark.asyncio
+async def test_stale_poll_is_abandoned_so_the_next_can_run(tmp_path,monkeypatch):
+    manager=Coordinator(runtime(tmp_path))
+    slow_setup(manager,monkeypatch)
+    hang=asyncio.Event()
+    async def hung(*args,**kwargs):
+        await hang.wait()
+    real=service.collect
+    monkeypatch.setattr(service,'collect',hung)
+    try:
+        assert manager.request_poll()
+        await asyncio.sleep(0)
+        assert not manager.request_poll()  # healthy poll still blocks duplicates
+        manager.poll_timeout=0.01
+        await asyncio.sleep(0.05)
+        monkeypatch.setattr(service,'collect',real)
+        assert manager.request_poll()
+        await manager.poll_task
+        assert manager.store.get('last_poll')
+        assert manager.polling is False
+    finally:
+        hang.set()
+        manager.closing=True
+        manager.close()
