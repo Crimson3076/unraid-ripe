@@ -9,6 +9,7 @@ from typing import Any
 import httpx
 from .config import Runtime
 from .models import AppRecord, AppView, Profile, Release, Settings, utcnow
+from .autoprofile import AUTO_FIELDS, merge_profile
 from .store import Store
 from .sources import collect
 from .intelligence import (classify_release, analyze_applicability, sanitize_profile, classification_key,
@@ -153,7 +154,22 @@ class Coordinator:
         return {'apps': [v.model_dump(mode='json') for v in views], 'demo': self.demo,
                 'summary': {s:counts[s] for s in ('ripe','waiting','recommended_now','read_first','up_to_date','unknown')},
                 'last_poll':self.store.get('last_poll'), 'polling': self.polling,
-                'integration_status': self.integration_status(), 'timezone':self.settings().timezone}
+                'integration_status': self.integration_status(), 'timezone':self.settings().timezone,
+                'auto_profiles': self.auto_profiles()}
+
+    def auto_profiles(self) -> list[dict]:
+        """Apps Ripe filled in by itself that the user has not yet acknowledged."""
+        reviewed = set(self.store.get('autoprofile:reviewed', []))
+        found = []
+        for app in self.store.apps():
+            evidence = app.detected.get('profile_evidence') or {}
+            reasons = {f: evidence[f] for f in (*AUTO_FIELDS, 'upstream_repo') if evidence.get(f) and app.profile.origin.get(f, 'auto') != 'user'}
+            if reasons and app.id not in reviewed:
+                found.append({'id': app.id, 'name': app.name, 'reasons': reasons})
+        return found
+
+    def review_auto_profiles(self):
+        self.store.set('autoprofile:reviewed', sorted({*self.store.get('autoprofile:reviewed', []), *(a['id'] for a in self.auto_profiles())}))
 
     def integration_status(self) -> dict:
         return {'docker_socket': 'present' if __import__('os').path.exists(self.runtime.docker_socket) else 'not mounted',
@@ -216,12 +232,15 @@ class Coordinator:
                     if self.store.get('generation:' + app.id, 0) != generation:
                         continue
                     preference = self.store.get('profile:' + app.id)
-                    if preference is not None:
-                        app.profile = Profile.model_validate(preference)
+                    # Fields the user edited are never overwritten; the rest follow what was read this scan.
+                    app.profile, evidence = merge_profile(app.profile, dict(app.detected.get('profile_evidence') or {}),
+                                                          Profile.model_validate(preference) if preference is not None else None)
                     app.profile = sanitize_profile(app.profile)
                     mapping = self.store.get('mapping:' + app.id)
                     if mapping is not None:
                         app.upstream_repo = mapping.get('upstream_repo')
+                        evidence.pop('upstream_repo', None)
+                    app.detected['profile_evidence'] = evidence
                     self.store.save_app(app)
                     for release in by_app.get(app.id, []):
                         if self.store.get('generation:' + app.id, 0) != generation:
@@ -251,7 +270,7 @@ class Coordinator:
                                 release.classification = None
                                 release = await classify_release(release, app, settings, gemini_key=self.runtime.gemini_key,log_call=self.store.log_llm)
                             self.store.set('classification:' + key, {'classification':release.classification,'classification_key':release.classification_key, 'model_disagreement':release.model_disagreement})
-                        profile_key = fingerprint([app.profile.model_dump(),release.classification_key,settings.local_model,settings.ollama_url,prompt_digest()])
+                        profile_key = fingerprint([app.profile.model_dump(exclude={'origin'}),release.classification_key,settings.local_model,settings.ollama_url,prompt_digest()])
                         analysis = self.store.get('applicability:' + profile_key)
                         if analysis is not None and all(item.get('verified') for item in analysis):
                             release.applicability = analysis

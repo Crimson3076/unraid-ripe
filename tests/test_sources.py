@@ -59,6 +59,8 @@ async def test_docker_only_allowed_get_and_no_env_persistence():
         seen.append((request.method, request.url.path))
         if request.url.path == '/containers/json':
             return httpx.Response(200, json=[{'Id':ident, 'Names':['/romm'], 'Image':'ghcr.io/rommapp/romm:latest', 'ImageID':image_id}])
+        if request.url.path == f'/containers/{ident}/json':
+            return httpx.Response(200, json={'Config': {'Env': ['TOKEN=secret', 'DB_PASSWORD=hunter2']}})
         if request.url.path.startswith('/images/'):
             return httpx.Response(200, json={'Created':'2026-10-01T00:00:00Z', 'RepoDigests':['ghcr.io/rommapp/romm@sha256:1234'], 'Config': {'Env':['TOKEN=secret'], 'Labels':{'org.opencontainers.image.version':'5.2.0','org.opencontainers.image.source':'https://github.com/rommapp/romm'}}})
         raise AssertionError(str(request.url))
@@ -70,9 +72,9 @@ async def test_docker_only_allowed_get_and_no_env_persistence():
                 await reader.read(path)
     assert apps[0].installed_version == '5.2.0'
     assert apps[0].upstream_repo == 'rommapp/romm'
-    assert 'secret' not in apps[0].model_dump_json()
+    assert 'secret' not in apps[0].model_dump_json() and 'hunter2' not in apps[0].model_dump_json()
     assert all(method == 'GET' for method, _ in seen)
-    assert len(seen) == 2
+    assert len(seen) == 3
 
 
 async def test_manual_repo_mapping_survives_redetection():
@@ -357,10 +359,11 @@ async def test_malformed_ha_entity_only_fails_its_own_app(monkeypatch, tmp_path)
     assert {a.id for a in apps} == {'ha:update.bad', 'ha:update.ok'}
 
 
-async def test_docker_allowlist_excludes_container_inspect_and_version():
+async def test_docker_allowlist_excludes_everything_but_list_inspect_and_image():
     async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={})), base_url='http://docker') as client:
         reader = DockerReader(client)
-        for path in ('/containers/' + 'a' * 64 + '/json', '/version'):
+        assert await reader.read('/containers/' + 'a' * 64 + '/json') == {}
+        for path in ('/containers/' + 'a' * 64 + '/exec', '/containers/' + 'a' * 64 + '/logs', '/containers/' + 'a' * 64 + '/json?size=1', '/version'):
             with pytest.raises(SourceError):
                 await reader.read(path)
 

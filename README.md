@@ -204,3 +204,15 @@ Tests cover version ordering, patch ripeness, soak resets, security targets, rea
 6. Confirm polling did not pull/tag images, create/restart containers, execute commands, install updates or modify host configuration. Ripe's database/cache and explicitly enabled notifications are expected writes.
 
 Stage 1 contains no guided-update, backup, rollback, chat or auto-update machinery.
+
+## Automatic app profiles
+
+On every scan Ripe fills in each untouched app profile from what Docker already exposes (GET-only): upstream repo
+(OCI label, Unraid template, known mapping), exposure (port bindings), dependencies (env hosts, links, small shared
+networks), tier, config context and, with one probe of the local web UI, whether the app has its own login. Each field
+records its evidence; editing a field marks it as yours and it is never overwritten. Env values are read only for
+`*_HOST`, `*_URL`, `*_PORT`, `*_VERSION` and `TZ`, never for names containing TOKEN/KEY/PASS/SECRET/AUTH. Profiles
+go only to the local model, never to Gemini.
+
+Optional, off by default (Settings → Internet exposure sources): mount an Nginx Proxy Manager `database.sqlite` or a
+cloudflared `config.yml` read-only and enter its path; containers they forward to are marked internet-facing.
