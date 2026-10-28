@@ -9,7 +9,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import quote, urlparse
+from email.utils import parsedate_to_datetime
+from urllib.parse import quote, urljoin, urlparse
 from xml.etree import ElementTree
 
 import httpx
@@ -259,25 +260,103 @@ def parse_image(image: str) -> tuple[str, str, str]:
     return host, repo, tag
 
 
+class RateLimited(SourceError):
+    """A registry answered 429. Not a failure: the caller keeps its last known data."""
+
+    def __init__(self, message: str, retry_after: float = 0):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+LATEST_TAGS = ("latest", "stable", "main", "master", "edge", "develop")
+MAX_TAG_PAGES = 10
+MAX_RETRY_WAIT = 30
+MAX_ATTEMPTS = 3
+LOCAL_HOSTS = ("localhost", "127.0.0.1")
+
+
+def retry_after_seconds(value: str | None) -> float | None:
+    if not value:
+        return None
+    value = value.strip()
+    if re.fullmatch(r"\d+", value, re.ASCII):
+        return float(value)
+    try:
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+
+
+def is_local_image(image: str, digest: str | None, previously_tracked: bool = False) -> bool:
+    """Never pulled from a registry: a bare image ID, or an unnamespaced name with no RepoDigests.
+
+    previously_tracked: registry data was found for this app before, so a missing digest
+    (e.g. a retagged pulled image) must not turn an official image into a local build."""
+    image = (image or "").strip()
+    if not image or re.fullmatch(r"(?:sha256:)?[a-fA-F0-9]{12,64}", image):
+        return True
+    if digest:
+        return False
+    name = image.split("@", 1)[0]
+    first = name.split("/", 1)[0]
+    if "/" in name and (first in LOCAL_HOSTS or first.startswith("localhost:")):
+        return True
+    return "/" not in name and not previously_tracked
+
+
 class RegistryReader:
     HOSTS = {"registry-1.docker.io", "ghcr.io", "lscr.io"}
     TOKEN_HOSTS = {"auth.docker.io", "ghcr.io", "lscr.io"}
+    KEPT_HEADERS = ("docker-content-digest", "link")
 
-    def __init__(self, client: httpx.AsyncClient, cache_get=None, cache_set=None):
+    def __init__(self, client: httpx.AsyncClient, cache_get=None, cache_set=None, min_interval: float = 0.25, sleep=asyncio.sleep):
         self.client = client
         self.tokens: dict[tuple[str, str], str] = {}
         self.cache_get = cache_get or (lambda _: None)
         self.cache_set = cache_set or (lambda *_: None)
+        self.min_interval = min_interval
+        self.sleep = sleep
+        self.last_request: dict[str, float] = {}
+        self.cooldown: dict[str, tuple[float, float]] = {}
 
-    async def request(self, host: str, repo: str, suffix: str) -> httpx.Response:
+    async def _throttle(self, host: str) -> None:
+        """Spread requests to one registry instead of bursting."""
+        wait = self.last_request.get(host, 0) + self.min_interval - time.monotonic()
+        if wait > 0:
+            await self.sleep(wait)
+        self.last_request[host] = time.monotonic()
+
+    async def _get(self, host: str, url: str, **kwargs) -> httpx.Response:
+        """GET with Retry-After and exponential backoff on 429."""
+        blocked = self.cooldown.get(host)
+        if blocked and blocked[0] > time.monotonic():
+            raise RateLimited("Registry: rate limited", blocked[1])
+        for attempt in range(MAX_ATTEMPTS):
+            await self._throttle(host)
+            response = await self.client.get(url, **kwargs)
+            if response.status_code != 429:
+                return response
+            wait = retry_after_seconds(response.headers.get("retry-after"))
+            wait = 2.0 ** (attempt + 1) if wait is None else wait
+            if wait > MAX_RETRY_WAIT or attempt == MAX_ATTEMPTS - 1:
+                wait = min(wait, 3600)
+                self.cooldown[host] = (time.monotonic() + wait, wait)
+                raise RateLimited("Registry: rate limited", wait)
+            await self.sleep(wait)
+        raise RateLimited("Registry: rate limited")
+
+    async def request(self, host: str, repo: str, suffix: str, extra_headers: JSON | None = None) -> httpx.Response:
         if host not in self.HOSTS or not re.fullmatch(r"[a-zA-Z0-9_.-]+(?:/[a-zA-Z0-9_.-]+)*", repo) or any(p in (".", "..") for p in repo.split("/")):
             raise SourceError("Registry: unsupported image registry or name")
         url = f"https://{host}/v2/{repo}/{suffix}"
-        headers = {"Accept": ACCEPT_MANIFEST}
+        headers = {"Accept": ACCEPT_MANIFEST, **(extra_headers or {})}
         if (host, repo) in self.tokens:
             headers["Authorization"] = "Bearer " + self.tokens[(host, repo)]
         try:
-            response = await self.client.get(url, headers=headers)
+            response = await self._get(host, url, headers=headers)
             if response.status_code == 401:
                 challenge = response.headers.get("www-authenticate", "")
                 fields = dict(re.findall(r'(realm|service|scope)="([^"]+)"', challenge))
@@ -285,14 +364,16 @@ class RegistryReader:
                 parsed = urlparse(realm)
                 if parsed.scheme != "https" or parsed.hostname not in self.TOKEN_HOSTS or parsed.username or parsed.password or parsed.query or parsed.fragment:
                     raise SourceError("Registry: unsupported authentication destination")
-                auth = await self.client.get(realm, params={"service":fields.get("service", host), "scope":f"repository:{repo}:pull"})
+                auth = await self._get(host, realm, params={"service":fields.get("service", host), "scope":f"repository:{repo}:pull"})
                 if auth.status_code >= 400:
                     raise SourceError(f"Registry: authentication HTTP {auth.status_code}")
                 token = auth.json().get("token") or auth.json().get("access_token")
                 if not isinstance(token, str):
                     raise SourceError("Registry: missing read token")
                 self.tokens[(host, repo)] = token
-                response = await self.client.get(url, headers={**headers, "Authorization":"Bearer " + token})
+                response = await self._get(host, url, headers={**headers, "Authorization":"Bearer " + token})
+            if response.status_code == 304:
+                return response
             if response.status_code >= 400:
                 raise SourceError(f"Registry: HTTP {response.status_code}")
             if len(response.content) > 8 * 1024 * 1024:
@@ -303,30 +384,63 @@ class RegistryReader:
         except (httpx.HTTPError, ValueError):
             raise SourceError("Registry: connection or JSON error") from None
 
+    async def fetch(self, host: str, repo: str, suffix: str, ttl: int = 0) -> JSON:
+        """Cached request: revalidated with If-None-Match once older than ttl."""
+        key = "http:" + hashlib.sha256(f"{host}/{repo}/{suffix}".encode()).hexdigest()
+        cached = self.cache_get(key) or {}
+        have = isinstance(cached.get("body"), dict)
+        if have and cached.get("fetched", 0) + ttl > time.time():
+            return cached
+        response = await self.request(host, repo, suffix, {"If-None-Match": cached["etag"]} if have and cached.get("etag") else None)
+        if response.status_code == 304 and have:
+            entry = {**cached, "fetched": time.time()}
+        else:
+            entry = {"body": response.json(), "headers": {k: response.headers.get(k) for k in self.KEPT_HEADERS if response.headers.get(k)},
+                     "etag": response.headers.get("etag"), "fetched": time.time()}
+        self.cache_set(key, entry)
+        return entry
+
+    async def tag_list(self, host: str, repo: str) -> tuple[list[str], bool]:
+        """Follow Link rel=next up to MAX_TAG_PAGES. The bool is True when the list is still incomplete."""
+        tags: list[str] = []
+        suffix = "tags/list?n=1000"
+        for _ in range(MAX_TAG_PAGES):
+            page = await self.fetch(host, repo, suffix)
+            tags.extend(t for t in page["body"].get("tags") or [] if isinstance(t, str))
+            match = re.search(r'<([^>]+)>\s*;\s*rel="?next"?', page.get("headers", {}).get("link") or "")
+            if not match:
+                return tags, False
+            target = urlparse(urljoin(f"https://{host}/v2/{repo}/tags/list", match.group(1)))
+            # Pagination may only continue on the same registry and repository.
+            if target.hostname != host or target.path != f"/v2/{repo}/tags/list" or not target.query:
+                return tags, True
+            suffix = "tags/list?" + target.query
+        return tags, True
+
     async def metadata(self, image: str, installed_digest: str | None, match_version: bool = True) -> JSON:
         host, repo, tag = parse_image(image)
         cache_key = "registry:" + hashlib.sha256((image + "|" + str(installed_digest) + "|" + str(match_version)).encode()).hexdigest()
         cached = self.cache_get(cache_key)
         if cached and cached.get("fetched", 0) + 21600 > time.time():
             return dict(cached["body"])
-        manifest = await self.request(host, repo, "manifests/" + quote(tag, safe=":"))
-        data = manifest.json()
-        digest = manifest.headers.get("docker-content-digest")
+        manifest = await self.fetch(host, repo, "manifests/" + quote(tag, safe=":"))
+        data = manifest["body"]
+        digest = manifest.get("headers", {}).get("docker-content-digest")
         matching_digests = {digest} if digest else set()
         # The local RepoDigest can be a manifest list or a platform-specific digest.
         matching_digests.update(m.get("digest") for m in data.get("manifests", []) if isinstance(m, dict))
-        tags_response = await self.request(host, repo, "tags/list?n=1000")
-        tags = tags_response.json().get("tags") or []
-        version_tags = [t for t in tags if isinstance(t, str) and re.match(r"^(?:v|version-)?\d+\.\d+", t)]
-        info: JSON = {"latest_digest": digest, "latest_only": not version_tags, "installed_version": None, "image_changed_at": None, "update_available": bool(installed_digest not in matching_digests) if installed_digest and digest else None, "truncated_tags": bool(tags_response.headers.get("link"))}
+        tags, truncated = await self.tag_list(host, repo)
+        version_tags = [t for t in tags if re.match(r"^(?:v|version-)?\d+\.\d+", t)]
+        # A moving tag is judged by its digest, so an incomplete tag list does not matter.
+        truncated = truncated and tag not in LATEST_TAGS
+        info: JSON = {"latest_digest": digest, "latest_only": not version_tags, "installed_version": None, "image_changed_at": None, "update_available": bool(installed_digest not in matching_digests) if installed_digest and digest else None, "truncated_tags": truncated}
         # Match local digest against version tags, with a strict per-image budget.
         # Architecture variant digests are handled above; exact immutable matches
         # are required rather than assuming the newest tag is what is installed.
         for version_tag in sorted(version_tags, key=version_key, reverse=True)[:12] if installed_digest and match_version else []:
-            candidate = await self.request(host, repo, "manifests/" + quote(version_tag, safe=""))
-            candidate_data = candidate.json()
-            candidate_digests = {candidate.headers.get("docker-content-digest")}
-            candidate_digests.update(m.get("digest") for m in candidate_data.get("manifests", []) if isinstance(m, dict))
+            candidate = await self.fetch(host, repo, "manifests/" + quote(version_tag, safe=""), ttl=21600)
+            candidate_digests = {candidate.get("headers", {}).get("docker-content-digest")}
+            candidate_digests.update(m.get("digest") for m in candidate["body"].get("manifests", []) if isinstance(m, dict))
             if installed_digest in candidate_digests:
                 info["installed_version"] = version_tag
                 break
@@ -564,7 +678,10 @@ async def collect(settings: Settings, *, github_token: str | None = None, ha_tok
         # shorter span fetched for a newer installation of the same app.
         upstream_cache: dict[tuple[str, str | None], list[Release] | str] = {}
         for app in apps:
-            if app.source == "docker" and app.image:
+            if app.source == "docker" and app.image and is_local_image(app.image, app.installed_digest, bool(existing.get(app.id) and existing[app.id].latest_digest)):
+                # Never pulled from a registry: nothing to look up, and not an error.
+                app.detected["local_build"] = "local build (not tracked)"
+            elif app.source == "docker" and app.image:
                 try:
                     metadata = await registry.metadata(app.image, app.installed_digest, match_version=not bool(app.installed_version))
                     app.latest_digest = metadata.get("latest_digest")
@@ -585,6 +702,15 @@ async def collect(settings: Settings, *, github_token: str | None = None, ha_tok
                         app.detected["image_change_date_kind"] = "first_observed"
                     if metadata.get("truncated_tags"):
                         error(app.id, "Registry tag list is incomplete; latest-only status is unknown")
+                except RateLimited:
+                    # Keep the last known registry data and retry on the next poll.
+                    previous = existing.get(app.id)
+                    # Only reuse it when this is still the same installation.
+                    if previous and previous.image == app.image and previous.installed_digest == app.installed_digest:
+                        app.latest_digest, app.latest_only = previous.latest_digest, previous.latest_only
+                        app.update_available, app.image_changed_at = previous.update_available, previous.image_changed_at
+                        app.installed_version = app.installed_version or previous.installed_version
+                    app.detected["registry_status"] = "Registry rate limited; last known data kept, retrying next poll"
                 except SourceError as exc:
                     error(app.id, str(exc))
                 except PARSE_ERRORS:
