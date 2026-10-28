@@ -31,7 +31,7 @@
       <div class="topbar-right"><span class="demo-context" id="demo-context" hidden>Demo data</span><span class="readonly-badge"><span data-icon="lock"></span> Read only</span><button id="theme-toggle" type="button" class="icon-button" aria-label="Switch color theme" title="Switch color theme"><span data-icon="moon"></span></button></div>
     </header>
     <main id="main-content" tabindex="-1">{% block content %}{% endblock %}</main>
-    <footer class="page-footer"><span>Made for a calmer homelab.</span><span id="footer-timezone">Ripe · Stage 1</span></footer>
+    <footer class="page-footer"><span>Made for a calmer homelab. · <span id="ripe-version">Ripe v{{ ripe_version }}</span></span><span id="footer-timezone">Ripe · Stage 1</span></footer>
   </div>
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 </body>

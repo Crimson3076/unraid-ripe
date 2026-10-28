@@ -14,6 +14,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.trustedhost import TrustedHostMiddleware
+from . import __version__
 from .config import Runtime, checked_url
 from .models import Settings, Profile
 from .service import Coordinator
@@ -102,6 +103,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
 
     app.mount('/static',StaticFiles(directory=PACKAGE/'static'),name='static')
     templates = Jinja2Templates(directory=PACKAGE/'templates')
+    templates.env.globals['ripe_version'] = __version__
 
     @app.get('/health')
     async def health():
