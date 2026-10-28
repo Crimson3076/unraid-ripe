@@ -8,6 +8,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     RIPE_CONFIG_DIR=/config \
     TZ=UTC
 
+# stamped by the publish workflow from git (release tag, or tag+commit for main builds); shown in the page footer
+ARG RIPE_VERSION=
+ENV RIPE_VERSION=${RIPE_VERSION}
+
 WORKDIR /app
 COPY requirements.lock pyproject.toml ./
 RUN python -m pip install --no-cache-dir --no-deps -r requirements.lock

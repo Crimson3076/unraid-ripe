@@ -29,7 +29,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
-          fetch-depth: 1
+          fetch-depth: 0   # tags, for the version shown in Ripe's footer
       # CI runs can finish out of order (or be re-run): only publish a main build if its commit is still main's head,
       # so an older commit can never replace a newer `latest`. The newer commit's own CI run publishes it.
       - id: guard
@@ -40,6 +40,8 @@ jobs:
         run: |
           # sha-<commit> names the commit actually built (on workflow_run, GITHUB_SHA is main's head when this run started)
           echo "short=${BUILT:0:7}" >> "$GITHUB_OUTPUT"
+          # the version Ripe shows: the release tag, or <last tag>-<n>-g<commit> for main builds after a release
+          echo "version=$(git describe --tags --match 'v[0-9]*' --always 2>/dev/null || echo "${BUILT:0:7}")" >> "$GITHUB_OUTPUT"
           if [ "$EVENT" != "workflow_run" ]; then echo "publish=true" >> "$GITHUB_OUTPUT"; exit 0; fi
           HEAD=$(git ls-remote origin refs/heads/main | cut -f1)
           if [ "$HEAD" = "$BUILT" ]; then echo "publish=true" >> "$GITHUB_OUTPUT"
@@ -75,5 +77,7 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            RIPE_VERSION=${{ steps.guard.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

@@ -72,7 +72,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
                     with suppress(asyncio.CancelledError):
                         await task
             manager.close()
-    app = FastAPI(title='Ripe',version='0.1.0',lifespan=lifespan, docs_url=None, redoc_url=None)
+    app = FastAPI(title='Ripe',version=__version__,lifespan=lifespan, docs_url=None, redoc_url=None)
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, exc: RequestValidationError):
