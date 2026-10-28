@@ -363,3 +363,148 @@ async def test_docker_allowlist_excludes_container_inspect_and_version():
         for path in ('/containers/' + 'a' * 64 + '/json', '/version'):
             with pytest.raises(SourceError):
                 await reader.read(path)
+
+
+def _registry(handler, **kwargs):
+    async def no_sleep(_):
+        pass
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return client, RegistryReader(client, min_interval=0, sleep=no_sleep, **kwargs)
+
+
+async def test_registry_follows_tag_pagination():
+    pages = []
+    def handler(request):
+        path = request.url.path
+        if '/manifests/' in path:
+            return httpx.Response(200, json={}, headers={'docker-content-digest': 'sha256:new'})
+        assert path.endswith('/tags/list')
+        pages.append(str(request.url.query))
+        if b'last=b' in request.url.query:
+            return httpx.Response(200, json={'tags': ['16-alpine', '16.1']})
+        return httpx.Response(200, json={'tags': ['a']}, headers={'link': '</v2/library/postgres/tags/list?n=1000&last=b>; rel="next"'})
+    client, reader = _registry(handler)
+    async with client:
+        info = await reader.metadata('postgres:16-alpine', 'sha256:new')
+    assert len(pages) == 2
+    assert info['truncated_tags'] is False and info['latest_only'] is False
+    assert info['update_available'] is False
+
+
+async def test_registry_pagination_cannot_leave_the_repository():
+    def handler(request):
+        if request.url.path.endswith('/manifests/1.0'):
+            return httpx.Response(200, json={}, headers={'docker-content-digest': 'sha256:a'})
+        return httpx.Response(200, json={'tags': ['1.0']}, headers={'link': '<https://attacker.test/v2/x/tags/list?last=a>; rel="next"'})
+    client, reader = _registry(handler)
+    async with client:
+        info = await reader.metadata('ghcr.io/o/app:1.0', 'sha256:a')
+    assert info['truncated_tags'] is True
+
+
+async def test_registry_latest_tag_decided_by_digest_when_tags_capped():
+    def handler(request):
+        if request.url.path.endswith('/manifests/latest'):
+            return httpx.Response(200, json={}, headers={'docker-content-digest': 'sha256:new'})
+        return httpx.Response(200, json={'tags': ['latest']}, headers={'link': '</v2/o/app/tags/list?n=1000&last=z>; rel="next"'})
+    client, reader = _registry(handler)
+    async with client:
+        info = await reader.metadata('ghcr.io/o/app:latest', 'sha256:old')
+    assert info['truncated_tags'] is False and info['update_available'] is True
+
+
+async def test_registry_429_honours_retry_after_then_succeeds():
+    calls, sleeps = [], []
+    def handler(request):
+        calls.append(1)
+        if len(calls) == 1:
+            return httpx.Response(429, headers={'retry-after': '7'})
+        return httpx.Response(200, json={'tags': []})
+    async def sleep(seconds):
+        sleeps.append(seconds)
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    async with client:
+        response = await RegistryReader(client, min_interval=0, sleep=sleep).request('ghcr.io', 'o/app', 'tags/list')
+    assert response.status_code == 200 and sleeps == [7.0]
+
+
+async def test_registry_429_gives_up_and_cools_down_host():
+    calls = []
+    def handler(request):
+        calls.append(1)
+        return httpx.Response(429)
+    client, reader = _registry(handler)
+    async with client:
+        with pytest.raises(collector_RateLimited):
+            await reader.request('lscr.io', 'linuxserver/a', 'tags/list')
+        made = len(calls)
+        with pytest.raises(collector_RateLimited):
+            await reader.request('lscr.io', 'linuxserver/b', 'tags/list')
+    assert made == 3 and len(calls) == made
+
+
+async def test_registry_reuses_etag_and_token():
+    seen = []
+    def handler(request):
+        seen.append((request.url.host, request.headers.get('authorization'), request.headers.get('if-none-match')))
+        if request.url.path == '/token':
+            return httpx.Response(200, json={'token': 't'})
+        if not request.headers.get('authorization'):
+            return httpx.Response(401, headers={'www-authenticate': 'Bearer realm="https://ghcr.io/token",service="ghcr.io"'})
+        if request.headers.get('if-none-match') == 'e1':
+            return httpx.Response(304)
+        return httpx.Response(200, json={'tags': ['1.0']}, headers={'etag': 'e1'})
+    cache = {}
+    client, reader = _registry(handler)
+    reader.cache_get, reader.cache_set = cache.get, cache.__setitem__
+    async with client:
+        await reader.fetch('ghcr.io', 'o/app', 'tags/list')
+        again = await reader.fetch('ghcr.io', 'o/app', 'tags/list')
+    assert again['body'] == {'tags': ['1.0']}
+    assert sum(1 for _, auth, _ in seen if auth is None) == 2  # first 401 and the token request; the token is then reused
+    assert seen[-1][2] == 'e1'
+
+
+@pytest.mark.parametrize('image,digest,local', [
+    ('ripe:stage1', None, True), ('crimson-atlas:latest', None, True), ('sha256:' + 'a' * 64, None, True),
+    ('localhost:5000/x:dev', None, True), ('postgres:16', 'sha256:a', False), ('ghcr.io/o/a:1', None, False),
+    ('romm-swarm-host:dev', 'sha256:a', False),
+])
+def test_local_image_detection(image, digest, local):
+    from ripe.sources.collector import is_local_image
+    assert is_local_image(image, digest) is local
+
+
+async def test_local_image_not_an_error_and_rate_limit_keeps_data(monkeypatch, tmp_path):
+    from ripe.models import Settings
+    from ripe.ripeness import build_view
+    from ripe.sources import collector
+    local = AppRecord(id='docker:ripe', name='ripe', source='docker', image='ripe:stage1')
+    limited = AppRecord(id='docker:lim', name='lim', source='docker', image='lscr.io/linuxserver/x:latest', installed_digest='sha256:' + '1' * 64)
+    async def limited_meta(self, image, installed_digest, match_version=True):
+        assert 'ripe' not in image
+        raise collector.RateLimited('Registry: rate limited', 60)
+    monkeypatch.setattr(collector.RegistryReader, 'metadata', limited_meta)
+    apps, _, errors = await _collect_existing(monkeypatch, tmp_path, [local, limited], [AppRecord(id='docker:lim', name='lim', source='docker', latest_digest='sha256:old', update_available=True)])
+    by_id = {a.id: a for a in apps}
+    assert not any(e['source'].startswith('docker:') for e in errors)
+    assert by_id['docker:ripe'].detected['local_build'] and not by_id['docker:ripe'].error
+    assert build_view(by_id['docker:ripe'], [], Settings()).status_label == 'Local build (not tracked)'
+    assert by_id['docker:lim'].latest_digest == 'sha256:old' and by_id['docker:lim'].update_available is True
+
+
+async def _collect_existing(monkeypatch, tmp_path, apps, existing):
+    from ripe.models import Settings
+    from ripe.sources import collector
+    socket = tmp_path / 'docker.sock'
+    socket.touch()
+    async def docker_apps(self, *args, **kwargs):
+        return apps
+    async def no_unraid(*args, **kwargs):
+        return []
+    monkeypatch.setattr(collector.DockerReader, 'apps', docker_apps)
+    monkeypatch.setattr(collector, 'unraid_releases', no_unraid)
+    return await collector.collect(Settings(), docker_socket=str(socket), unraid_version_file=str(tmp_path / 'nv'), existing_apps=existing)
+
+
+from ripe.sources.collector import RateLimited as collector_RateLimited  # noqa: E402
