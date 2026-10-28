@@ -113,8 +113,8 @@
   }
   function initDashboard() {
     $$('[data-filter]').forEach(button=>button.addEventListener('click',()=>{filter=button.dataset.filter;renderGroups();}));
-    const openHint=e=>{const hint=e.target.closest?.('.mapping-hint');if(!hint||(e.type==='keydown'&&e.key!=='Enter'))return;e.preventDefault();e.stopPropagation();location.href=hint.dataset.href;};
-    $('#app-groups').addEventListener('click',openHint);$('#app-groups').addEventListener('keydown',openHint);
+    const openHint=e=>{const hint=e.target.closest?.('.mapping-hint');if(!hint||(e.type==='keydown'&&e.key!=='Enter')||(e.type==='auxclick'&&e.button!==1))return;e.preventDefault();e.stopPropagation();if(e.ctrlKey||e.metaKey||e.shiftKey||e.type==='auxclick')window.open(hint.dataset.href,'_blank','noopener');else location.href=hint.dataset.href;};
+    $('#app-groups').addEventListener('click',openHint);$('#app-groups').addEventListener('auxclick',openHint);$('#app-groups').addEventListener('keydown',openHint);
     $('#app-search').addEventListener('input',e=>{appSearch=e.target.value.toLowerCase().trim();renderGroups();});
     $('#poll-button').onclick=async()=>{const button=$('#poll-button');button.disabled=true;try{const result=await api('/api/poll',{method:'POST'});toast(result.message || (result.status==='demo'?'Demo mode uses sample data and does not scan your homelab.':result.status==='already running'?'An update check is already running.':'Update check started. This may take a little while.'));setTimeout(()=>loadDashboard(true),1500);}catch(e){errorAt('#dashboard-error',e);}finally{button.disabled=false;}};
     $('#demo-button').onclick=async()=>{const button=$('#demo-button');button.disabled=true;try{await api('/api/demo',{method:'POST'});filter='all';await loadDashboard();toast('Exploring synthetic examples. No live actions or notifications.');}catch(e){errorAt('#dashboard-error',e);}finally{button.disabled=false;}};

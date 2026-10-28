@@ -29,6 +29,10 @@ const view=(id,name,extra)=>({status:'up_to_date',status_label:'Up to date',reas
  assert.equal(el.textContent.trim(),'No release notes source. Choose a GitHub repo in the app profile.');
  assert.equal(el.dataset.href,'/apps/docker%3Abare#profile');
  assert.equal(d.querySelector('.app-card img'),null,'Upstream/model text is escaped');
+ const opened=[];w.open=(...a)=>opened.push(a[0]);
+ el.dispatchEvent(new w.MouseEvent('click',{bubbles:true,cancelable:true,ctrlKey:true}));
+ el.dispatchEvent(new w.MouseEvent('auxclick',{bubbles:true,cancelable:true,button:1}));
+ assert.deepEqual(opened,['/apps/docker%3Abare#profile','/apps/docker%3Abare#profile'],'Modified and middle clicks open a new tab');
  d.querySelector('[data-filter="needs_mapping"]').click();
  assert.deepEqual([...d.querySelectorAll('.app-card h3')].map(x=>x.textContent),['Unmapped <img src=x onerror=alert(1)>']);
  assert.equal(errors.length,0);dom.window.close();
