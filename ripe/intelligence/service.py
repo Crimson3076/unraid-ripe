@@ -20,6 +20,11 @@ PROMPT_VERSION = 'classification-v1'
 APPLICABILITY_PROMPT_VERSION = 'applicability-v1'
 CHUNK_SIZE = 12_000
 MAX_NOTES = 500_000
+LOCAL_NUM_PREDICT = 8192
+CTX_MARGIN = 1024
+CTX_STEP = 4096
+MIN_NUM_CTX = 8192
+MAX_NUM_CTX = 32768
 LogCall = Callable[[dict[str, Any]], None]
 
 class LLMUnavailable(RuntimeError):
@@ -70,6 +75,14 @@ def _audit(log_call: LogCall, **entry: Any) -> None:
     log_call(safe)
 
 
+def local_num_ctx(prompt: str, user: str) -> int:
+    """Context window for one local request: prompt + output + margin, in 4k steps."""
+    # Conservative estimate (3 chars/token) since JSON and code tokenize densely.
+    needed = (len(prompt) + len(user)) // 3 + 1 + LOCAL_NUM_PREDICT + CTX_MARGIN
+    rounded = -(-needed // CTX_STEP) * CTX_STEP
+    return min(max(rounded, MIN_NUM_CTX), MAX_NUM_CTX)
+
+
 async def _call_model(provider: str, model: str, prompt: str, payload: dict,
                       settings: Settings, key: str | None) -> str:
     user = json.dumps(payload, ensure_ascii=False)
@@ -79,7 +92,8 @@ async def _call_model(provider: str, model: str, prompt: str, payload: dict,
             response = await client.post(url + '/api/chat', json={
                 'model': model, 'stream': False, 'think': False, 'format': 'json',
                 'messages': [{'role': 'system', 'content': prompt}, {'role': 'user', 'content': user}],
-                'options': {'temperature': 0, 'num_ctx': 32768, 'num_predict': 8192},
+                'options': {'temperature': 0, 'num_ctx': local_num_ctx(prompt, user),
+                            'num_predict': LOCAL_NUM_PREDICT},
             })
         if response.status_code != 200:
             raise LLMUnavailable(f'Local model HTTP {response.status_code}')
