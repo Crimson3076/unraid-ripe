@@ -13,3 +13,5 @@ html[data-theme=dark]{color-scheme:dark;--bg:#191d1a;--panel:#222823;--panel-sof
 .search-field input[type=search]{border:0;background:transparent;padding:0;color:var(--text);font-size:10px;line-height:1.5;box-shadow:none}.tag-evidence{margin-top:14px}.tag-evidence .finding-title{margin-top:12px}.tag-evidence .quote{font-size:10px}
 
 .demo-context{font-size:9px;background:var(--yellow-bg);color:var(--yellow);border:1px solid #976f2d20;padding:3px 7px;border-radius:5px;white-space:nowrap}
+
+.mapping-hint{font-size:9px;color:var(--muted);background:var(--panel-soft);border:1px solid var(--line);padding:5px 8px;border-radius:5px;line-height:1.5;cursor:pointer}.mapping-hint:hover{border-color:var(--accent);color:var(--text)}.mapping-hint svg{width:11px;height:11px;margin-right:4px}

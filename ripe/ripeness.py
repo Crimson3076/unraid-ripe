@@ -154,6 +154,8 @@ def _build_view(app: AppRecord, releases: list[Release], settings: Settings,
     view = AppView(app=app, status="unknown", status_label="Unknown", latest_version=latest,
                    pending=pending, history=history, available_notes=available_notes, releases_behind=len(pending), tags=tags,
                    hard_signals=signals, reason="Could not determine an installed version or release notes.")
+    if app.detected.get("local_build"):
+        view.status_label, view.reason = "Local build (not tracked)", "Built locally, never pulled from a registry. Map it to a GitHub repository to track its releases."
     if app.latest_only:
         return _latest_only_view(view, settings, now)
     if parse_version(app.installed_version) is None:
