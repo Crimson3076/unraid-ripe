@@ -378,14 +378,26 @@ class RegistryReader:
             await self.sleep(wait)
         self.last_request[host] = time.monotonic()
 
-    async def _get(self, host: str, url: str, **kwargs) -> httpx.Response:
+    async def _fetch(self, url: str, max_bytes: int | None, **kwargs) -> httpx.Response:
+        """One GET. With max_bytes the body is streamed and abandoned as soon as it exceeds the cap."""
+        if max_bytes is None:
+            return await self.client.get(url, **kwargs)
+        async with self.client.stream("GET", url, **kwargs) as response:
+            body = b""
+            async for chunk in response.aiter_bytes():
+                body += chunk
+                if len(body) > max_bytes:
+                    raise SourceError("Registry: response too large")
+            return httpx.Response(response.status_code, headers=response.headers, content=body)
+
+    async def _get(self, host: str, url: str, max_bytes: int | None = None, **kwargs) -> httpx.Response:
         """GET with Retry-After and exponential backoff on 429."""
         blocked = self.cooldown.get(host)
         if blocked and blocked[0] > time.monotonic():
             raise RateLimited("Registry: rate limited", blocked[1])
         for attempt in range(MAX_ATTEMPTS):
             await self._throttle(host)
-            response = await self.client.get(url, **kwargs)
+            response = await self._fetch(url, max_bytes, **kwargs)
             if response.status_code != 429:
                 return response
             wait = retry_after_seconds(response.headers.get("retry-after"))
@@ -402,10 +414,11 @@ class RegistryReader:
             raise SourceError("Registry: unsupported image registry or name")
         url = f"https://{host}/v2/{repo}/{suffix}"
         headers = {"Accept": ACCEPT_MANIFEST, **(extra_headers or {})}
+        cap = MAX_BLOB_BYTES if suffix.startswith("blobs/") else None
         if (host, repo) in self.tokens:
             headers["Authorization"] = "Bearer " + self.tokens[(host, repo)]
         try:
-            response = await self._get(host, url, headers=headers)
+            response = await self._get(host, url, cap, headers=headers)
             if response.status_code == 401:
                 challenge = response.headers.get("www-authenticate", "")
                 fields = dict(re.findall(r'(realm|service|scope)="([^"]+)"', challenge))
@@ -420,7 +433,7 @@ class RegistryReader:
                 if not isinstance(token, str):
                     raise SourceError("Registry: missing read token")
                 self.tokens[(host, repo)] = token
-                response = await self._get(host, url, headers={**headers, "Authorization":"Bearer " + token})
+                response = await self._get(host, url, cap, headers={**headers, "Authorization":"Bearer " + token})
             if response.status_code in (301, 302, 303, 307, 308) and suffix.startswith("blobs/"):
                 response = await self._follow_blob_redirect(host, url, response)
             if response.status_code == 304:
@@ -437,7 +450,9 @@ class RegistryReader:
 
     async def _follow_blob_redirect(self, host: str, url: str, response: httpx.Response) -> httpx.Response:
         """Registries answer blob GETs with a redirect to a CDN. One hop, https, a host that resolves only
-        to public addresses, no credentials, and a capped body."""
+        to public addresses, no credentials, and a capped body. The check resolves the name locally: behind
+        an HTTP(S)_PROXY (the public client trusts the environment) the proxy resolves it instead, so the
+        literal and suffix checks are the only protection there, as is the case for a DNS rebinding race."""
         target = urlparse(urljoin(url, response.headers.get("location", "")))
         name = target.hostname or ""
         try:
@@ -454,15 +469,10 @@ class RegistryReader:
         if not addresses or not all(is_public_address(a) for a in addresses):
             raise SourceError("Registry: unsupported blob redirect")
         await self._throttle(name)
-        async with self.client.stream("GET", target.geturl(), headers={"Accept": "application/json"}) as hop:
-            if hop.status_code == 429:
-                raise RateLimited("Registry: rate limited", retry_after_seconds(hop.headers.get("retry-after")) or 0)
-            body = b""
-            async for chunk in hop.aiter_bytes():
-                body += chunk
-                if len(body) > MAX_BLOB_BYTES:
-                    raise SourceError("Registry: response too large")
-            return httpx.Response(hop.status_code, headers=hop.headers, content=body)
+        hop = await self._fetch(target.geturl(), MAX_BLOB_BYTES, headers={"Accept": "application/json"})
+        if hop.status_code == 429:
+            raise RateLimited("Registry: rate limited", retry_after_seconds(hop.headers.get("retry-after")) or 0)
+        return hop
 
     async def image_facts(self, host: str, repo: str, reference: str) -> JSON:
         """Runtime-version facts from an image config, read through the registry API without pulling layers.
@@ -635,7 +645,8 @@ async def github_releases(http: CachedHTTP, repo: str, app_id: str, token: str |
     return releases
 
 
-# Lines that may carry credentials never leave the collector: URLs, user:pass@host, emails.
+# Best effort: lines that look like they carry credentials never leave the collector (URLs, user:pass@host,
+# emails). It also drops harmless pkg@1.2.3 pins, and cannot recognise a bare secret such as token=abc.
 CREDENTIAL_LINE = re.compile(r"://|[\w.%:+-]@")
 
 

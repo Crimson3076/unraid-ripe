@@ -610,3 +610,30 @@ async def test_manifest_diff_fallback_needs_the_same_repo_base_and_head(monkeypa
     previous.detected['manifest_diff_for']['repo'] = 'other/a'
     apps, _, _ = await _collect(monkeypatch, tmp_path, [fresh()], github=gh, existing=[previous])
     assert 'manifest_diff' not in apps[0].detected
+
+
+def test_wants_image_diff_for_moving_tags_and_newer_pinned_releases():
+    from ripe.sources.collector import wants_image_diff
+    assert wants_image_diff(AppRecord(id='d:a', name='a', source='docker', update_available=True))
+    assert wants_image_diff(AppRecord(id='d:a', name='a', source='docker', update_available=None))
+    pinned = AppRecord(id='d:a', name='a', source='docker', update_available=False, installed_version='1.0.0', latest_version='2.0.0')
+    assert wants_image_diff(pinned)
+    pinned.latest_version = '1.0.0'
+    assert not wants_image_diff(pinned)
+    assert not wants_image_diff(AppRecord(id='d:a', name='a', source='docker', update_available=False))
+
+
+async def test_image_diff_rate_limit_keeps_last_diff_and_reports_status(monkeypatch, tmp_path):
+    from ripe.sources import collector
+    installed = 'sha256:' + 'a' * 64
+    async def limited(self, *args, **kwargs):
+        raise collector.RateLimited('Registry: rate limited', 5)
+    monkeypatch.setattr(collector.RegistryReader, 'image_diff', limited)
+    def fresh():
+        return AppRecord(id='docker:a', name='a', source='docker', image='ghcr.io/o/a:latest', installed_digest=installed)
+    previous = fresh()
+    previous.detected.update(image_diff=_diff('8.3'), image_diff_for={'image': previous.image, 'installed_digest': installed,
+                                                                    'latest_digest': 'sha256:' + 'f' * 64, 'latest_version': None})
+    apps, _, _ = await _collect(monkeypatch, tmp_path, [fresh()], existing=[previous])
+    assert 'rate limited' in apps[0].detected['registry_status']
+    assert apps[0].detected['image_diff'] == _diff('8.3')

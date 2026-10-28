@@ -10,6 +10,7 @@ from ripe.intelligence import build_rollup, rollup_key
 from ripe.intelligence import service as intelligence
 from ripe.intelligence.rollup import CHUNK_SIZE
 from ripe.models import AppRecord, Release, Settings, utcnow
+from ripe.sources.collector import RateLimited
 from ripe.service import Coordinator
 import ripe.service as service
 from ripe.sources.collector import CachedHTTP, RegistryReader, SourceError, manifest_diff
@@ -373,3 +374,27 @@ async def test_latest_only_image_gets_a_rollup_from_its_digest(tmp_path, monkeyp
         assert manager.store.get('rollup:docker:img')['key'] != key
     finally:
         manager.close()
+
+
+@pytest.mark.asyncio
+async def test_direct_config_blob_without_redirect_is_capped_while_streaming():
+    big = b'{"config": {"Labels": {"x": "' + b'a' * (1024 * 1024) + b'"}}}'
+    client, reader = blob_client(lambda r: httpx.Response(200, content=big))
+    async with client:
+        with pytest.raises(SourceError, match='too large'):
+            await reader.request('ghcr.io', 'owner/app', 'blobs/sha256:' + 'e' * 64)
+
+
+@pytest.mark.asyncio
+async def test_blob_hop_rate_limit_and_error_statuses():
+    def redirecting(final):
+        return lambda r: httpx.Response(307, headers={'location': 'https://cdn.example.test/blob'}) if r.url.host == 'ghcr.io' else final(r)
+    client, reader = blob_client(redirecting(lambda r: httpx.Response(429, headers={'retry-after': '7'})))
+    async with client:
+        with pytest.raises(RateLimited):
+            await reader.request('ghcr.io', 'owner/app', 'blobs/sha256:' + 'e' * 64)
+    for status, headers in ((503, {}), (302, {'location': 'https://other.example.test/x'})):
+        client, reader = blob_client(redirecting(lambda r, s=status, h=headers: httpx.Response(s, headers=h)))
+        async with client:
+            with pytest.raises(SourceError):
+                await reader.request('ghcr.io', 'owner/app', 'blobs/sha256:' + 'e' * 64)

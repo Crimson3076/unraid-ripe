@@ -318,3 +318,11 @@ async def test_direct_lan_networks_keep_exposure_unknown(network):
     # A published port is still a definite fact even on a direct network.
     pub = [{'IP': '0.0.0.0', 'PrivatePort': 80, 'PublicPort': 80}]
     assert (await scan([container(3, 'both', 'x/b:1', pub, networks=(network,))]))['both'].profile.exposure == 'lan'
+
+
+def test_plain_value_keeps_ipv6_hosts_and_ports_and_drops_credentials():
+    from ripe.autoprofile import plain_value
+    assert plain_value('http://[fd00::5]:8080/path?token=x') == 'http://[fd00::5]:8080'
+    assert plain_value('https://host.lan') == 'https://host.lan'
+    assert plain_value('http://user:pw@host:80/x') == ''
+    assert plain_value('http://[not-an-ip/') == ''
