@@ -125,8 +125,15 @@ def read_templates(directory: str) -> dict[str, JSON]:
 PARSE_ERRORS = (AttributeError, TypeError, ValueError, KeyError)
 
 
+MAPPING_ERROR = "GitHub: mapping needs attention (repository not found)"
+
+
 class SourceError(Exception):
     """Intentionally safe to persist: only fixed source labels and status codes."""
+
+
+class SourceNotFound(SourceError):
+    """HTTP 404: the mapped repository is private or does not exist."""
 
 
 class CachedHTTP:
@@ -151,6 +158,8 @@ class CachedHTTP:
             cached["fetched"] = time.time()
             self.cache_set(key, cached)
             return cached["body"]
+        if response.status_code == 404:
+            raise SourceNotFound(f"{source}: HTTP 404")
         if response.status_code >= 400:
             raise SourceError(f"{source}: HTTP {response.status_code}")
         if len(response.content) > 8 * 1024 * 1024:
@@ -239,7 +248,7 @@ A :ro socket mount alone does not make the Docker daemon's API read-only.
             port_map = {p["private"]:p["public"] for p in ports if p.get("public")}
             web_url = re.sub(r"\[PORT:(\d+)\]", lambda match:str(port_map.get(int(match.group(1)), match.group(1))), web_url.replace("[IP]", self.host))
             web_url = safe_url(web_url)
-        return (AppRecord(id=key, name=name, source="docker", installed_version=installed, image=image, installed_digest=digest, image_created_at=date(info.get("Created")), upstream_repo=upstream, icon=tpl.get("icon"), web_url=web_url, profile=profile, detected={"ports":ports, "revision": str(labels.get("org.opencontainers.image.revision", ""))[:80], "registry": host, "tag": tag}))
+        return (AppRecord(id=key, name=name, source="docker", installed_version=installed, image=image, installed_digest=digest, image_created_at=date(info.get("Created")), upstream_repo=upstream, icon=tpl.get("icon"), web_url=web_url, profile=profile, detected={"ports":ports, "revision": str(labels.get("org.opencontainers.image.revision", ""))[:80], "registry": host, "tag": tag, **({"image_source": source} if (source := github_repo(labels.get("org.opencontainers.image.source"))) else {})}))
 
 
 def parse_image(image: str) -> tuple[str, str, str]:
@@ -341,6 +350,18 @@ def version_key(value: str) -> tuple:
     return tuple(int(v) for v in re.findall(r"\d+", value)[:6])
 
 
+def mapping_suggestion(app: AppRecord) -> str | None:
+    """Best guess at a working repository: OCI source label, else GHCR owner/package."""
+    current = (app.upstream_repo or "").lower()
+    if (source := github_repo(app.detected.get("image_source"))) and source.lower() != current:
+        return source
+    if app.image:
+        host, repo, _ = parse_image(app.image)
+        if host == "ghcr.io" and repo.count("/") == 1 and repo.lower() != current:
+            return repo
+    return None
+
+
 def latest_stable(releases: list[Release]) -> Release | None:
     """Newest final release; unparseable tags and pre-releases never qualify."""
     final = [r for r in releases if not r.prerelease and (v := parse_version(r.version)) is not None and not v.is_prerelease]
@@ -355,7 +376,6 @@ async def github_releases(http: CachedHTTP, repo: str, app_id: str, token: str |
     if token:
         headers["Authorization"] = "Bearer " + token
     releases = []
-    complete = False
     for page in range(1, 11):
         data = await http.get(f"https://api.github.com/repos/{repo}/releases?per_page=100&page={page}", headers=headers, source="GitHub")
         if not isinstance(data, list):
@@ -368,17 +388,19 @@ async def github_releases(http: CachedHTTP, repo: str, app_id: str, token: str |
                 continue
             releases.append(Release(id=f"github:{repo}:{item.get('id', version)}", app_id=app_id, version=version, published_at=date(item.get("published_at")), prerelease=bool(item.get("prerelease")), notes=str(item.get("body") or ""), source_url=f"https://github.com/{repo}/releases/tag/{quote(version, safe='')}"))
         if len(data) < 100:
-            complete = True
             break
         # We intentionally retain historical base releases for the patch rule.
         if installed_version:
             target = version_parts(installed_version)
             known = [k for r in releases if (k := version_parts(r.version))]
             if target and known and min(known) < target and any(len(k)>=3 and k[:2]==target[:2] and k[2]==0 for k in known):
-                complete = True
                 break
-    if not complete:
-        raise SourceError("GitHub: release history exceeded 1000 records; narrow repository mapping or inspect manually")
+            # Newest-first: once a release is older than the installed minor, its
+            # base release has been passed and nothing further can be pending.
+            if target and any(k[:2] < target[:2] for k in known):
+                break
+    # A long history is not an error: only releases near the installed version
+    # matter, and anything older than the page limit cannot be pending.
     return releases
 
 
@@ -589,12 +611,19 @@ async def collect(settings: Settings, *, github_token: str | None = None, ha_tok
                     error(app.id, str(exc))
                 except PARSE_ERRORS:
                     error(app.id, "Registry: parse error")
-            if app.upstream_repo:
+            flagged = (existing[app.id].detected.get("invalid_mapping") if app.id in existing else None) or {}
+            if app.upstream_repo and str(flagged.get("repo", "")).lower() == app.upstream_repo.lower():
+                # Already known to 404: keep the flag, skip the request until the mapping changes.
+                app.detected["invalid_mapping"] = flagged
+                app.error = MAPPING_ERROR
+            elif app.upstream_repo:
                 cache_key = (app.upstream_repo, app.installed_version)
                 try:
                     if cache_key not in upstream_cache:
                         upstream_cache[cache_key] = await github_releases(cached, app.upstream_repo, app.id, github_token, app.installed_version)
                     upstream = upstream_cache[cache_key]
+                    if isinstance(upstream, SourceError):
+                        raise upstream
                     if isinstance(upstream, str):
                         raise SourceError(upstream)
                     app_releases = [r.model_copy(update={"app_id":app.id}) for r in upstream]
@@ -607,6 +636,11 @@ async def collect(settings: Settings, *, github_token: str | None = None, ha_tok
                     # Prefer GitHub's dated full release over HA's undated summary.
                     releases[:] = [r for r in releases if not (r.app_id==app.id and any(r.version==g.version or compare_versions(r.version, g.version)==0 for g in app_releases))]
                     releases.extend(app_releases)
+                except SourceNotFound as exc:
+                    upstream_cache[cache_key] = exc
+                    app.detected["invalid_mapping"] = {"repo": app.upstream_repo, "status": 404, "suggestion": mapping_suggestion(app)}
+                    app.error = MAPPING_ERROR
+                    error(app.id, f"GitHub: {app.upstream_repo} not found (HTTP 404); mapping needs attention")
                 except SourceError as exc:
                     upstream_cache[cache_key] = str(exc)
                     app.error = str(exc)

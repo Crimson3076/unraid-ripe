@@ -109,6 +109,8 @@ def build_view(app: AppRecord, releases: list[Release], settings: Settings,
         view.status, view.status_label = "unknown", "Unknown"
         view.recommended_version = None
         view.reason = "Source unavailable; last known data shown. Freshness and the current soak cannot be verified."
+        if app.detected.get("invalid_mapping"):
+            view.reason = "Mapping needs attention: the upstream repository was not found. Choose a repository in the app profile."
     else:
         view.reason = "Source unavailable; last known data shown. " + view.reason
     view.days_remaining = None

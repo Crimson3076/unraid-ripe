@@ -363,3 +363,73 @@ async def test_docker_allowlist_excludes_container_inspect_and_version():
         for path in ('/containers/' + 'a' * 64 + '/json', '/version'):
             with pytest.raises(SourceError):
                 await reader.read(path)
+
+
+async def test_long_release_history_stops_at_installed_version():
+    pages = []
+    def handler(request):
+        page = int(request.url.params['page'])
+        pages.append(page)
+        start = 300 - (page - 1) * 100
+        return httpx.Response(200, json=[_gh(f'1.{minor}.0') for minor in range(start, start - 100, -1)])
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        releases = await github_releases(CachedHTTP(client), 'o/a', 'docker:a', None, '1.150.0')
+    assert pages == [1, 2]
+    assert any(r.version == '1.150.0' for r in releases)
+
+
+async def test_long_unparseable_history_is_not_an_error():
+    def handler(request):
+        return httpx.Response(200, json=[_gh(f'nightly-{request.url.params["page"]}-{i}') for i in range(100)])
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        releases = await github_releases(CachedHTTP(client), 'o/a', 'docker:a', None, '1.0.0')
+    assert len(releases) == 1000
+
+
+async def test_404_mapping_flagged_once_and_not_retried(monkeypatch, tmp_path):
+    from ripe.sources import collector
+    hits = []
+    def make(repo='HaveAGitGat/tdarr_express_be'):
+        return AppRecord(id='docker:tdarr', name='tdarr', source='docker', installed_version='1.0.0', upstream_repo=repo, image='ghcr.io/haveagitgat/tdarr:latest', detected={'image_source': 'https://github.com/HaveAGitGat/Tdarr'})
+    app = make()
+    apps, _, errors = await _collect_404(monkeypatch, tmp_path, [app], hits)
+    flagged = next(a for a in apps if a.id == 'docker:tdarr')
+    assert hits and flagged.detected['invalid_mapping']['status'] == 404
+    assert flagged.detected['invalid_mapping']['suggestion'] == 'HaveAGitGat/Tdarr'
+    assert 'mapping needs attention' in flagged.error
+    assert sum(e['source'] == 'docker:tdarr' for e in errors) == 1
+    # Next poll: same mapping is skipped entirely, with no new error entries.
+    hits.clear()
+    apps, _, errors = await _collect_404(monkeypatch, tmp_path, [make()], hits, existing=[flagged])
+    again = next(a for a in apps if a.id == 'docker:tdarr')
+    assert not hits and again.detected['invalid_mapping'] == flagged.detected['invalid_mapping']
+    assert 'mapping needs attention' in again.error
+    assert not any(e['source'] == 'docker:tdarr' for e in errors)
+    # Changing the mapping retries.
+    apps, _, _ = await _collect_404(monkeypatch, tmp_path, [make('HaveAGitGat/Tdarr')], hits, existing=[flagged])
+    assert hits
+
+
+async def _collect_404(monkeypatch, tmp_path, apps, hits, existing=None):
+    from ripe.models import Settings
+    from ripe.sources import collector
+    socket = tmp_path / 'docker.sock'
+    socket.touch()
+    async def docker_apps(self, *args, **kwargs):
+        return apps
+    async def no_unraid(*args, **kwargs):
+        return []
+    async def registry_meta(self, image, installed_digest, match_version=True):
+        return {}
+    monkeypatch.setattr(collector.DockerReader, 'apps', docker_apps)
+    monkeypatch.setattr(collector.RegistryReader, 'metadata', registry_meta)
+    monkeypatch.setattr(collector, 'unraid_releases', no_unraid)
+    def handler(request):
+        hits.append(request.url.path)
+        return httpx.Response(404, json={'message': 'Not Found'})
+    original_client = httpx.AsyncClient
+    def make_client(*args, **kwargs):
+        kwargs['transport'] = httpx.MockTransport(handler)
+        return original_client(*args, **kwargs)
+    monkeypatch.setattr(collector.httpx, 'AsyncClient', make_client)
+    return await collector.collect(Settings(), docker_socket=str(socket), unraid_version_file=str(tmp_path / 'none'), existing_apps=existing)
