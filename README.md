@@ -72,6 +72,7 @@ recipients, tokens or app profiles.
 | `TZ` | Initial scheduling timezone | `UTC` in Docker |
 | `RIPE_CONFIG_DIR` | Private Ripe data directory | `/config` |
 | `RIPE_ALLOWED_HOSTS` | Comma-separated UI hostnames/IPs without ports | Loopback names/addresses |
+| `RIPE_UI_TOKEN` | Optional shared token. When set, Settings, all connection/settings endpoints and every change require it (browser login prompt: any username, token as password). The dashboard and app pages stay readable. | Unset (no login) |
 
 The Home Assistant token, GitHub token and Gemini API key can each be entered in
 their own password field in Ripe Settings; the environment variables above remain

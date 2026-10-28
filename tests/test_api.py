@@ -220,3 +220,39 @@ def test_pages_show_the_ripe_version_number(client):
     page = client.get('/')
     assert page.status_code == 200
     assert f'Ripe v{__version__}' in page.text
+
+
+@pytest.fixture
+def locked(tmp_path):
+    runtime = Runtime(config_dir=tmp_path, disable_scheduler=True, ui_token='lan-token-xyz')
+    with TestClient(create_app(runtime), base_url='http://localhost') as browser:
+        browser.app.state.manager.request_poll = lambda: False
+        yield browser
+
+
+def test_ui_token_protects_settings_and_changes(locked):
+    assert locked.get('/api/dashboard').status_code == 200
+    assert locked.get('/').status_code == 200
+    for url in ('/settings', '/api/settings', '/api/connections/home-assistant', '/api/connections/github', '/api/logs'):
+        response = locked.get(url)
+        assert response.status_code == 401, url
+        assert 'Basic' in response.headers['www-authenticate']
+    assert change(locked, 'patch', '/api/settings', json={'poll_hours': 24}).status_code == 401
+    assert change(locked, 'post', '/api/poll').status_code == 401
+    wrong = {'Authorization': 'Bearer nope', 'X-Ripe-Request': '1'}
+    assert locked.patch('/api/settings', json={'poll_hours': 24}, headers=wrong).status_code == 401
+
+
+def test_ui_token_accepts_bearer_and_basic(locked):
+    import base64
+    basic = base64.b64encode(b'anyone:lan-token-xyz').decode()
+    assert locked.get('/api/settings', headers={'Authorization': 'Bearer lan-token-xyz'}).status_code == 200
+    assert locked.get('/settings', headers={'Authorization': 'Basic ' + basic}).status_code == 200
+    ok = locked.patch('/api/settings', json={'poll_hours': 24},
+                      headers={'Authorization': 'Basic ' + basic, 'X-Ripe-Request': '1'})
+    assert ok.status_code == 200
+    assert locked.get('/api/settings', headers={'Authorization': 'Basic !!!'}).status_code == 401
+
+
+def test_no_token_configured_keeps_ui_open(client):
+    assert client.get('/api/settings').status_code == 200
