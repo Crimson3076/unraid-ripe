@@ -367,6 +367,8 @@ async def test_latest_only_image_gets_a_rollup_from_its_digest(tmp_path, monkeyp
         rollup = manager.store.get('rollup:docker:img')
         assert rollup and rollup['result']['status'] == 'ok' and rollup['key']
         assert rollup['result']['groups']['under_the_hood'][0]['text'].startswith('PHP changes from 8.2 to 8.3')
+        # The read side uses the same digest identity, so the rollup is actually shown.
+        assert manager.view('docker:img').rollup == rollup['result']
         # A different target digest is a different rollup key.
         key = rollup['key']
         record.latest_digest = 'sha256:' + 'c' * 64

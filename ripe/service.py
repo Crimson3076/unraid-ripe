@@ -116,7 +116,7 @@ class Coordinator:
     def with_rollup(self, view: AppView) -> AppView:
         # A stored rollup is shown only while it still describes this installed -> latest span.
         stored = (self.store.get('rollup:' + view.app.id) or {}).get('result')
-        if stored and stored.get('installed') == view.app.installed_version and stored.get('latest') == rollup_latest(view.app, view.pending):
+        if stored and stored.get('installed') == (view.app.installed_version or view.app.installed_digest) and stored.get('latest') == rollup_latest(view.app, view.pending):
             view.rollup = stored
         return view
 
