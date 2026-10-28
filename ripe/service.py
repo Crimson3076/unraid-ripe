@@ -243,8 +243,13 @@ class Coordinator:
                         self.store.save_app(prior)
                 self.store.set('last_poll',utcnow().isoformat())
                 self.store.set('poll_errors',errors)
+                failing = {str(e.get('source')) for e in errors}
                 if local_ready is False:
+                    failing.add('ollama')
                     self.store.log_error({'source':'ollama','message':'Configured model unavailable on the local Ollama endpoint. Pending classifications remain unknown.'})
+                # A source that didn't fail this time has recovered; hide its old errors.
+                self.store.resolve_errors(failing)
+                self.store.prune_errors()
                 await self.notify()
             except asyncio.CancelledError:
                 raise

@@ -77,3 +77,32 @@ def test_http_cache_keeps_changelog_text_and_classification_key(tmp_path):
     again = fresh.model_copy(update={'notes': db.get('http:def')['body']})
     assert classification_key(fresh, app, Settings()) == classification_key(again, app, Settings())
     db.close()
+
+
+def test_errors_group_per_source_and_resolve_when_source_recovers(tmp_path):
+    db = Store(tmp_path / 'ripe.sqlite3')
+    for _ in range(3):
+        db.log_error({'source': 'docker:a', 'message': 'GitHub: HTTP 403'})
+    db.log_error({'source': 'unraid', 'message': 'boom'})
+    current = {e['source']: e for e in db.logs()['errors']}
+    assert current['docker:a']['attempts'] == 3
+    assert current['docker:a']['first_seen'] <= current['docker:a']['last_seen']
+    db.resolve_errors({'unraid'})  # docker:a succeeded on the latest attempt
+    assert [e['source'] for e in db.logs()['errors']] == ['unraid']
+    db.log_error({'source': 'docker:a', 'message': 'fails again'})
+    again = {e['source']: e for e in db.logs()['errors']}
+    assert again['docker:a']['attempts'] == 1
+    db.close()
+
+
+def test_resolved_errors_are_pruned_after_retention(tmp_path):
+    db = Store(tmp_path / 'ripe.sqlite3')
+    db.log_error({'source': 'old', 'message': 'x'})
+    db.log_error({'source': 'recent', 'message': 'x'})
+    db.log_error({'source': 'open', 'message': 'x'})
+    db.resolve_errors({'open'})
+    db.db.execute("UPDATE errors SET resolved_at='2000-01-01T00:00:00+00:00' WHERE data LIKE '%\"old\"%'")
+    db.prune_errors(14)
+    sources = [json.loads(r[0])['source'] for r in db.db.execute('SELECT data FROM errors')]
+    assert sorted(sources) == ['open', 'recent']
+    db.close()
