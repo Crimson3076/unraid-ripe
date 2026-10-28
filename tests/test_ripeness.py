@@ -301,7 +301,7 @@ def test_low_severity_security_waits_but_high_skips_soak():
 
 
 def test_advisory_id_in_notes_skips_soak_and_is_shown():
-    r=release('1.1.0',1,classification=SEC())
+    r=release('1.1.0',1,classification={'tags':['security'],'security':[{'evidence':'Security: fixes CVE-2026-12345 and GHSA-abcd-2345-wxyz.'}]})
     r.notes='Security: fixes CVE-2026-12345 and GHSA-abcd-2345-wxyz.'
     v=build_view(app(),[r],Settings(),NOW)
     assert v.status == 'recommended_now'
@@ -314,3 +314,18 @@ def test_unsoaked_later_security_fix_still_constrains_target():
                         release('1.2.0',1,classification=SEC(severity='low'))],Settings(),NOW)
     assert v.status == 'recommended_now'
     assert v.recommended_version == '1.2.0'
+
+
+def test_advisory_of_excluded_fix_does_not_make_other_fix_urgent():
+    r=release('1.1.0',1,classification={'tags':['security'],'security':[
+        {'evidence':'Fixes CVE-2026-12345 in the proxy.'},{'severity':'low','evidence':'Security fix.'}]})
+    r.notes='Fixes CVE-2026-12345 in the proxy. Security fix.'
+    r.applicability=[{'kind':'security','index':0,'status':'does_not_apply','evidence':'x','profile_evidence':'y'}]
+    v=build_view(app(),[r],Settings(),NOW)
+    assert v.status != 'recommended_now'
+
+
+def test_waiting_countdown_reflects_security_soak():
+    v=build_view(app(),[release('1.1.0',1,classification=SEC(severity='low'))],Settings(),NOW)
+    assert v.status == 'waiting'
+    assert v.days_remaining == 2

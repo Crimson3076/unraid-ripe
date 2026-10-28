@@ -48,7 +48,13 @@ def _has_applicable(release: Release, kind: str) -> bool:
 
 
 def advisory_ids(release: Release) -> list[str]:
-    return sorted({m.upper() for m in _ADVISORY.findall(release.notes or "")})
+    """Advisory IDs quoted by an applicable security item, so an advisory for an
+    excluded fix cannot make a different fix urgent."""
+    items = _classification(release).get("security", [])
+    text = " ".join(f"{item.get('evidence') or ''} {item.get('description') or ''}"
+                    for i, item in enumerate(items)
+                    if item.get("evidence") and _applicable(release, "security", i))
+    return sorted({m.upper() for m in _ADVISORY.findall(text)} & {m.upper() for m in _ADVISORY.findall(release.notes or "")})
 
 
 def _security_severities(release: Release) -> list[str]:
@@ -59,6 +65,13 @@ def _security_severities(release: Release) -> list[str]:
 
 def _security_urgent(release: Release) -> bool:
     return bool(advisory_ids(release)) or any(s in _URGENT_SEVERITY for s in _security_severities(release))
+
+
+def _security_ready_at(release: Release, settings: Settings) -> datetime | None:
+    if not _has_applicable(release, "security") or release.published_at is None:
+        return None
+    published = _aware(release.published_at)
+    return published if _security_urgent(release) else published + timedelta(days=settings.patch_soak_days)
 
 
 def _security_ready(release: Release, settings: Settings, now: datetime) -> bool:
@@ -208,6 +221,15 @@ def _build_view(app: AppRecord, releases: list[Release], settings: Settings,
     latest_missing = compare_versions(latest, newest.version) == 1
     deadline = None if latest_missing else soak_deadline(newest, releases, settings, app.profile.tier)
     days_left = max(0, math.ceil((deadline - now).total_seconds() / 86400)) if deadline else None
+    security_at = None
+    if not latest_missing and not any(_security_ready(r, settings, now) for r in pending):
+        times = [t for r in pending if (t := _security_ready_at(r, settings))]
+        security_at = min(times, default=None)
+        if security_at and (deadline is None or security_at < deadline):
+            deadline = security_at
+            days_left = max(0, math.ceil((deadline - now).total_seconds() / 86400))
+        else:
+            security_at = None
     ripe = [] if latest_missing else [r for r in pending if _is_ripe(r, pending, releases, settings, app.profile.tier, now)]
     target = ripe[-1] if ripe else None
     security = [r for r in pending if _security_ready(r, settings, now)]
@@ -241,7 +263,8 @@ def _build_view(app: AppRecord, releases: list[Release], settings: Settings,
             view.reason += f" Newest {newest.version} still needs {days_left} days."
     elif deadline is not None:
         view.status, view.status_label = "waiting", "Waiting"
-        view.reason = f"Newest {newest.version} needs {days_left} more days."
+        view.reason = (f"An applicable security fix becomes recommended in {days_left} days." if security_at
+                       else f"Newest {newest.version} needs {days_left} more days.")
         if any((d := soak_deadline(r, releases, settings, app.profile.tier)) and d <= now for r in pending[:-1]):
             view.reason += " Earlier releases were superseded before completing their soak; the clock restarted."
     else:
