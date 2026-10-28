@@ -307,3 +307,10 @@ def test_advisory_id_in_notes_skips_soak_and_is_shown():
     assert v.status == 'recommended_now'
     assert 'CVE-2026-12345' in v.reason
 
+
+
+def test_unsoaked_later_security_fix_still_constrains_target():
+    v=build_view(app(),[release('1.1.0',15,classification=SEC(severity='low')),
+                        release('1.2.0',1,classification=SEC(severity='low'))],Settings(),NOW)
+    assert v.status == 'recommended_now'
+    assert v.recommended_version == '1.2.0'

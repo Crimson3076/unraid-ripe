@@ -83,7 +83,7 @@ class Notifier:
             if view.status != 'recommended_now':
                 continue
             fixes = [(r.version, (r.classification or {}).get('security', [])) for r in view.pending if (r.classification or {}).get('security')]
-            key = 'security-sent:' + hashlib.sha256(repr((view.app.id, fixes)).encode()).hexdigest()
+            key = 'security-sent:' + hashlib.sha256(repr((view.app.id, fixes, view.recommended_version)).encode()).hexdigest()
             if self.store.get(key):
                 continue
             if await self.send(settings, f'{view.app.name}: applicable security fix available. Review {view.recommended_version or "the release notes"}; no update has been performed.', 'ripe-security-' + hashlib.sha256(view.app.id.encode()).hexdigest()[:12], now=now):

@@ -212,9 +212,11 @@ def _build_view(app: AppRecord, releases: list[Release], settings: Settings,
     target = ripe[-1] if ripe else None
     security = [r for r in pending if _security_ready(r, settings, now)]
     # The earliest version containing all known fixes is the last fixing
-    # release. Recommending the first would knowingly omit later security fixes.
-    if security and (target is None or compare_versions(target.version, security[-1].version) == -1):
-        target = security[-1]
+    # release. Recommending the first would knowingly omit later security fixes,
+    # so unsoaked applicable fixes still constrain the target once one is ready.
+    last_fix = [r for r in pending if _has_applicable(r, "security")][-1:] if security else []
+    if last_fix and (target is None or compare_versions(target.version, last_fix[0].version) == -1):
+        target = last_fix[0]
     view.recommended_version = target.version if target else None
     view.next_ripe_at = deadline
     view.days_remaining = days_left
@@ -223,7 +225,7 @@ def _build_view(app: AppRecord, releases: list[Release], settings: Settings,
     unknown = latest_missing or any(not r.notes.strip() or not _classification(r) for r in pending)
     if security:
         view.status, view.status_label = "recommended_now", "Recommended now"
-        view.reason = f"Applicable security fix{_security_detail(security)}: {target.version if target else security[-1].version} is the earliest target containing all known applicable fixes. Your approval is still required."
+        view.reason = f"Applicable security fix{_security_detail(security)}: {target.version if target else last_fix[0].version} is the earliest target containing all known applicable fixes. Your approval is still required."
         if applicable_break:
             view.reason += " Read the applicable breaking or migration steps first."
     elif applicable_break or attention or any(s in signals for s in ("Semver major version change", "Database image major version change", "Pending span includes a pre-release")):
