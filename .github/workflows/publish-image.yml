@@ -1,8 +1,11 @@
 # Publishes Ripe's container image to GitHub Container Registry so Unraid can pull it and show updates
-# in the Docker tab: `latest` follows main, releases also get version tags (e.g. 0.3.1), every build gets sha-<commit>.
+# in the Docker tab: `latest` follows main (only after CI passes there), releases also get version tags (e.g. 0.3.1),
+# every build gets sha-<commit>.
 name: Publish image
 on:
-  push:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
     branches: [main]
   release:
     types: [published]
@@ -18,10 +21,14 @@ concurrency:
 
 jobs:
   publish:
+    # main builds wait for CI on the merged commit; a failed CI run publishes nothing
+    if: github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -32,8 +39,11 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/crimson3076/unraid-ripe
+          # only the raw tag below may set `latest`: a release build for an older commit must not replace it
+          flavor: |
+            latest=false
           tags: |
-            type=raw,value=latest,enable=${{ github.event_name != 'release' }}
+            type=raw,value=latest,enable={{is_default_branch}}
             type=semver,pattern={{version}}
             type=sha,format=short
           labels: |
