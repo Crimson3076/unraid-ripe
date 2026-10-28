@@ -86,5 +86,7 @@ class AppView(BaseModel):
     pending: list[Release] = Field(default_factory=list)
     history: list[Release] = Field(default_factory=list)
     available_notes: list[Release] = Field(default_factory=list)
+    no_notes: list[str] = Field(default_factory=list)
+    rollup: dict[str, Any] | None = None
     reason: str = ""
     next_ripe_at: datetime | None = None

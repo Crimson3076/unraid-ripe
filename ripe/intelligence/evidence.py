@@ -55,6 +55,19 @@ class ApplicabilityItem(Strict):
     evidence: str
     profile_evidence: str
 
+class RollupItem(Strict):
+    text: str
+    source: Literal['release', 'manifest']
+    release: str
+    evidence: str
+
+class RollupModel(Strict):
+    action: list[RollupItem]
+    security: list[RollupItem]
+    features: list[RollupItem]
+    fixes: list[RollupItem]
+    under_the_hood: list[RollupItem]
+
 class Applicability(Strict):
     items: list[ApplicabilityItem]
 

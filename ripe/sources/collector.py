@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import ipaddress
 import json
 import re
 import time
@@ -17,7 +18,7 @@ import httpx
 import websockets
 
 from ripe.models import AppRecord, Profile, Release, Settings, utcnow
-from ripe.versions import compare_versions, parse_version, version_parts
+from ripe.versions import compare_versions, normalize_version, parse_version, version_parts
 
 JSON = dict[str, Any]
 INFRA = re.compile(r"unraid|home.?assistant|adguard|nginx.?proxy.?manager|cloudflar|wireguard|mariadb|mysql|postgres|redis|mongo|pihole|pi.hole|traefik|caddy", re.I)
@@ -269,6 +270,13 @@ class RateLimited(SourceError):
 
 
 LATEST_TAGS = ("latest", "stable", "main", "master", "edge", "develop")
+DIGEST = re.compile(r"sha256:[a-f0-9]{64}")
+ENV_VERSION = re.compile(r"[A-Z][A-Z0-9_]*_(?:VERSION|VER|RELEASE)")
+ENV_SECRET = re.compile(r"KEY|TOKEN|SECRET|PASS|CRED|AUTH", re.I)
+ENV_VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+~:-]{0,63}")
+LABEL_VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+~:/@-]{0,127}")
+IMAGE_LABELS = ("org.opencontainers.image.base.name", "org.opencontainers.image.ref.name")
+MANIFEST_FILE = re.compile(r"(?:^|/)(?:package\.json|requirements[\w.-]*\.txt|pyproject\.toml|composer\.json|go\.mod)$")
 MAX_TAG_PAGES = 10
 MAX_RETRY_WAIT = 30
 MAX_ATTEMPTS = 3
@@ -372,6 +380,8 @@ class RegistryReader:
                     raise SourceError("Registry: missing read token")
                 self.tokens[(host, repo)] = token
                 response = await self._get(host, url, headers={**headers, "Authorization":"Bearer " + token})
+            if response.status_code in (301, 302, 303, 307, 308) and suffix.startswith("blobs/"):
+                response = await self._follow_blob_redirect(host, url, response)
             if response.status_code == 304:
                 return response
             if response.status_code >= 400:
@@ -383,6 +393,78 @@ class RegistryReader:
             return response
         except (httpx.HTTPError, ValueError):
             raise SourceError("Registry: connection or JSON error") from None
+
+    async def _follow_blob_redirect(self, host: str, url: str, response: httpx.Response) -> httpx.Response:
+        """Registries answer blob GETs with a redirect to a CDN. One hop, https, public host, no credentials."""
+        target = urlparse(urljoin(url, response.headers.get("location", "")))
+        name = target.hostname or ""
+        try:
+            ipaddress.ip_address(name)
+            literal = True
+        except ValueError:
+            literal = False
+        if target.scheme != "https" or not name or literal or target.username or target.password or name == "localhost" or name.endswith((".local", ".lan", ".internal")):
+            raise SourceError("Registry: unsupported blob redirect")
+        return await self._get(name, target.geturl(), headers={"Accept": "application/json"})
+
+    async def image_facts(self, host: str, repo: str, reference: str) -> JSON:
+        """Runtime-version facts from an image config, read through the registry API without pulling layers.
+
+        Only allowlisted *_VERSION style ENV values and two base-image labels are returned;
+        the config's other ENV entries are never kept."""
+        manifest = await self.fetch(host, repo, "manifests/" + quote(reference, safe=":"), ttl=21600)
+        body = manifest["body"]
+        if isinstance(body.get("manifests"), list):
+            entries = [m for m in body["manifests"] if isinstance(m, dict) and isinstance(m.get("platform"), dict) and m["platform"].get("os") == "linux"]
+            chosen = next((m for m in entries if m["platform"].get("architecture") == "amd64"), entries[0] if entries else None)
+            if not chosen or not DIGEST.fullmatch(str(chosen.get("digest"))):
+                raise SourceError("Registry: no linux image manifest")
+            body = (await self.fetch(host, repo, "manifests/" + chosen["digest"], ttl=21600))["body"]
+        digest = (body.get("config") or {}).get("digest")
+        if not isinstance(digest, str) or not DIGEST.fullmatch(digest):
+            raise SourceError("Registry: image config unavailable")
+        key = "imgcfg:" + hashlib.sha256(f"{host}/{repo}/{digest}".encode()).hexdigest()
+        if (cached := self.cache_get(key)) is not None:
+            return cached
+        # Deliberately not cached as a raw blob: the full config can carry arbitrary ENV.
+        config = (await self.request(host, repo, "blobs/" + digest)).json().get("config") or {}
+        facts: JSON = {}
+        for item in (config.get("Env") or [])[:500]:
+            name, _, value = str(item).partition("=")
+            if ENV_VERSION.fullmatch(name) and not ENV_SECRET.search(name) and ENV_VALUE.fullmatch(value) and "://" not in value:
+                facts[name] = value
+        labels = config.get("Labels") or {}
+        for label in IMAGE_LABELS:
+            if isinstance(labels.get(label), str) and LABEL_VALUE.fullmatch(labels[label].strip()) and "://" not in labels[label]:
+                facts[label] = labels[label].strip()
+        self.cache_set(key, facts)
+        return facts
+
+    async def image_diff(self, image: str, installed_digest: str, latest_version: str | None, ignore: tuple[str, ...] = ()) -> list[JSON]:
+        """Differences between the installed image's config and the latest one, as plain facts."""
+        host, repo, tag = parse_image(image)
+        candidates = [tag] if tag in LATEST_TAGS else [v for v in (latest_version, "v" + latest_version if latest_version else None) if v]
+        latest = None
+        for candidate in candidates:
+            try:
+                latest = await self.image_facts(host, repo, candidate)
+                break
+            except RateLimited:
+                raise
+            except SourceError:
+                continue
+        if latest is None:
+            return []
+        installed = await self.image_facts(host, repo, installed_digest)
+        skip = {normalize_version(v) for v in ignore if v} - {None}
+        diff = []
+        for key in sorted(set(installed) | set(latest)):
+            before, after = installed.get(key), latest.get(key)
+            if before == after or {normalize_version(before), normalize_version(after)} & skip:
+                continue
+            name = key.rsplit(".", 1)[-1] if key in IMAGE_LABELS else re.sub(r"_(?:VERSION|VER|RELEASE)$", "", key).replace("_", " ")
+            diff.append({"name": name, "key": key, "installed": before, "latest": after})
+        return diff[:20]
 
     async def fetch(self, host: str, repo: str, suffix: str, ttl: int = 0) -> JSON:
         """Cached request: revalidated with If-None-Match once older than ttl."""
@@ -494,6 +576,31 @@ async def github_releases(http: CachedHTTP, repo: str, app_id: str, token: str |
     if not complete:
         raise SourceError("GitHub: release history exceeded 1000 records; narrow repository mapping or inspect manually")
     return releases
+
+
+async def manifest_diff(http: CachedHTTP, repo: str, base: str, head: str, token: str | None = None) -> list[JSON]:
+    """Changed lines in dependency manifests between two tags, via the GitHub compare API."""
+    repo = github_repo(repo)
+    if not repo:
+        raise SourceError("GitHub: invalid repository mapping")
+    headers = {"Accept":"application/vnd.github+json", "X-GitHub-Api-Version":"2022-11-28"}
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    data = await http.get(f"https://api.github.com/repos/{repo}/compare/{quote(base, safe='')}...{quote(head, safe='')}", headers=headers, source="GitHub")
+    if not isinstance(data, dict) or not isinstance(data.get("files"), list):
+        raise SourceError("GitHub: invalid compare response")
+    changes = []
+    for item in data["files"]:
+        name = item.get("filename") if isinstance(item, dict) else None
+        if not isinstance(name, str) or "node_modules/" in name or not MANIFEST_FILE.search(name):
+            continue
+        lines = {"-": [], "+": []}
+        for line in str(item.get("patch") or "").splitlines():
+            if line[:1] in lines and not line.startswith(("---", "+++")) and len(line.strip(" \t+-,{}[]")) > 1:
+                lines[line[0]].append(line[1:].strip()[:200])
+        if lines["-"] or lines["+"]:
+            changes.append({"file": name, "removed": lines["-"][:40], "added": lines["+"][:40]})
+    return changes[:12]
 
 
 async def unraid_releases(http: CachedHTTP, installed: str | None, token: str | None = None) -> list[Release]:
@@ -702,6 +809,17 @@ async def collect(settings: Settings, *, github_token: str | None = None, ha_tok
                         app.detected["image_change_date_kind"] = "first_observed"
                     if metadata.get("truncated_tags"):
                         error(app.id, "Registry tag list is incomplete; latest-only status is unknown")
+                    previous = existing.get(app.id)
+                    same_install = bool(previous and previous.image == app.image and previous.installed_digest == app.installed_digest)
+                    if app.installed_digest and app.update_available is not False:
+                        try:
+                            diff = await registry.image_diff(app.image, app.installed_digest, app.latest_version or None, (app.installed_version, app.latest_version))
+                            if diff:
+                                app.detected["image_diff"] = diff
+                        except (SourceError, *PARSE_ERRORS):
+                            # Optional facts: keep the last known diff for the same installation.
+                            if same_install and previous.detected.get("image_diff"):
+                                app.detected["image_diff"] = previous.detected["image_diff"]
                 except RateLimited:
                     # Keep the last known registry data and retry on the next poll.
                     previous = existing.get(app.id)
@@ -733,6 +851,16 @@ async def collect(settings: Settings, *, github_token: str | None = None, ha_tok
                     # Prefer GitHub's dated full release over HA's undated summary.
                     releases[:] = [r for r in releases if not (r.app_id==app.id and any(r.version==g.version or compare_versions(r.version, g.version)==0 for g in app_releases))]
                     releases.extend(app_releases)
+                    base = next((r.version for r in app_releases if compare_versions(r.version, app.installed_version) == 0), None)
+                    head = next((r.version for r in app_releases if compare_versions(r.version, app.latest_version) == 0), None)
+                    if base and head and compare_versions(head, base) == 1:
+                        try:
+                            if changes := await manifest_diff(cached, app.upstream_repo, base, head, github_token):
+                                app.detected["manifest_diff"] = changes
+                        except (SourceError, *PARSE_ERRORS):
+                            previous = existing.get(app.id)
+                            if previous and previous.installed_version == app.installed_version and previous.detected.get("manifest_diff"):
+                                app.detected["manifest_diff"] = previous.detected["manifest_diff"]
                 except SourceError as exc:
                     upstream_cache[cache_key] = str(exc)
                     app.error = str(exc)
