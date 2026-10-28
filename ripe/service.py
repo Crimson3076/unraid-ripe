@@ -132,18 +132,20 @@ class Coordinator:
         """Regenerate the app's rollup only when installed, latest, their notes or the model setup changed."""
         pending = build_view(app, self.store.releases(app.id), settings).pending
         image_diff, manifest = app.detected.get('image_diff'), app.detected.get('manifest_diff')
-        if not app.installed_version or not (pending or image_diff):
+        # No version known (latest-only image): the installed digest identifies the installation.
+        installed = app.installed_version or app.installed_digest
+        if not installed or not (pending or image_diff):
             self.store.set('rollup:' + app.id, None)
             return
         latest = rollup_latest(app, pending)
-        key = rollup_key(app, app.installed_version, latest, pending, image_diff, manifest, settings)
+        key = rollup_key(app, installed, latest, pending, image_diff, manifest, settings)
         stored = self.store.get('rollup:' + app.id) or {}
         if stored.get('key') == key and stored['result'].get('status') == 'ok':
             return
         unavailable = None
         if (any(r.notes.strip() for r in pending) or manifest) and settings.classification_provider == 'local' and not await local_ready():
             unavailable = 'Local model is unavailable; no summary was inferred.'
-        result = await build_rollup(app, app.installed_version, latest, pending, settings, image_diff=image_diff,
+        result = await build_rollup(app, installed, latest, pending, settings, image_diff=image_diff,
                                     manifest_diff=manifest, gemini_key=self.runtime.gemini_key,
                                     model_unavailable=unavailable, log_call=self.store.log_llm)
         self.store.set('rollup:' + app.id, {'key': key if result['status'] == 'ok' else None, 'result': result})

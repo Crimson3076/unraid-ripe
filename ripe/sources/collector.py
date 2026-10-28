@@ -6,6 +6,7 @@ import hashlib
 import ipaddress
 import json
 import re
+import socket
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -339,6 +340,21 @@ def is_local_image(image: str, digest: str | None, previously_tracked: bool = Fa
     return "/" not in name and not previously_tracked
 
 
+MAX_BLOB_BYTES = 1024 * 1024  # an image config is a few KB; anything bigger is not one
+
+
+async def resolve_addresses(name: str, port: int) -> list[str]:
+    infos = await asyncio.get_running_loop().getaddrinfo(name, port, type=socket.SOCK_STREAM)
+    return [str(info[4][0]).split("%", 1)[0] for info in infos]
+
+
+def is_public_address(value: str) -> bool:
+    try:
+        return ipaddress.ip_address(value).is_global
+    except ValueError:
+        return False
+
+
 class RegistryReader:
     HOSTS = {"registry-1.docker.io", "ghcr.io", "lscr.io"}
     TOKEN_HOSTS = {"auth.docker.io", "ghcr.io", "lscr.io"}
@@ -353,6 +369,7 @@ class RegistryReader:
         self.sleep = sleep
         self.last_request: dict[str, float] = {}
         self.cooldown: dict[str, tuple[float, float]] = {}
+        self.resolve = resolve_addresses
 
     async def _throttle(self, host: str) -> None:
         """Spread requests to one registry instead of bursting."""
@@ -410,7 +427,7 @@ class RegistryReader:
                 return response
             if response.status_code >= 400:
                 raise SourceError(f"Registry: HTTP {response.status_code}")
-            if len(response.content) > 8 * 1024 * 1024:
+            if len(response.content) > (MAX_BLOB_BYTES if suffix.startswith("blobs/") else 8 * 1024 * 1024):
                 raise SourceError("Registry: response too large")
             if not isinstance(response.json(), dict):
                 raise SourceError("Registry: invalid JSON object")
@@ -419,7 +436,8 @@ class RegistryReader:
             raise SourceError("Registry: connection or JSON error") from None
 
     async def _follow_blob_redirect(self, host: str, url: str, response: httpx.Response) -> httpx.Response:
-        """Registries answer blob GETs with a redirect to a CDN. One hop, https, public host, no credentials."""
+        """Registries answer blob GETs with a redirect to a CDN. One hop, https, a host that resolves only
+        to public addresses, no credentials, and a capped body."""
         target = urlparse(urljoin(url, response.headers.get("location", "")))
         name = target.hostname or ""
         try:
@@ -429,7 +447,22 @@ class RegistryReader:
             literal = False
         if target.scheme != "https" or not name or literal or target.username or target.password or name == "localhost" or name.endswith((".local", ".lan", ".internal")):
             raise SourceError("Registry: unsupported blob redirect")
-        return await self._get(name, target.geturl(), headers={"Accept": "application/json"})
+        try:
+            addresses = await self.resolve(name, target.port or 443)
+        except OSError:
+            raise SourceError("Registry: unsupported blob redirect") from None
+        if not addresses or not all(is_public_address(a) for a in addresses):
+            raise SourceError("Registry: unsupported blob redirect")
+        await self._throttle(name)
+        async with self.client.stream("GET", target.geturl(), headers={"Accept": "application/json"}) as hop:
+            if hop.status_code == 429:
+                raise RateLimited("Registry: rate limited", retry_after_seconds(hop.headers.get("retry-after")) or 0)
+            body = b""
+            async for chunk in hop.aiter_bytes():
+                body += chunk
+                if len(body) > MAX_BLOB_BYTES:
+                    raise SourceError("Registry: response too large")
+            return httpx.Response(hop.status_code, headers=hop.headers, content=body)
 
     async def image_facts(self, host: str, repo: str, reference: str) -> JSON:
         """Runtime-version facts from an image config, read through the registry API without pulling layers.
@@ -602,6 +635,17 @@ async def github_releases(http: CachedHTTP, repo: str, app_id: str, token: str |
     return releases
 
 
+# Lines that may carry credentials never leave the collector: URLs, user:pass@host, emails.
+CREDENTIAL_LINE = re.compile(r"://|[\w.%:+-]@")
+
+
+def wants_image_diff(app: AppRecord) -> bool:
+    """A moving tag with an update, or a pinned tag whose upstream release is newer than the installed one."""
+    if app.update_available is not False:
+        return True
+    return bool(app.latest_version and app.installed_version and compare_versions(app.latest_version, app.installed_version) == 1)
+
+
 async def manifest_diff(http: CachedHTTP, repo: str, base: str, head: str, token: str | None = None) -> list[JSON]:
     """Changed lines in dependency manifests between two tags, via the GitHub compare API."""
     repo = github_repo(repo)
@@ -620,7 +664,7 @@ async def manifest_diff(http: CachedHTTP, repo: str, base: str, head: str, token
             continue
         lines = {"-": [], "+": []}
         for line in str(item.get("patch") or "").splitlines():
-            if line[:1] in lines and not line.startswith(("---", "+++")) and len(line.strip(" \t+-,{}[]")) > 1:
+            if line[:1] in lines and not line.startswith(("---", "+++")) and len(line.strip(" \t+-,{}[]")) > 1 and not CREDENTIAL_LINE.search(line):
                 lines[line[0]].append(line[1:].strip()[:200])
         if lines["-"] or lines["+"]:
             changes.append({"file": name, "removed": lines["-"][:40], "added": lines["+"][:40]})
@@ -818,6 +862,7 @@ async def collect(settings: Settings, *, github_token: str | None = None, ha_tok
         # shorter span fetched for a newer installation of the same app.
         upstream_cache: dict[tuple[str, str | None], list[Release] | str] = {}
         for app in apps:
+            registry_ok = False
             if app.source == "docker" and app.image and is_local_image(app.image, app.installed_digest, bool(existing.get(app.id) and existing[app.id].latest_digest)):
                 # Never pulled from a registry: nothing to look up, and not an error.
                 app.detected["local_build"] = "local build (not tracked)"
@@ -843,16 +888,7 @@ async def collect(settings: Settings, *, github_token: str | None = None, ha_tok
                     if metadata.get("truncated_tags"):
                         error(app.id, "Registry tag list is incomplete; latest-only status is unknown")
                     previous = existing.get(app.id)
-                    same_install = bool(previous and previous.image == app.image and previous.installed_digest == app.installed_digest)
-                    if app.installed_digest and app.update_available is not False:
-                        try:
-                            diff = await registry.image_diff(app.image, app.installed_digest, app.latest_version or None, (app.installed_version, app.latest_version))
-                            if diff:
-                                app.detected["image_diff"] = diff
-                        except (SourceError, *PARSE_ERRORS):
-                            # Optional facts: keep the last known diff for the same installation.
-                            if same_install and previous.detected.get("image_diff"):
-                                app.detected["image_diff"] = previous.detected["image_diff"]
+                    registry_ok = True
                 except RateLimited:
                     # Keep the last known registry data and retry on the next poll.
                     previous = existing.get(app.id)
@@ -887,13 +923,17 @@ async def collect(settings: Settings, *, github_token: str | None = None, ha_tok
                     base = next((r.version for r in app_releases if compare_versions(r.version, app.installed_version) == 0), None)
                     head = next((r.version for r in app_releases if compare_versions(r.version, app.latest_version) == 0), None)
                     if base and head and compare_versions(head, base) == 1:
+                        span = {"repo": app.upstream_repo, "base": base, "head": head}
                         try:
                             if changes := await manifest_diff(cached, app.upstream_repo, base, head, github_token):
                                 app.detected["manifest_diff"] = changes
+                                app.detected["manifest_diff_for"] = span
                         except (SourceError, *PARSE_ERRORS):
                             previous = existing.get(app.id)
-                            if previous and previous.installed_version == app.installed_version and previous.detected.get("manifest_diff"):
+                            # Reuse only a diff computed for exactly this repo, base and head.
+                            if previous and previous.detected.get("manifest_diff") and previous.detected.get("manifest_diff_for") == span:
                                 app.detected["manifest_diff"] = previous.detected["manifest_diff"]
+                                app.detected["manifest_diff_for"] = span
                 except SourceError as exc:
                     upstream_cache[cache_key] = str(exc)
                     if str(exc) == "GitHub: HTTP 404" and app.detected.pop("upstream_auto", False):
@@ -912,6 +952,24 @@ async def collect(settings: Settings, *, github_token: str | None = None, ha_tok
                 # A missing mapping is a hint, not a source failure: the digest
                 # logic still gives a valid status for unmapped :latest images.
                 app.detected["mapping_hint"] = "No upstream repository mapping; choose one in the app profile"
+            if registry_ok and app.installed_digest and wants_image_diff(app):
+                # After the upstream lookup: version-tagged images need latest_version to pick the target.
+                previous = existing.get(app.id)
+                identity = {"image": app.image, "installed_digest": app.installed_digest,
+                            "latest_digest": app.latest_digest, "latest_version": app.latest_version}
+                try:
+                    diff = await registry.image_diff(app.image, app.installed_digest, app.latest_version or None, (app.installed_version, app.latest_version))
+                    if diff:
+                        app.detected["image_diff"] = diff
+                        app.detected["image_diff_for"] = identity
+                except RateLimited:
+                    app.detected["registry_status"] = "Registry rate limited; last known data kept, retrying next poll"
+                except (SourceError, *PARSE_ERRORS):
+                    pass
+                # Optional facts: keep the last diff only for the very same installed and target image.
+                if "image_diff" not in app.detected and previous and previous.detected.get("image_diff") and previous.detected.get("image_diff_for") == identity:
+                    app.detected["image_diff"] = previous.detected["image_diff"]
+                    app.detected["image_diff_for"] = identity
             if not app.installed_version and app.image_created_at:
                 app.detected["version_fallback"] = "unknown (image date " + app.image_created_at.date().isoformat() + ")"
     return apps, releases, errors
