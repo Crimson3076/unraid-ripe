@@ -24,8 +24,8 @@ ENV_DENY = re.compile(r"TOKEN|KEY|PASS|SECRET|AUTH", re.I)
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,99}")
 LOGIN_PATH = re.compile(r"log[-_]?in|sign[-_]?in|sso|oauth|/auth\b|/account", re.I)
 PASSWORD_FIELD = re.compile(rb"<input[^>]+type\s*=\s*[\"']?password", re.I)
-DB_MOUNT = re.compile(r"mysql|mariadb|postgres|pgdata|redis|mongo|sqlite|/db\b|\.db$", re.I)
-CONFIG_MOUNT = re.compile(r"^/(?:config|etc|conf)(?:/|$)|/config(?:/|$)", re.I)
+DB_MOUNT = re.compile(r"(?:mysql|mariadb|postgres|pgdata|redis|mongo|sqlite|/db\b|\.db$)", re.I)
+CONFIG_MOUNT = re.compile(r"(?:^/(?:config|etc|conf)(?:/|$))|(?:/config(?:/|$))", re.I)
 SHARED_NETWORK_MAX = 4  # a network shared by many containers says nothing about who needs whom
 Prober = Callable[[str], Awaitable[tuple[bool | None, str]]]
 
