@@ -204,3 +204,10 @@ def test_unconfigured_runtime_does_not_choose_integration_hosts(tmp_path,monkeyp
     assert runtime.ha_url==''
     assert runtime.initial_settings().ollama_url==''
     assert runtime.initial_settings().dashboard_url=='http://localhost:8087'
+
+
+def test_pages_show_the_ripe_version_number(client):
+    from ripe import __version__
+    page = client.get('/')
+    assert page.status_code == 200
+    assert f'Ripe v{__version__}' in page.text

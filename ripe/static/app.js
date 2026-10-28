@@ -120,7 +120,11 @@
 
   function normalized(value) {return String(value??'').toLowerCase().replace(/\s+/g,' ').trim();}
   function hasEvidence(quote, notes) {const q=normalized(quote);return q.length>0&&normalized(notes).includes(q);}
-  function evidence(quote,label='Release notes') {return `<blockquote class="quote"><span class="quote-label">${h(label)}</span>“${h(quote)}”</blockquote>`;}
+  function plainMarkdown(value) {
+    // Show quoted source text without raw Markdown syntax; nothing but escaped text and http(s) links is rendered.
+    return h(String(value??'')).replace(/!?\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)/g,(m,label,url)=>`<a href="${url}" target="_blank" rel="noopener noreferrer">${label||url}</a>`).replace(/\[([^\]]+)\]\([^)]*\)/g,'$1').replace(/^\s{0,3}#{1,6}\s+/gm,'').replace(/(\*\*|__)(.+?)\1/g,'$2').replace(/`([^`]+)`/g,'$1');
+  }
+  function evidence(quote,label='Release notes') {return `<blockquote class="quote"><span class="quote-label">${h(label)}</span>“${plainMarkdown(quote)}”</blockquote>`;}
   function applicability(release,kind,index) {
     const result=(release.applicability||[]).find(item=>item.kind===kind&&item.index===index);
     if(!result||!result.verified||!hasEvidence(result.evidence,release.notes)||!result.profile_evidence)return '<div class="applicability"><span class="status-chip waiting">'+icon('help')+'Treated as applies</span><p>Personal impact has not been verified by the local model. Review this item before updating.</p></div>';
@@ -133,13 +137,15 @@
     const kinds={security:['shield','Security'],breaking:['alert','Breaking change'],migration:['arrow','Migration'],big_features:['sparkles','Feature']};
     const [sym,label]=kinds[kind];
     const extra=kind==='security'?`<p>${item.severity?`<strong>Severity:</strong> ${h(item.severity)}. `:''}${item.requires?`<strong>Requires:</strong> ${h(item.requires)}`:''}</p>`:kind==='breaking'&&item.action_needed?`<p><strong>Action needed:</strong> ${h(item.action_needed)}</p>`:kind==='migration'&&Array.isArray(item.steps)?`<ol>${item.steps.map(s=>`<li>${h(s)}</li>`).join('')}</ol>`:'';
-    return `<div class="finding"><div class="finding-title">${icon(sym)}${h(label)}</div><p>${h(item.description)}</p>${extra}${evidence(item.evidence)}${['security','breaking','migration'].includes(kind)?applicability(release,kind,index):''}</div>`;
+    return `<div class="finding"><div class="finding-title">${icon(sym)}${h(label)}</div><p>${h(item.description)}</p>${extra}<details><summary>Supporting evidence</summary>${evidence(item.evidence)}</details>${['security','breaking','migration'].includes(kind)?applicability(release,kind,index):''}</div>`;
   }
   function releaseCard(release,history=false) {
     const c=release.classification||{};
     const supportedTags=(c.tags||[]).filter(t=>hasEvidence(c.tag_evidence?.[t],release.notes));
-    const summary=c.summary && hasEvidence(c.summary_evidence,release.notes) ? `<p class="release-summary">${h(c.summary)}</p>${evidence(c.summary_evidence)}` : '';
-    const warnings=(c.keyword_warnings||[]).map(w=>`<div class="notice warning">${icon('alert')} ${h(w.message||`Mentions “${w.term}”, not addressed by the model; worth a look.`)}${w.quote&&hasEvidence(w.quote,release.notes)?evidence(w.quote,'Unaddressed passage'):''}</div>`).join('');
+    const summary=c.summary && hasEvidence(c.summary_evidence,release.notes) ? `<p class="release-summary">${h(c.summary)}</p><details><summary>Summary evidence</summary>${evidence(c.summary_evidence)}</details>` : '';
+    const seenWarnings=new Set();
+    const warningItems=(c.keyword_warnings||[]).filter(w=>{const key=normalized(w.quote||w.term||w.message);if(seenWarnings.has(key))return false;seenWarnings.add(key);return true;});
+    const warnings=warningItems.length?`<div class="notice warning">${icon('alert')} ${warningItems.length===1?h(warningItems[0].message||`Mentions “${warningItems[0].term}”, not addressed by the model; worth a look.`):`${warningItems.length} passages mention terms the model did not address: ${[...new Set(warningItems.map(w=>h(w.term)).filter(Boolean))].join(', ')}.`}<details><summary>Show unaddressed passages</summary>${warningItems.filter(w=>w.quote&&hasEvidence(w.quote,release.notes)).map(w=>evidence(w.quote,w.term?`Unaddressed passage · ${w.term}`:'Unaddressed passage')).join('')}</details></div>`:'';
     const addressed=(c.keyword_hits_addressed||[]).filter(a=>hasEvidence(a.quote||a.evidence,release.notes));
     const coverage=addressed.length?`<details><summary>Context checks · ${addressed.length} passages addressed</summary>${addressed.map(a=>`<div class="finding"><div class="finding-title">${h(a.term)} · ${a.matters?'Relevant':'Not a concern in context'}</div><p>${h(a.why)}</p>${evidence(a.quote||a.evidence)}</div>`).join('')}</details>`:'';
     const findings=['security','breaking','migration','big_features'].map(kind=>(c[kind]||[]).map((item,i)=>finding(release,item,kind,i)).join('')).join('');
