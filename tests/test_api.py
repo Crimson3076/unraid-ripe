@@ -256,3 +256,32 @@ def test_ui_token_accepts_bearer_and_basic(locked):
 
 def test_no_token_configured_keeps_ui_open(client):
     assert client.get('/api/settings').status_code == 200
+
+
+def test_ui_token_gates_head_and_options_but_not_app_pages(locked):
+    assert locked.head('/api/settings').status_code == 401
+    assert locked.options('/api/settings').status_code == 401
+    assert locked.head('/api/dashboard').status_code != 401
+    for url in ('/apps/demo-romm', '/api/apps/demo-romm'):
+        assert locked.get(url).status_code != 401, url
+    assert locked.get('/applications').status_code == 401
+
+
+def test_ui_token_bearer_works_on_changes(locked):
+    ok = locked.patch('/api/settings', json={'poll_hours': 24},
+                      headers={'Authorization': 'Bearer lan-token-xyz', 'X-Ripe-Request': '1'})
+    assert ok.status_code == 200
+
+
+def test_empty_ui_token_means_unset(tmp_path, monkeypatch):
+    monkeypatch.setenv('RIPE_UI_TOKEN', '')
+    runtime = Runtime(config_dir=tmp_path, disable_scheduler=True)
+    assert runtime.ui_token is None
+    with TestClient(create_app(runtime), base_url='http://localhost') as browser:
+        assert browser.get('/api/settings').status_code == 200
+
+
+def test_ui_token_is_a_redacted_secret():
+    runtime = Runtime(ui_token='lan-token-xyz')
+    assert 'lan-token-xyz' in runtime.secret_values()
+    assert 'lan-token-xyz' not in repr(runtime)
