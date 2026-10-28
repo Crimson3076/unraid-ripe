@@ -382,7 +382,9 @@ class Coordinator:
         if self.store.get('generation:' + app.id, 0) != generation:
             return True  # Edited mid-inference: discard the result and redo with the new profile.
         current = next((r for r in self.store.releases(app.id) if r.id == release.id), None)
-        if current and current.notes == release.notes:
+        if current and current.notes != release.notes:
+            return True  # Notes were revised mid-inference: keep the re-queued item and redo it.
+        if current:
             self.store.save_release(release)
         self.dequeue(item)
         self.store.set('last_classification', utcnow().isoformat())

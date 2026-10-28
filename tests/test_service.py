@@ -222,6 +222,33 @@ async def test_classified_releases_are_not_requeued_or_resent(tmp_path,monkeypat
 
 
 @pytest.mark.asyncio
+async def test_notes_revised_mid_inference_keep_the_requeued_item(tmp_path,monkeypatch):
+    manager=Coordinator(runtime(tmp_path))
+    slow_setup(manager,monkeypatch)
+    manager.closing=True  # collect and queue only; drive the item by hand
+    started,release_gate=asyncio.Event(),asyncio.Event()
+    async def classify(release,app,settings,**kwargs):
+        started.set()
+        await release_gate.wait()
+        return release.model_copy(update={'classification':{'status':'ok','tags':['bugfix'],'tag_evidence':{'bugfix':'Fixed an error.'}},'classification_key':classification_key(release,app,settings)})
+    monkeypatch.setattr(service,'classify_release',classify)
+    try:
+        await manager.poll()
+        item=manager.store.get('classification_queue')[0]
+        task=asyncio.create_task(manager.classify_item(item,[None]))
+        await started.wait()
+        revised=manager.store.releases('one')[0].model_copy(update={'notes':'Revised notes.'})
+        manager.store.save_release(revised)  # a collection refreshed the notes and re-queued the item
+        release_gate.set()
+        assert await task
+        assert manager.store.get('classification_queue')==[item]
+        stored=manager.store.releases('one')[0]
+        assert stored.notes=='Revised notes.' and not stored.classification
+    finally:
+        manager.close()
+
+
+@pytest.mark.asyncio
 async def test_polling_resets_after_exception(tmp_path,monkeypatch):
     manager=Coordinator(runtime(tmp_path))
     async def collect(*args,**kwargs):
