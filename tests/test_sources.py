@@ -275,7 +275,7 @@ def _gh(tag, prerelease=False):
     return {'id': tag, 'tag_name': tag, 'body': 'notes', 'published_at': '2026-10-01T00:00:00Z', 'prerelease': prerelease}
 
 
-async def _collect(monkeypatch, tmp_path, apps, github=None, registry_digest='sha256:' + 'f' * 64):
+async def _collect(monkeypatch, tmp_path, apps, github=None, registry_digest='sha256:' + 'f' * 64, existing=None):
     from ripe.models import Settings
     from ripe.sources import collector
     socket = tmp_path / 'docker.sock'
@@ -297,7 +297,7 @@ async def _collect(monkeypatch, tmp_path, apps, github=None, registry_digest='sh
         return original_client(*args, **kwargs)
     monkeypatch.setattr(collector.httpx, 'AsyncClient', make_client)
     cache = {}
-    return await collector.collect(Settings(), docker_socket=str(socket), unraid_version_file=str(tmp_path / 'no-version'), cache_get=cache.get, cache_set=cache.__setitem__)
+    return await collector.collect(Settings(), docker_socket=str(socket), unraid_version_file=str(tmp_path / 'no-version'), cache_get=cache.get, cache_set=cache.__setitem__, existing_apps=existing)
 
 
 async def test_unmapped_latest_app_uses_digest_logic(monkeypatch, tmp_path):
@@ -539,3 +539,101 @@ def test_official_image_without_digest_stays_tracked_if_seen_before():
     assert is_local_image('nginx:latest', None) is True
     assert is_local_image('nginx:latest', None, previously_tracked=True) is False
     assert is_local_image('nginx:latest', 'sha256:a') is False
+
+
+def _diff(value):
+    return [{'name': 'PHP', 'key': 'PHP_VERSION', 'installed': '8.2', 'latest': value}]
+
+
+async def test_image_diff_is_resolved_after_the_update_target_and_reused_only_for_the_same_target(monkeypatch, tmp_path):
+    from ripe.sources import collector
+    installed, target = 'sha256:' + 'a' * 64, 'sha256:' + 'f' * 64
+    seen = []
+    async def image_diff(self, image, digest, latest_version, ignore=()):
+        seen.append(latest_version)
+        return _diff('8.3')
+    monkeypatch.setattr(collector.RegistryReader, 'image_diff', image_diff)
+    def fresh():
+        return AppRecord(id='docker:a', name='a', source='docker', image='ghcr.io/o/a:1.0.0', installed_version='1.0.0',
+                         installed_digest=installed, upstream_repo='o/a')
+    # Pinned tag: update_available is False, but the upstream release is newer, and latest_version is known before the diff.
+    apps, _, _ = await _collect(monkeypatch, tmp_path, [fresh()], github=[_gh('2.0.0'), _gh('1.0.0')], registry_digest=installed)
+    first = apps[0]
+    assert seen == ['2.0.0'] and first.detected['image_diff'] == _diff('8.3')
+    # The fetch fails on the next poll: same installed and target digest keep the diff.
+    async def failing(self, *args, **kwargs):
+        raise collector.SourceError('Registry: HTTP 500')
+    monkeypatch.setattr(collector.RegistryReader, 'image_diff', failing)
+    apps, _, _ = await _collect(monkeypatch, tmp_path, [fresh()], github=[_gh('2.0.0'), _gh('1.0.0')], registry_digest=installed, existing=[first])
+    assert apps[0].detected['image_diff'] == _diff('8.3')
+    # The target moved on: the old diff says nothing about the new target and is dropped.
+    moved = first.model_copy(deep=True)
+    moved.detected['image_diff_for'] = {**moved.detected['image_diff_for'], 'latest_version': '1.5.0'}
+    apps, _, _ = await _collect(monkeypatch, tmp_path, [fresh()], github=[_gh('2.0.0'), _gh('1.0.0')], registry_digest=installed, existing=[moved])
+    assert 'image_diff' not in apps[0].detected
+
+
+async def test_moving_tag_diff_is_not_reused_for_a_new_target_digest(monkeypatch, tmp_path):
+    from ripe.sources import collector
+    installed = 'sha256:' + 'a' * 64
+    async def failing(self, *args, **kwargs):
+        raise collector.SourceError('Registry: HTTP 500')
+    monkeypatch.setattr(collector.RegistryReader, 'image_diff', failing)
+    def fresh():
+        return AppRecord(id='docker:a', name='a', source='docker', image='ghcr.io/o/a:latest', installed_digest=installed)
+    previous = fresh()
+    previous.detected.update(image_diff=_diff('8.3'), image_diff_for={'image': previous.image, 'installed_digest': installed,
+                                                                    'latest_digest': 'sha256:' + 'e' * 64, 'latest_version': None})
+    apps, _, _ = await _collect(monkeypatch, tmp_path, [fresh()], existing=[previous])
+    assert 'image_diff' not in apps[0].detected
+    previous.detected['image_diff_for']['latest_digest'] = 'sha256:' + 'f' * 64
+    apps, _, _ = await _collect(monkeypatch, tmp_path, [fresh()], existing=[previous])
+    assert apps[0].detected['image_diff'] == _diff('8.3')
+
+
+async def test_manifest_diff_fallback_needs_the_same_repo_base_and_head(monkeypatch, tmp_path):
+    from ripe.sources import collector
+    async def failing(*args, **kwargs):
+        raise collector.SourceError('GitHub: HTTP 500')
+    monkeypatch.setattr(collector, 'manifest_diff', failing)
+    gh = [_gh('3.0.0'), _gh('2.0.0'), _gh('1.0.0')]
+    def fresh():
+        return AppRecord(id='docker:a', name='a', source='docker', installed_version='1.0.0', upstream_repo='o/a')
+    changes = [{'file': 'requirements.txt', 'removed': ['a==1'], 'added': ['a==2']}]
+    previous = fresh()
+    previous.detected.update(manifest_diff=changes, manifest_diff_for={'repo': 'o/a', 'base': '1.0.0', 'head': '2.0.0'})
+    apps, _, _ = await _collect(monkeypatch, tmp_path, [fresh()], github=gh, existing=[previous])
+    assert 'manifest_diff' not in apps[0].detected  # a v1->v2 diff must not describe v1->v3
+    previous.detected['manifest_diff_for']['head'] = '3.0.0'
+    apps, _, _ = await _collect(monkeypatch, tmp_path, [fresh()], github=gh, existing=[previous])
+    assert apps[0].detected['manifest_diff'] == changes
+    previous.detected['manifest_diff_for']['repo'] = 'other/a'
+    apps, _, _ = await _collect(monkeypatch, tmp_path, [fresh()], github=gh, existing=[previous])
+    assert 'manifest_diff' not in apps[0].detected
+
+
+def test_wants_image_diff_for_moving_tags_and_newer_pinned_releases():
+    from ripe.sources.collector import wants_image_diff
+    assert wants_image_diff(AppRecord(id='d:a', name='a', source='docker', update_available=True))
+    assert wants_image_diff(AppRecord(id='d:a', name='a', source='docker', update_available=None))
+    pinned = AppRecord(id='d:a', name='a', source='docker', update_available=False, installed_version='1.0.0', latest_version='2.0.0')
+    assert wants_image_diff(pinned)
+    pinned.latest_version = '1.0.0'
+    assert not wants_image_diff(pinned)
+    assert not wants_image_diff(AppRecord(id='d:a', name='a', source='docker', update_available=False))
+
+
+async def test_image_diff_rate_limit_keeps_last_diff_and_reports_status(monkeypatch, tmp_path):
+    from ripe.sources import collector
+    installed = 'sha256:' + 'a' * 64
+    async def limited(self, *args, **kwargs):
+        raise collector.RateLimited('Registry: rate limited', 5)
+    monkeypatch.setattr(collector.RegistryReader, 'image_diff', limited)
+    def fresh():
+        return AppRecord(id='docker:a', name='a', source='docker', image='ghcr.io/o/a:latest', installed_digest=installed)
+    previous = fresh()
+    previous.detected.update(image_diff=_diff('8.3'), image_diff_for={'image': previous.image, 'installed_digest': installed,
+                                                                    'latest_digest': 'sha256:' + 'f' * 64, 'latest_version': None})
+    apps, _, _ = await _collect(monkeypatch, tmp_path, [fresh()], existing=[previous])
+    assert 'rate limited' in apps[0].detected['registry_status']
+    assert apps[0].detected['image_diff'] == _diff('8.3')

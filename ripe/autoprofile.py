@@ -26,6 +26,8 @@ LOGIN_PATH = re.compile(r"log[-_]?in|sign[-_]?in|sso|oauth|/auth\b|/account", re
 PASSWORD_FIELD = re.compile(rb"<input[^>]+type\s*=\s*[\"']?password", re.I)
 DB_MOUNT = re.compile(r"(?:mysql|mariadb|postgres|pgdata|redis|mongo|sqlite|/db\b|\.db$)", re.I)
 CONFIG_MOUNT = re.compile(r"(?:^/(?:config|etc|conf)(?:/|$))|(?:/config(?:/|$))", re.I)
+# Unraid names macvlan/ipvlan networks after the interface (br0, eth0, bond0, br0.10, vlan5).
+DIRECT_NETWORK = re.compile(r"(?:br|eth|bond|vlan|macvlan|ipvlan)[\w]*\d(?:\.\d+)?$", re.I)
 SHARED_NETWORK_MAX = 4  # a network shared by many containers says nothing about who needs whom
 Prober = Callable[[str], Awaitable[tuple[bool | None, str]]]
 
@@ -42,8 +44,26 @@ def split_env(env: Any) -> tuple[list[str], dict[str, str]]:
             continue
         names.append(name)
         if ENV_ALLOW.fullmatch(name) and not ENV_DENY.search(name):
-            values[name] = value
+            if (kept := plain_value(value)) and "@" not in kept:
+                values[name] = kept
     return names, values
+
+
+def plain_value(value: str) -> str:
+    """Strip anything token-shaped from a value: a URL keeps only scheme, host and port."""
+    if "://" in value:
+        try:
+            parsed = urlparse(value.strip())
+            if parsed.username or parsed.password:
+                return ""
+            host = parsed.hostname or ""
+            port = f":{parsed.port}" if parsed.port else ""
+        except ValueError:
+            return ""
+        if not host or not re.fullmatch(r"[A-Za-z0-9._-]+|[0-9a-fA-F:]+", host):
+            return ""
+        return f"{parsed.scheme}://{host if ':' not in host else '[' + host + ']'}{port}"
+    return re.split(r"[?#;]", value, maxsplit=1)[0]
 
 
 def storable(value: str) -> bool:
@@ -127,6 +147,9 @@ def exposure_of(facts: dict) -> tuple[str, str]:
         return "lan", f"port {port} is published on " + ("a LAN address" if "lan" in kinds else "all interfaces")
     if "loopback" in kinds:
         return "internal", "ports are published on loopback only"
+    direct = [n for n in facts.get("networks", {}) if DIRECT_NETWORK.match(n)]
+    if direct:
+        return "unknown", f"attached directly to the LAN through {direct[0]}; Docker cannot say who can reach it"
     if facts.get("readable"):
         return "internal", "no published ports"
     return "unknown", "nothing readable from Docker"
@@ -204,7 +227,7 @@ async def derive(apps: list[AppRecord], facts: dict[str, dict], proxy_targets: l
         if not tier and exposure == "internet":
             tier, tier_reason = "internet", reason
         own_login = None
-        if prober and app.web_url:
+        if prober and app.web_url and probe_allowed(app.web_url, f, host):
             own_login, login_reason = await prober(app.web_url)
             if own_login is not None:
                 evidence["own_login"] = login_reason
@@ -219,14 +242,38 @@ async def derive(apps: list[AppRecord], facts: dict[str, dict], proxy_targets: l
             app.detected["profile_evidence"]["tier"] = "required by " + ", ".join(users[:5])
 
 
+def probe_allowed(url: str, facts: dict, host: str) -> bool:
+    """Only probe the container itself: its own address, or the Docker host on one of its published ports."""
+    try:
+        parsed = urlparse(url)
+        name, port = (parsed.hostname or "").lower(), parsed.port
+    except ValueError:
+        return False
+    if parsed.scheme not in ("http", "https") or not name:
+        return False
+    port = port or (443 if parsed.scheme == "https" else 80)
+    if name in {ip for ip in facts["networks"].values() if ip}:
+        return True
+    if host and name == host.lower():
+        return port in {p for _, p in facts["bindings"]}
+    return False
+
+
 def proxy_hit(app: AppRecord, facts: dict, targets: list[dict], host: str) -> str | None:
+    """A target reaches this container on its own address (private ports) or on the Docker host (published ports)."""
     addresses = {ip for ip in facts["networks"].values() if ip}
-    ports = facts["private_ports"] | {port for _, port in facts["bindings"]}
+    published = {port for _, port in facts["bindings"]}
+    own_ports = facts["private_ports"] | set(facts.get("exposed_ports", []))
     for target in targets:
         name = str(target.get("host", "")).lower()
         port = target.get("port")
-        local = name == app.name.lower() or name in addresses or (bool(host) and name == host.lower())
-        if local and (port is None or port in ports):
+        if name == app.name.lower() or name in addresses:
+            ports = own_ports
+        elif host and name == host.lower():
+            ports = published
+        else:
+            continue
+        if port is None or port in ports:
             return f"{target['via']} forwards {target.get('domain') or 'a public hostname'} to this container"
     return None
 

@@ -264,3 +264,78 @@ async def test_env_values_and_probe_results_never_reach_gemini(monkeypatch):
     await classify_release(release(), app, Settings(classification_provider='gemini'), gemini_key='k' * 20)
     gemini = [body for provider, body in sent if provider == 'gemini']
     assert gemini and all('dawarich_db' not in body and 'own_login' not in body for body in gemini)
+
+
+def test_env_url_values_keep_only_scheme_host_and_port():
+    env = ['DB_URL=https://db.local:5432/path?token=abc123', 'SYNC_URL=http://sync/hook#frag', 'API_HOST=host?key=zzz',
+           'CALLBACK_URL=http://u:p@h/x', 'BARE_URL=http://[::1]:8080/a?t=1']
+    _, values = split_env(env)
+    assert values == {'DB_URL': 'https://db.local:5432', 'SYNC_URL': 'http://sync', 'API_HOST': 'host', 'BARE_URL': 'http://[::1]:8080'}
+    facts = autoprofile.read_facts({}, {}, {'Config': {'Env': env}})
+    dumped = json.dumps(autoprofile.config_of(facts))
+    assert not any(secret in dumped for secret in ('abc123', 'zzz', 'frag', 'u:p', 'token', '?'))
+
+
+async def test_login_probe_only_targets_the_containers_own_address():
+    urls = []
+    async def prober(url):
+        urls.append(url)
+        return True, 'x'
+    ports = [{'IP': '0.0.0.0', 'PrivatePort': 80, 'PublicPort': 8080}]
+    web = lambda url: {'net.unraid.docker.webui': url}
+    apps = await scan([
+        container(1, 'own', 'x/o:1', ports, labels=web('http://[IP]:[PORT:80]/')),
+        container(2, 'other', 'x/p:1', ports, labels=web('http://[IP]:9999/')),          # not a published port of this container
+        container(3, 'router', 'x/r:1', ports, labels=web('http://192.168.1.1/')),      # a different LAN device
+        container(4, 'meta', 'x/m:1', ports, labels=web('http://169.254.169.254/latest')),
+        container(5, 'peer', 'x/q:1', ports, labels=web('http://172.20.0.1:80/'))],      # another container's address (not .5)
+        prober=prober)
+    assert urls == ['http://tower:8080/']
+    assert apps['own'].profile.own_login is True
+    assert all(apps[n].profile.own_login is None for n in ('other', 'router', 'meta', 'peer'))
+
+
+async def test_proxy_target_on_docker_host_matches_published_ports_only():
+    targets = [{'via': 'Nginx Proxy Manager', 'host': 'tower', 'port': 80, 'domain': 'a.example.com'}]
+    pub = lambda private, public: [{'IP': '0.0.0.0', 'PrivatePort': private, 'PublicPort': public}]
+    apps = await scan([container(1, 'maps', 'x/m:1', pub(80, 8081)),      # tower:80 is NOT this container
+                       container(2, 'web', 'x/w:1', pub(8080, 80))], targets=targets)  # published as 80
+    assert apps['maps'].profile.exposure == 'lan'
+    assert apps['web'].profile.exposure == 'internet'
+    # By container name or own address the private port is the one that counts.
+    by_name = [{'via': 'cloudflared tunnel', 'host': 'maps', 'port': 80}, {'via': 'cloudflared tunnel', 'host': '172.20.0.2', 'port': 8080}]
+    apps = await scan([container(1, 'maps', 'x/m:1', pub(80, 8081)), container(2, 'web', 'x/w:1', pub(8080, 80))], targets=by_name)
+    assert apps['maps'].profile.exposure == apps['web'].profile.exposure == 'internet'
+    apps = await scan([container(1, 'maps', 'x/m:1', pub(80, 8081))], targets=[{'via': 'x', 'host': 'maps', 'port': 8081}])
+    assert apps['maps'].profile.exposure == 'lan'
+
+
+@pytest.mark.parametrize('network', ['br0', 'br0.10', 'eth1', 'bond0', 'vlan5'])
+async def test_direct_lan_networks_keep_exposure_unknown(network):
+    apps = await scan([container(1, 'lan', 'x/l:1', [], networks=(network,)), container(2, 'plain', 'x/p:1', [], networks=('appnet',))])
+    assert apps['lan'].profile.exposure == 'unknown'
+    assert apps['plain'].profile.exposure == 'internal'
+    # A published port is still a definite fact even on a direct network.
+    pub = [{'IP': '0.0.0.0', 'PrivatePort': 80, 'PublicPort': 80}]
+    assert (await scan([container(3, 'both', 'x/b:1', pub, networks=(network,))]))['both'].profile.exposure == 'lan'
+
+
+def test_plain_value_keeps_ipv6_hosts_and_ports_and_drops_credentials():
+    from ripe.autoprofile import plain_value
+    assert plain_value('http://[fd00::5]:8080/path?token=x') == 'http://[fd00::5]:8080'
+    assert plain_value('https://host.lan') == 'https://host.lan'
+    assert plain_value('http://user:pw@host:80/x') == ''
+    assert plain_value('http://[not-an-ip/') == ''
+
+
+async def test_login_probe_resolves_default_ports_for_published_bindings():
+    urls = []
+    async def prober(url):
+        urls.append(url)
+        return True, 'x'
+    pub = lambda port: [{'IP': '0.0.0.0', 'PrivatePort': port, 'PublicPort': port}]
+    web = lambda url: {'net.unraid.docker.webui': url}
+    await scan([container(1, 'plain', 'x/a:1', pub(80), labels=web('http://tower/')),
+                container(2, 'secure', 'x/b:1', pub(443), labels=web('https://tower/')),
+                container(3, 'wrong', 'x/c:1', pub(8080), labels=web('http://tower/'))], prober=prober)
+    assert sorted(urls) == ['http://tower/', 'https://tower/']

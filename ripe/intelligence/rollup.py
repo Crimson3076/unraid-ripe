@@ -46,7 +46,7 @@ def image_items(diff: list[dict] | None) -> list[dict]:
 def rollup_key(app: AppRecord, installed: str | None, latest: str | None, pending: list[Release],
                image_diff: list[dict] | None, manifest: list[dict] | None, settings: Settings) -> str:
     """Per (app, installed, latest) plus the inputs those versions imply and the model setup."""
-    values = [app.id, str(installed), str(latest), ROLLUP_PROMPT, _prompt(ROLLUP_PROMPT), _prompt(REDUCE_PROMPT),
+    values = [app.id, str(installed), str(latest), str(app.latest_digest), ROLLUP_PROMPT, _prompt(ROLLUP_PROMPT), _prompt(REDUCE_PROMPT),
               json.dumps([[r.version, hashlib.sha256(r.notes.encode()).hexdigest()] for r in pending]),
               json.dumps(image_diff or [], sort_keys=True), json.dumps(manifest or [], sort_keys=True),
               settings.ollama_url, settings.classification_provider, settings.local_model,

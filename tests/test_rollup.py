@@ -10,6 +10,7 @@ from ripe.intelligence import build_rollup, rollup_key
 from ripe.intelligence import service as intelligence
 from ripe.intelligence.rollup import CHUNK_SIZE
 from ripe.models import AppRecord, Release, Settings, utcnow
+from ripe.sources.collector import RateLimited
 from ripe.service import Coordinator
 import ripe.service as service
 from ripe.sources.collector import CachedHTTP, RegistryReader, SourceError, manifest_diff
@@ -216,6 +217,10 @@ async def test_unavailable_rollup_is_retried_not_cached(tmp_path, monkeypatch):
         manager.close()
 
 
+async def public_resolver(name, port):
+    return ['93.184.216.34']
+
+
 def registry_handler(installed_env, latest_env, hits):
     def config(env, labels=None):
         return {'config': {'Env': env, 'Labels': labels or {}}}
@@ -247,7 +252,9 @@ async def test_registry_image_config_diff_without_pulling_layers():
     installed = ['PATH=/usr/bin', 'PHP_VERSION=8.2.12', 'NODE_VERSION=20.1.0', 'GITHUB_TOKEN_VERSION=zzz', 'DB_PASSWORD=hunter2', 'APP_VERSION=1.0']
     latest = ['PATH=/usr/bin', 'PHP_VERSION=8.3.4', 'NODE_VERSION=20.1.0', 'DB_PASSWORD=other', 'APP_VERSION=2.0']
     async with httpx.AsyncClient(transport=httpx.MockTransport(registry_handler(installed, latest, hits))) as client:
-        diff = await RegistryReader(client, min_interval=0).image_diff(
+        reader = RegistryReader(client, min_interval=0)
+        reader.resolve = public_resolver
+        diff = await reader.image_diff(
             'ghcr.io/owner/app:latest', 'sha256:' + 'a' * 64, '2.0', ('1.0', '2.0'))
     assert {d['key'] for d in diff} == {'PHP_VERSION', 'org.opencontainers.image.base.name'}
     php = next(d for d in diff if d['key'] == 'PHP_VERSION')
@@ -279,3 +286,131 @@ async def test_manifest_diff_keeps_only_dependency_manifest_changes():
         changes = await manifest_diff(CachedHTTP(client), 'owner/app', 'v1.0.0', 'v1.1.0')
     assert changes == [{'file': 'composer.json', 'removed': ['"php": ">=8.2",'], 'added': ['"php": ">=8.3",']},
                        {'file': 'web/package.json', 'removed': [], 'added': ['"vite": "^6.0.0"']}]
+
+
+def blob_client(handler, resolver=public_resolver):
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    reader = RegistryReader(client, min_interval=0)
+    reader.resolve = resolver
+    return client, reader
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('address', ['127.0.0.1', '10.0.0.5', '169.254.169.254', '192.168.1.2', '::1', 'fd00::1'])
+async def test_blob_redirect_to_hostname_resolving_privately_is_refused(address):
+    hits = []
+    def handler(request):
+        hits.append(request.url.host)
+        return httpx.Response(307, headers={'location': 'https://cdn.example.test/blob'})
+    async def resolver(name, port):
+        return ['93.184.216.34', address]
+    client, reader = blob_client(handler, resolver)
+    async with client:
+        with pytest.raises(SourceError, match='blob redirect'):
+            await reader.request('ghcr.io', 'owner/app', 'blobs/sha256:' + 'e' * 64)
+    assert hits == ['ghcr.io']
+
+
+@pytest.mark.asyncio
+async def test_blob_redirect_that_does_not_resolve_is_refused():
+    def handler(request):
+        return httpx.Response(307, headers={'location': 'https://cdn.example.test/blob'})
+    async def resolver(name, port):
+        raise OSError('nxdomain')
+    client, reader = blob_client(handler, resolver)
+    async with client:
+        with pytest.raises(SourceError, match='blob redirect'):
+            await reader.request('ghcr.io', 'owner/app', 'blobs/sha256:' + 'e' * 64)
+
+
+@pytest.mark.asyncio
+async def test_config_blob_is_capped_at_one_megabyte():
+    big = b'{"config": {"Labels": {"x": "' + b'a' * (1024 * 1024) + b'"}}}'
+    def handler(request):
+        if request.url.host == 'ghcr.io':
+            return httpx.Response(307, headers={'location': 'https://cdn.example.test/blob'})
+        return httpx.Response(200, content=big)
+    client, reader = blob_client(handler)
+    async with client:
+        with pytest.raises(SourceError, match='too large'):
+            await reader.request('ghcr.io', 'owner/app', 'blobs/sha256:' + 'e' * 64)
+    ok_client, ok_reader = blob_client(lambda r: httpx.Response(200, json={'config': {}}))
+    async with ok_client:
+        assert (await ok_reader.request('ghcr.io', 'owner/app', 'blobs/sha256:' + 'e' * 64)).json() == {'config': {}}
+
+
+@pytest.mark.asyncio
+async def test_manifest_diff_drops_lines_that_may_carry_credentials():
+    def handler(request):
+        return httpx.Response(200, json={'files': [
+            {'filename': 'requirements.txt', 'patch': '+--index-url https://user:pass@pkgs.example.com/simple\n'
+             '+git+ssh://deploy:hunter2@host/repo.git\n+private @ user:pw@host\n+flask==3.0.0'},
+            {'filename': 'package.json', 'patch': '+    "@types/node": "^22.0.0"'}]})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        changes = await manifest_diff(CachedHTTP(client), 'owner/app', 'v1', 'v2')
+    dumped = json.dumps(changes)
+    assert 'pass' not in dumped and 'hunter2' not in dumped and 'user:pw' not in dumped
+    assert changes[0]['added'] == ['flask==3.0.0']
+    assert changes[1]['added'] == ['"@types/node": "^22.0.0"']
+
+
+@pytest.mark.asyncio
+async def test_latest_only_image_gets_a_rollup_from_its_digest(tmp_path, monkeypatch):
+    manager = Coordinator(runtime(tmp_path))
+    record = AppRecord(id='docker:img', name='img', source='docker', image='ghcr.io/o/img:latest', installed_digest='sha256:' + 'a' * 64,
+                       latest_digest='sha256:' + 'b' * 64, detected={'image_diff': [{'name': 'PHP', 'key': 'PHP_VERSION', 'installed': '8.2', 'latest': '8.3'}]})
+    manager.store.save_app(record)
+    async def ready():
+        return True
+    try:
+        await manager.refresh_rollup(record, manager.settings(), ready)
+        rollup = manager.store.get('rollup:docker:img')
+        assert rollup and rollup['result']['status'] == 'ok' and rollup['key']
+        assert rollup['result']['groups']['under_the_hood'][0]['text'].startswith('PHP changes from 8.2 to 8.3')
+        # The read side uses the same digest identity, so the rollup is actually shown.
+        assert manager.view('docker:img').rollup == rollup['result']
+        # A different target digest is a different rollup key.
+        key = rollup['key']
+        record.latest_digest = 'sha256:' + 'c' * 64
+        await manager.refresh_rollup(record, manager.settings(), ready)
+        assert manager.store.get('rollup:docker:img')['key'] != key
+    finally:
+        manager.close()
+
+
+@pytest.mark.asyncio
+async def test_direct_config_blob_without_redirect_is_capped_while_streaming():
+    big = b'{"config": {"Labels": {"x": "' + b'a' * (1024 * 1024) + b'"}}}'
+    client, reader = blob_client(lambda r: httpx.Response(200, content=big))
+    async with client:
+        with pytest.raises(SourceError, match='too large'):
+            await reader.request('ghcr.io', 'owner/app', 'blobs/sha256:' + 'e' * 64)
+
+
+@pytest.mark.asyncio
+async def test_blob_hop_rate_limit_and_error_statuses():
+    def redirecting(final):
+        return lambda r: httpx.Response(307, headers={'location': 'https://cdn.example.test/blob'}) if r.url.host == 'ghcr.io' else final(r)
+    client, reader = blob_client(redirecting(lambda r: httpx.Response(429, headers={'retry-after': '7'})))
+    async with client:
+        with pytest.raises(RateLimited):
+            await reader.request('ghcr.io', 'owner/app', 'blobs/sha256:' + 'e' * 64)
+    for status, headers in ((503, {}), (302, {'location': 'https://other.example.test/x'})):
+        client, reader = blob_client(redirecting(lambda r, s=status, h=headers: httpx.Response(s, headers=h)))
+        async with client:
+            with pytest.raises(SourceError):
+                await reader.request('ghcr.io', 'owner/app', 'blobs/sha256:' + 'e' * 64)
+
+
+@pytest.mark.asyncio
+async def test_compressed_blob_is_decoded_once():
+    import gzip
+    body = json.dumps({'config': {'Labels': {'a': 'b'}}}).encode()
+    zipped = gzip.compress(body)
+    direct = lambda r: httpx.Response(200, headers={'content-encoding': 'gzip'}, content=zipped)
+    hop = lambda r: httpx.Response(307, headers={'location': 'https://cdn.example.test/blob'}) if r.url.host == 'ghcr.io' else direct(r)
+    for handler in (direct, hop):
+        client, reader = blob_client(handler)
+        async with client:
+            response = await reader.request('ghcr.io', 'owner/app', 'blobs/sha256:' + 'e' * 64)
+            assert response.json() == {'config': {'Labels': {'a': 'b'}}}
