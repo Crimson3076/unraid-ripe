@@ -1,0 +1,79 @@
+# Publishes Ripe's container image to GitHub Container Registry so Unraid can pull it and show updates
+# in the Docker tab: `latest` follows main (only after CI passes there), releases also get version tags (e.g. 0.3.1),
+# every build gets sha-<commit>.
+name: Publish image
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    # main builds wait for CI on the merged commit; a failed CI run publishes nothing
+    if: github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 1
+      # CI runs can finish out of order (or be re-run): only publish a main build if its commit is still main's head,
+      # so an older commit can never replace a newer `latest`. The newer commit's own CI run publishes it.
+      - id: guard
+        name: Still the newest main commit?
+        env:
+          BUILT: ${{ github.event.workflow_run.head_sha || github.sha }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          # sha-<commit> names the commit actually built (on workflow_run, GITHUB_SHA is main's head when this run started)
+          echo "short=${BUILT:0:7}" >> "$GITHUB_OUTPUT"
+          if [ "$EVENT" != "workflow_run" ]; then echo "publish=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          HEAD=$(git ls-remote origin refs/heads/main | cut -f1)
+          if [ "$HEAD" = "$BUILT" ]; then echo "publish=true" >> "$GITHUB_OUTPUT"
+          else echo "publish=false" >> "$GITHUB_OUTPUT"; echo "::notice::main moved on ($HEAD); skipping the build of $BUILT"; fi
+      - uses: docker/setup-buildx-action@v3
+        if: steps.guard.outputs.publish == 'true'
+      - uses: docker/login-action@v3
+        if: steps.guard.outputs.publish == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        if: steps.guard.outputs.publish == 'true'
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/crimson3076/unraid-ripe
+          # only the raw tag below may set `latest`: a release build for an older commit must not replace it
+          flavor: |
+            latest=false
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=raw,value=sha-${{ steps.guard.outputs.short }}
+          labels: |
+            org.opencontainers.image.title=Ripe
+            org.opencontainers.image.description=Update tracker for Unraid, Docker and Home Assistant with soak periods and changelog analysis
+      - uses: docker/build-push-action@v6
+        if: steps.guard.outputs.publish == 'true'
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
