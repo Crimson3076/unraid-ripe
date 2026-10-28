@@ -20,6 +20,11 @@ PROMPT_VERSION = 'classification-v1'
 APPLICABILITY_PROMPT_VERSION = 'applicability-v1'
 CHUNK_SIZE = 12_000
 MAX_NOTES = 500_000
+LOCAL_NUM_PREDICT = 8192
+CTX_MARGIN = 1024
+CTX_BUCKETS = (8192, 16384, 32768)
+MIN_NUM_CTX = CTX_BUCKETS[0]
+MAX_NUM_CTX = CTX_BUCKETS[-1]
 LogCall = Callable[[dict[str, Any]], None]
 
 class LLMUnavailable(RuntimeError):
@@ -70,6 +75,21 @@ def _audit(log_call: LogCall, **entry: Any) -> None:
     log_call(safe)
 
 
+def _estimate_tokens(text: str) -> int:
+    # ASCII ~3 chars/token (JSON and code are dense); other scripts ~1 token/char.
+    ascii_chars = len(text.encode('ascii', 'ignore'))
+    return ascii_chars // 3 + (len(text) - ascii_chars)
+
+
+def local_num_ctx(prompt: str, user: str) -> int:
+    """Context window for one local request: prompt + output + margin, bucketed.
+
+    Few distinct sizes keep Ollama from reloading the model for every request.
+    """
+    needed = _estimate_tokens(prompt) + _estimate_tokens(user) + 1 + LOCAL_NUM_PREDICT + CTX_MARGIN
+    return next((size for size in CTX_BUCKETS if needed <= size), MAX_NUM_CTX)
+
+
 async def _call_model(provider: str, model: str, prompt: str, payload: dict,
                       settings: Settings, key: str | None) -> str:
     user = json.dumps(payload, ensure_ascii=False)
@@ -79,7 +99,8 @@ async def _call_model(provider: str, model: str, prompt: str, payload: dict,
             response = await client.post(url + '/api/chat', json={
                 'model': model, 'stream': False, 'think': False, 'format': 'json',
                 'messages': [{'role': 'system', 'content': prompt}, {'role': 'user', 'content': user}],
-                'options': {'temperature': 0, 'num_ctx': 32768, 'num_predict': 8192},
+                'options': {'temperature': 0, 'num_ctx': local_num_ctx(prompt, user),
+                            'num_predict': LOCAL_NUM_PREDICT},
             })
         if response.status_code != 200:
             raise LLMUnavailable(f'Local model HTTP {response.status_code}')

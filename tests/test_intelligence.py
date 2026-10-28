@@ -307,3 +307,45 @@ def test_applicability_prompt_digest_tracks_actual_prompt_content(monkeypatch):
     assert len(first) == 64
     with pytest.raises(ValueError):
         prompt_digest('../../secret')
+
+
+def _capture_ollama(monkeypatch):
+    from ripe.intelligence import service
+    sent = []
+    class FakeClient:
+        def __init__(self, *a, **k): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def post(self, url, json=None, **k):
+            sent.append(json)
+            return httpx.Response(200, json={'message': {'content': '{}'}},
+                                  request=httpx.Request('POST', url))
+    monkeypatch.setattr(service.httpx, 'AsyncClient', FakeClient)
+    return service, sent
+
+
+@pytest.mark.asyncio
+async def test_local_context_is_sized_to_short_changelog(monkeypatch):
+    service, sent = _capture_ollama(monkeypatch)
+    settings = Settings(ollama_url='http://localhost:11434')
+    await service._call_model('local', 'm', 'prompt', {'notes': 'x' * 9000}, settings, None)
+    options = sent[0]['options']
+    assert options['num_ctx'] == 16384 and options['num_predict'] == 8192
+    assert options['num_ctx'] in service.CTX_BUCKETS
+
+
+@pytest.mark.asyncio
+async def test_local_context_is_capped_at_32k(monkeypatch):
+    service, sent = _capture_ollama(monkeypatch)
+    settings = Settings(ollama_url='http://localhost:11434')
+    await service._call_model('local', 'm', 'p', {'notes': 'x' * 400_000}, settings, None)
+    assert sent[0]['options']['num_ctx'] == 32768
+    assert service.local_num_ctx('', '') >= service.MIN_NUM_CTX
+
+
+@pytest.mark.asyncio
+async def test_local_context_counts_non_ascii_text_densely(monkeypatch):
+    service, sent = _capture_ollama(monkeypatch)
+    settings = Settings(ollama_url='http://localhost:11434')
+    await service._call_model('local', 'm', 'p', {'notes': '変' * 12_000}, settings, None)
+    assert sent[0]['options']['num_ctx'] == 32768
