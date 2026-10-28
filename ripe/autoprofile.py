@@ -251,6 +251,7 @@ def probe_allowed(url: str, facts: dict, host: str) -> bool:
         return False
     if parsed.scheme not in ("http", "https") or not name:
         return False
+    port = port or (443 if parsed.scheme == "https" else 80)
     if name in {ip for ip in facts["networks"].values() if ip}:
         return True
     if host and name == host.lower():

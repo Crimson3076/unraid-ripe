@@ -398,3 +398,17 @@ async def test_blob_hop_rate_limit_and_error_statuses():
         async with client:
             with pytest.raises(SourceError):
                 await reader.request('ghcr.io', 'owner/app', 'blobs/sha256:' + 'e' * 64)
+
+
+@pytest.mark.asyncio
+async def test_compressed_blob_is_decoded_once():
+    import gzip
+    body = json.dumps({'config': {'Labels': {'a': 'b'}}}).encode()
+    zipped = gzip.compress(body)
+    direct = lambda r: httpx.Response(200, headers={'content-encoding': 'gzip'}, content=zipped)
+    hop = lambda r: httpx.Response(307, headers={'location': 'https://cdn.example.test/blob'}) if r.url.host == 'ghcr.io' else direct(r)
+    for handler in (direct, hop):
+        client, reader = blob_client(handler)
+        async with client:
+            response = await reader.request('ghcr.io', 'owner/app', 'blobs/sha256:' + 'e' * 64)
+            assert response.json() == {'config': {'Labels': {'a': 'b'}}}

@@ -388,7 +388,9 @@ class RegistryReader:
                 body += chunk
                 if len(body) > max_bytes:
                     raise SourceError("Registry: response too large")
-            return httpx.Response(response.status_code, headers=response.headers, content=body)
+            # aiter_bytes() already decoded the body; keeping these headers would make httpx decode it twice.
+            headers = [(k, v) for k, v in response.headers.multi_items() if k.lower() not in ("content-encoding", "content-length")]
+            return httpx.Response(response.status_code, headers=headers, content=body)
 
     async def _get(self, host: str, url: str, max_bytes: int | None = None, **kwargs) -> httpx.Response:
         """GET with Retry-After and exponential backoff on 429."""

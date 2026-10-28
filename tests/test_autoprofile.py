@@ -326,3 +326,16 @@ def test_plain_value_keeps_ipv6_hosts_and_ports_and_drops_credentials():
     assert plain_value('https://host.lan') == 'https://host.lan'
     assert plain_value('http://user:pw@host:80/x') == ''
     assert plain_value('http://[not-an-ip/') == ''
+
+
+async def test_login_probe_resolves_default_ports_for_published_bindings():
+    urls = []
+    async def prober(url):
+        urls.append(url)
+        return True, 'x'
+    pub = lambda port: [{'IP': '0.0.0.0', 'PrivatePort': port, 'PublicPort': port}]
+    web = lambda url: {'net.unraid.docker.webui': url}
+    await scan([container(1, 'plain', 'x/a:1', pub(80), labels=web('http://tower/')),
+                container(2, 'secure', 'x/b:1', pub(443), labels=web('https://tower/')),
+                container(3, 'wrong', 'x/c:1', pub(8080), labels=web('http://tower/'))], prober=prober)
+    assert sorted(urls) == ['http://tower/', 'https://tower/']
