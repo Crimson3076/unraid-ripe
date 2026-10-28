@@ -23,7 +23,14 @@ def test_security_earliest_fixing_version_example():
     assert v.recommended_version == '1.02'
     assert v.days_remaining == 11
     assert v.releases_behind == 3
-    assert v.tags == ['security','bugfix']
+    # Card-level tags only when they apply to the whole pending span.
+    assert v.tags == []
+
+
+def test_card_tags_are_those_shared_by_every_pending_release():
+    tagged=lambda version,age,*tags: release(version,age,classification={'status':'ok','tags':list(tags)})
+    v = build_view(app('1.00'),[tagged('1.01',20,'bugfix','docs_only'),tagged('1.02',12,'bugfix'),tagged('1.03',3,'bugfix','performance')],Settings(),NOW)
+    assert v.tags == ['bugfix']
 
 
 def test_newer_release_resets_unfinished_quiet_soak():

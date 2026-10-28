@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 from .models import AppRecord, Release, Settings, utcnow
@@ -26,6 +27,8 @@ class Store:
             CREATE TABLE IF NOT EXISTS llm_calls (id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS errors (id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, data TEXT NOT NULL);
         ''')
+        if 'resolved_at' not in [r[1] for r in self.db.execute('PRAGMA table_info(errors)')]:
+            self.db.execute('ALTER TABLE errors ADD COLUMN resolved_at TEXT')
         self.db.commit()
 
     def close(self):
@@ -90,6 +93,33 @@ class Store:
     def log_error(self, data: dict):
         self._log('errors', data)
 
+    def resolve_errors(self, failing_sources: set[str]):
+        """Mark unresolved errors resolved for every source that did not fail in the latest attempt."""
+        now = utcnow().isoformat()
+        with self.lock, self.db:
+            rows = self.db.execute('SELECT id,data FROM errors WHERE resolved_at IS NULL').fetchall()
+            ids = [i for i, d in rows if json.loads(d).get('source') not in failing_sources]
+            self.db.executemany('UPDATE errors SET resolved_at=? WHERE id=?', [(now, i) for i in ids])
+
+    def prune_errors(self, retention_days: int = 14):
+        cutoff = (utcnow() - timedelta(days=retention_days)).isoformat()
+        with self.lock, self.db:
+            self.db.execute('DELETE FROM errors WHERE resolved_at IS NOT NULL AND resolved_at < ?', (cutoff,))
+
+    def current_errors(self) -> list[dict]:
+        """Unresolved errors grouped per source: latest message, first/last seen and attempt count."""
+        with self.lock:
+            rows = self.db.execute('SELECT id,created_at,data FROM errors WHERE resolved_at IS NULL ORDER BY id').fetchall()
+        groups: dict[str, dict] = {}
+        for i, t, d in rows:
+            item = json.loads(d)
+            g = groups.get(item.get('source'))
+            if g is None:
+                groups[item.get('source')] = dict(item, id=i, created_at=t, first_seen=t, last_seen=t, attempts=1)
+            else:
+                g.update(item, id=i, created_at=t, last_seen=t, attempts=g['attempts'] + 1)
+        return sorted(groups.values(), key=lambda g: g['id'], reverse=True)
+
     def _log(self, table: str, data: dict):
         if table not in ('llm_calls', 'errors'):
             raise ValueError('Invalid log table')
@@ -104,7 +134,7 @@ class Store:
             with self.lock:
                 rows = self.db.execute(f'SELECT id,created_at,data FROM {table} ORDER BY id DESC LIMIT ?', (min(limit, 500),)).fetchall()
             return [dict(json.loads(d), id=i, created_at=t) for i,t,d in rows]
-        llm, errors = read('llm_calls'), read('errors')
+        llm, errors = read('llm_calls'), self.current_errors()
         with self.lock:
             records = [json.loads(row[0]) for row in self.db.execute('SELECT data FROM releases')]
         compared = [r for r in records if len((r.get('classification') or {}).get('provenance', [])) > 1]

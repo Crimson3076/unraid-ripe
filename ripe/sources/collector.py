@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import ipaddress
 import json
 import re
+import socket
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,11 +18,11 @@ from xml.etree import ElementTree
 import httpx
 import websockets
 
+from ripe.autoprofile import AUTO_FIELDS, INFRA, derive, probe_login, read_cloudflared_targets, read_facts, read_npm_targets
 from ripe.models import AppRecord, Profile, Release, Settings, utcnow
-from ripe.versions import compare_versions, parse_version, version_parts
+from ripe.versions import compare_versions, normalize_version, parse_version, version_parts
 
 JSON = dict[str, Any]
-INFRA = re.compile(r"unraid|home.?assistant|adguard|nginx.?proxy.?manager|cloudflar|wireguard|mariadb|mysql|postgres|redis|mongo|pihole|pi.hole|traefik|caddy", re.I)
 REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 LINUXSERVER_UPSTREAM = {
     "sonarr":"Sonarr/Sonarr", "radarr":"Radarr/Radarr", "lidarr":"Lidarr/Lidarr",
@@ -87,7 +89,16 @@ def safe_url(value: Any) -> str | None:
 
 
 def inferred_profile(name: str) -> Profile:
-    return Profile(tier="infrastructure" if INFRA.search(name) else "general", exposure="unknown")
+    return Profile(tier="infrastructure" if INFRA.search(name) else "general", exposure="unknown", origin={f: "auto" for f in AUTO_FIELDS})
+
+
+def clean_webui(value: Any) -> str | None:
+    """A WebUI template string, kept only if it resolves to a plain http(s) URL."""
+    webui = str(value or "").strip()
+    if "[IP]" in webui:
+        probe = re.sub(r"\[PORT:(\d+)\]", r"\1", webui.replace("[IP]", "127.0.0.1"))
+        return webui if safe_url(probe) else None
+    return safe_url(webui)
 
 
 def read_templates(directory: str) -> dict[str, JSON]:
@@ -108,12 +119,7 @@ def read_templates(directory: str) -> dict[str, JSON]:
             name = (tree.findtext("Name") or "").strip()
             image = (tree.findtext("Repository") or "").strip()
             project = github_repo(tree.findtext("Project")) or github_repo(tree.findtext("Support"))
-            webui = (tree.findtext("WebUI") or "").strip()
-            if "[IP]" in webui:
-                probe = re.sub(r"\[PORT:(\d+)\]", r"\1", webui.replace("[IP]", "127.0.0.1"))
-                webui = webui if safe_url(probe) else None
-            else:
-                webui = safe_url(webui)
+            webui = clean_webui(tree.findtext("WebUI"))
             metadata = {"repo": project, "icon": safe_url(tree.findtext("Icon")), "web_url": webui, "image": image}
             if name:
                 found[name.lower()] = metadata
@@ -179,12 +185,13 @@ class DockerReader:
 
 A :ro socket mount alone does not make the Docker daemon's API read-only.
     """
-    ALLOWED = re.compile(r"^/(?:containers/json|images/(?:sha256%3A|sha256:)?[a-fA-F0-9]{12,64}/json)$")
+    ALLOWED = re.compile(r"^/(?:containers/json|containers/[a-fA-F0-9]{12,64}/json|images/(?:sha256%3A|sha256:)?[a-fA-F0-9]{12,64}/json)$")
 
     def __init__(self, client: httpx.AsyncClient, host: str = "localhost"):
         self.client = client
         self.host = host
         self.skipped: list[str] = []
+        self.facts: dict[str, dict] = {}
 
     async def read(self, path: str, params=None) -> Any:
         if not self.ALLOWED.fullmatch(path):
@@ -197,13 +204,14 @@ A :ro socket mount alone does not make the Docker daemon's API read-only.
         except (httpx.HTTPError, ValueError):
             raise SourceError("Docker: connection or JSON error") from None
 
-    async def apps(self, templates: dict[str, JSON], existing: dict[str, AppRecord]) -> list[AppRecord]:
+    async def apps(self, templates: dict[str, JSON], existing: dict[str, AppRecord], proxy_targets: list[JSON] | None = None, prober=None) -> list[AppRecord]:
         containers = await self.read("/containers/json", {"all": "1"})
         if not isinstance(containers, list):
             raise SourceError("Docker: invalid container list")
         apps = []
         image_cache = {}
         self.skipped = []
+        self.facts = {}
         for item in containers[:1000]:
             if not isinstance(item, dict):
                 continue
@@ -215,6 +223,7 @@ A :ro socket mount alone does not make the Docker daemon's API read-only.
             except (AttributeError, TypeError, ValueError, KeyError):
                 # One malformed record must not hide every other container.
                 self.skipped.append("docker:" + ident[:12])
+        await derive(apps, self.facts, proxy_targets or [], prober, self.host)
         return apps
 
     async def _app(self, item: JSON, ident: str, templates: dict[str, JSON], existing: dict[str, AppRecord], image_cache: dict) -> AppRecord:
@@ -230,27 +239,46 @@ A :ro socket mount alone does not make the Docker daemon's API read-only.
             info = image_cache[image_id]
         if not isinstance(info, dict):
             info = {}
+        try:
+            inspect = await self.read(f"/containers/{ident}/json")
+        except SourceError:
+            inspect = {}
+        inspect = inspect if isinstance(inspect, dict) else {}
         labels = dict((info.get("Config") or {}).get("Labels") or {})
         labels.update(item.get("Labels") or {})
         image = item.get("Image", "")
-        # Only OCI metadata is retained. Never persist Config.Env or inspect blobs.
+        # Only OCI metadata and the autoprofile facts are retained; env values pass the
+        # allowlist in ripe.autoprofile and inspect payloads are never stored.
         installed = usable_version_label(labels.get("org.opencontainers.image.version"))
         host, repo, tag = parse_image(image)
         if not installed and tag not in ("latest", "stable", "main", "master", "edge", "develop") and not tag.startswith("sha256:"):
             installed = tag
         digests = info.get("RepoDigests") or []
         digest = next((d.rsplit("@", 1)[-1] for d in digests if "@sha256:" in d), None)
-        upstream = previous.upstream_repo if previous and previous.upstream_repo else github_repo(labels.get("org.opencontainers.image.source")) or tpl.get("repo")
-        if not (previous and previous.upstream_repo) and repo.startswith("linuxserver/"):
-            upstream = LINUXSERVER_UPSTREAM.get(repo.split("/", 1)[1], upstream)
-        profile = previous.profile if previous else inferred_profile(name + " " + repo)
+        evidence = {}
+        label_repo, template_repo = github_repo(labels.get("org.opencontainers.image.source")), tpl.get("repo")
+        upstream = previous.upstream_repo if previous and previous.upstream_repo else label_repo or template_repo
+        if label_repo and upstream == label_repo and not (previous and previous.upstream_repo):
+            evidence["upstream_repo"] = "OCI image source label"
+        elif template_repo and upstream == template_repo and not (previous and previous.upstream_repo):
+            evidence["upstream_repo"] = "Unraid template Project/Support link"
+        if not (previous and previous.upstream_repo) and repo.startswith("linuxserver/") and repo.split("/", 1)[1] in LINUXSERVER_UPSTREAM:
+            upstream = LINUXSERVER_UPSTREAM[repo.split("/", 1)[1]]
+            evidence["upstream_repo"] = "known mapping for the linuxserver image (the image repo is only a wrapper)"
+        profile = inferred_profile(name + " " + repo)
         ports = [{"private":p.get("PrivatePort"), "public":p.get("PublicPort")} for p in item.get("Ports") or [] if isinstance(p, dict)]
-        web_url = tpl.get("web_url")
+        web_url = tpl.get("web_url") or clean_webui(labels.get("net.unraid.docker.webui"))
         if web_url:
             port_map = {p["private"]:p["public"] for p in ports if p.get("public")}
             web_url = re.sub(r"\[PORT:(\d+)\]", lambda match:str(port_map.get(int(match.group(1)), match.group(1))), web_url.replace("[IP]", self.host))
             web_url = safe_url(web_url)
-        return (AppRecord(id=key, name=name, source="docker", installed_version=installed, image=image, installed_digest=digest, image_created_at=date(info.get("Created")), upstream_repo=upstream, icon=tpl.get("icon"), web_url=web_url, profile=profile, detected={"ports":ports, "revision": str(labels.get("org.opencontainers.image.revision", ""))[:80], "registry": host, "tag": tag, **({"image_source": source} if (source := github_repo(labels.get("org.opencontainers.image.source"))) else {})}))
+        self.facts[key] = read_facts(item, info, inspect)
+        detected = {"ports":ports, "revision": str(labels.get("org.opencontainers.image.revision", ""))[:80], "registry": host, "tag": tag, "profile_evidence": evidence}
+        if source := github_repo(labels.get("org.opencontainers.image.source")):
+            detected["image_source"] = source
+        if upstream and evidence.get("upstream_repo"):
+            detected["upstream_auto"] = True
+        return (AppRecord(id=key, name=name, source="docker", installed_version=installed, image=image, installed_digest=digest, image_created_at=date(info.get("Created")), upstream_repo=upstream, icon=tpl.get("icon"), web_url=web_url, profile=profile, detected=detected))
 
 
 def parse_image(image: str) -> tuple[str, str, str]:
@@ -279,6 +307,13 @@ class RateLimited(SourceError):
 
 
 LATEST_TAGS = ("latest", "stable", "main", "master", "edge", "develop")
+DIGEST = re.compile(r"sha256:[a-f0-9]{64}")
+ENV_VERSION = re.compile(r"[A-Z][A-Z0-9_]*_(?:VERSION|VER|RELEASE)")
+ENV_SECRET = re.compile(r"KEY|TOKEN|SECRET|PASS|CRED|AUTH", re.I)
+ENV_VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+~:-]{0,63}")
+LABEL_VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+~:/@-]{0,127}")
+IMAGE_LABELS = ("org.opencontainers.image.base.name", "org.opencontainers.image.ref.name")
+MANIFEST_FILE = re.compile(r"(?:^|/)(?:package\.json|requirements[\w.-]*\.txt|pyproject\.toml|composer\.json|go\.mod)$")
 MAX_TAG_PAGES = 10
 MAX_RETRY_WAIT = 30
 MAX_ATTEMPTS = 3
@@ -317,6 +352,21 @@ def is_local_image(image: str, digest: str | None, previously_tracked: bool = Fa
     return "/" not in name and not previously_tracked
 
 
+MAX_BLOB_BYTES = 1024 * 1024  # an image config is a few KB; anything bigger is not one
+
+
+async def resolve_addresses(name: str, port: int) -> list[str]:
+    infos = await asyncio.get_running_loop().getaddrinfo(name, port, type=socket.SOCK_STREAM)
+    return [str(info[4][0]).split("%", 1)[0] for info in infos]
+
+
+def is_public_address(value: str) -> bool:
+    try:
+        return ipaddress.ip_address(value).is_global
+    except ValueError:
+        return False
+
+
 class RegistryReader:
     HOSTS = {"registry-1.docker.io", "ghcr.io", "lscr.io"}
     TOKEN_HOSTS = {"auth.docker.io", "ghcr.io", "lscr.io"}
@@ -331,6 +381,7 @@ class RegistryReader:
         self.sleep = sleep
         self.last_request: dict[str, float] = {}
         self.cooldown: dict[str, tuple[float, float]] = {}
+        self.resolve = resolve_addresses
 
     async def _throttle(self, host: str) -> None:
         """Spread requests to one registry instead of bursting."""
@@ -339,14 +390,28 @@ class RegistryReader:
             await self.sleep(wait)
         self.last_request[host] = time.monotonic()
 
-    async def _get(self, host: str, url: str, **kwargs) -> httpx.Response:
+    async def _fetch(self, url: str, max_bytes: int | None, **kwargs) -> httpx.Response:
+        """One GET. With max_bytes the body is streamed and abandoned as soon as it exceeds the cap."""
+        if max_bytes is None:
+            return await self.client.get(url, **kwargs)
+        async with self.client.stream("GET", url, **kwargs) as response:
+            body = b""
+            async for chunk in response.aiter_bytes():
+                body += chunk
+                if len(body) > max_bytes:
+                    raise SourceError("Registry: response too large")
+            # aiter_bytes() already decoded the body; keeping these headers would make httpx decode it twice.
+            headers = [(k, v) for k, v in response.headers.multi_items() if k.lower() not in ("content-encoding", "content-length")]
+            return httpx.Response(response.status_code, headers=headers, content=body)
+
+    async def _get(self, host: str, url: str, max_bytes: int | None = None, **kwargs) -> httpx.Response:
         """GET with Retry-After and exponential backoff on 429."""
         blocked = self.cooldown.get(host)
         if blocked and blocked[0] > time.monotonic():
             raise RateLimited("Registry: rate limited", blocked[1])
         for attempt in range(MAX_ATTEMPTS):
             await self._throttle(host)
-            response = await self.client.get(url, **kwargs)
+            response = await self._fetch(url, max_bytes, **kwargs)
             if response.status_code != 429:
                 return response
             wait = retry_after_seconds(response.headers.get("retry-after"))
@@ -363,10 +428,11 @@ class RegistryReader:
             raise SourceError("Registry: unsupported image registry or name")
         url = f"https://{host}/v2/{repo}/{suffix}"
         headers = {"Accept": ACCEPT_MANIFEST, **(extra_headers or {})}
+        cap = MAX_BLOB_BYTES if suffix.startswith("blobs/") else None
         if (host, repo) in self.tokens:
             headers["Authorization"] = "Bearer " + self.tokens[(host, repo)]
         try:
-            response = await self._get(host, url, headers=headers)
+            response = await self._get(host, url, cap, headers=headers)
             if response.status_code == 401:
                 challenge = response.headers.get("www-authenticate", "")
                 fields = dict(re.findall(r'(realm|service|scope)="([^"]+)"', challenge))
@@ -381,18 +447,105 @@ class RegistryReader:
                 if not isinstance(token, str):
                     raise SourceError("Registry: missing read token")
                 self.tokens[(host, repo)] = token
-                response = await self._get(host, url, headers={**headers, "Authorization":"Bearer " + token})
+                response = await self._get(host, url, cap, headers={**headers, "Authorization":"Bearer " + token})
+            if response.status_code in (301, 302, 303, 307, 308) and suffix.startswith("blobs/"):
+                response = await self._follow_blob_redirect(host, url, response)
             if response.status_code == 304:
                 return response
             if response.status_code >= 400:
                 raise SourceError(f"Registry: HTTP {response.status_code}")
-            if len(response.content) > 8 * 1024 * 1024:
+            if len(response.content) > (MAX_BLOB_BYTES if suffix.startswith("blobs/") else 8 * 1024 * 1024):
                 raise SourceError("Registry: response too large")
             if not isinstance(response.json(), dict):
                 raise SourceError("Registry: invalid JSON object")
             return response
         except (httpx.HTTPError, ValueError):
             raise SourceError("Registry: connection or JSON error") from None
+
+    async def _follow_blob_redirect(self, host: str, url: str, response: httpx.Response) -> httpx.Response:
+        """Registries answer blob GETs with a redirect to a CDN. One hop, https, a host that resolves only
+        to public addresses, no credentials, and a capped body. The check resolves the name locally: behind
+        an HTTP(S)_PROXY (the public client trusts the environment) the proxy resolves it instead, so the
+        literal and suffix checks are the only protection there, as is the case for a DNS rebinding race."""
+        target = urlparse(urljoin(url, response.headers.get("location", "")))
+        name = target.hostname or ""
+        try:
+            ipaddress.ip_address(name)
+            literal = True
+        except ValueError:
+            literal = False
+        if target.scheme != "https" or not name or literal or target.username or target.password or name == "localhost" or name.endswith((".local", ".lan", ".internal")):
+            raise SourceError("Registry: unsupported blob redirect")
+        try:
+            addresses = await self.resolve(name, target.port or 443)
+        except OSError:
+            raise SourceError("Registry: unsupported blob redirect") from None
+        if not addresses or not all(is_public_address(a) for a in addresses):
+            raise SourceError("Registry: unsupported blob redirect")
+        await self._throttle(name)
+        hop = await self._fetch(target.geturl(), MAX_BLOB_BYTES, headers={"Accept": "application/json"})
+        if hop.status_code == 429:
+            raise RateLimited("Registry: rate limited", retry_after_seconds(hop.headers.get("retry-after")) or 0)
+        return hop
+
+    async def image_facts(self, host: str, repo: str, reference: str) -> JSON:
+        """Runtime-version facts from an image config, read through the registry API without pulling layers.
+
+        Only allowlisted *_VERSION style ENV values and two base-image labels are returned;
+        the config's other ENV entries are never kept."""
+        manifest = await self.fetch(host, repo, "manifests/" + quote(reference, safe=":"), ttl=21600)
+        body = manifest["body"]
+        if isinstance(body.get("manifests"), list):
+            entries = [m for m in body["manifests"] if isinstance(m, dict) and isinstance(m.get("platform"), dict) and m["platform"].get("os") == "linux"]
+            chosen = next((m for m in entries if m["platform"].get("architecture") == "amd64"), entries[0] if entries else None)
+            if not chosen or not DIGEST.fullmatch(str(chosen.get("digest"))):
+                raise SourceError("Registry: no linux image manifest")
+            body = (await self.fetch(host, repo, "manifests/" + chosen["digest"], ttl=21600))["body"]
+        digest = (body.get("config") or {}).get("digest")
+        if not isinstance(digest, str) or not DIGEST.fullmatch(digest):
+            raise SourceError("Registry: image config unavailable")
+        key = "imgcfg:" + hashlib.sha256(f"{host}/{repo}/{digest}".encode()).hexdigest()
+        if (cached := self.cache_get(key)) is not None:
+            return cached
+        # Deliberately not cached as a raw blob: the full config can carry arbitrary ENV.
+        config = (await self.request(host, repo, "blobs/" + digest)).json().get("config") or {}
+        facts: JSON = {}
+        for item in (config.get("Env") or [])[:500]:
+            name, _, value = str(item).partition("=")
+            if ENV_VERSION.fullmatch(name) and not ENV_SECRET.search(name) and ENV_VALUE.fullmatch(value) and "://" not in value:
+                facts[name] = value
+        labels = config.get("Labels") or {}
+        for label in IMAGE_LABELS:
+            if isinstance(labels.get(label), str) and LABEL_VALUE.fullmatch(labels[label].strip()) and "://" not in labels[label]:
+                facts[label] = labels[label].strip()
+        self.cache_set(key, facts)
+        return facts
+
+    async def image_diff(self, image: str, installed_digest: str, latest_version: str | None, ignore: tuple[str, ...] = ()) -> list[JSON]:
+        """Differences between the installed image's config and the latest one, as plain facts."""
+        host, repo, tag = parse_image(image)
+        candidates = [tag] if tag in LATEST_TAGS else [v for v in (latest_version, "v" + latest_version if latest_version else None) if v]
+        latest = None
+        for candidate in candidates:
+            try:
+                latest = await self.image_facts(host, repo, candidate)
+                break
+            except RateLimited:
+                raise
+            except SourceError:
+                continue
+        if latest is None:
+            return []
+        installed = await self.image_facts(host, repo, installed_digest)
+        skip = {normalize_version(v) for v in ignore if v} - {None}
+        diff = []
+        for key in sorted(set(installed) | set(latest)):
+            before, after = installed.get(key), latest.get(key)
+            if before == after or {normalize_version(before), normalize_version(after)} & skip:
+                continue
+            name = key.rsplit(".", 1)[-1] if key in IMAGE_LABELS else re.sub(r"_(?:VERSION|VER|RELEASE)$", "", key).replace("_", " ")
+            diff.append({"name": name, "key": key, "installed": before, "latest": after})
+        return diff[:20]
 
     async def fetch(self, host: str, repo: str, suffix: str, ttl: int = 0) -> JSON:
         """Cached request: revalidated with If-None-Match once older than ttl."""
@@ -520,6 +673,43 @@ async def github_releases(http: CachedHTTP, repo: str, app_id: str, token: str |
     return releases
 
 
+# Best effort: lines that look like they carry credentials never leave the collector (URLs, user:pass@host,
+# emails). It also drops harmless pkg@1.2.3 pins, and cannot recognise a bare secret such as token=abc.
+CREDENTIAL_LINE = re.compile(r"://|[\w.%:+-]@")
+
+
+def wants_image_diff(app: AppRecord) -> bool:
+    """A moving tag with an update, or a pinned tag whose upstream release is newer than the installed one."""
+    if app.update_available is not False:
+        return True
+    return bool(app.latest_version and app.installed_version and compare_versions(app.latest_version, app.installed_version) == 1)
+
+
+async def manifest_diff(http: CachedHTTP, repo: str, base: str, head: str, token: str | None = None) -> list[JSON]:
+    """Changed lines in dependency manifests between two tags, via the GitHub compare API."""
+    repo = github_repo(repo)
+    if not repo:
+        raise SourceError("GitHub: invalid repository mapping")
+    headers = {"Accept":"application/vnd.github+json", "X-GitHub-Api-Version":"2022-11-28"}
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    data = await http.get(f"https://api.github.com/repos/{repo}/compare/{quote(base, safe='')}...{quote(head, safe='')}", headers=headers, source="GitHub")
+    if not isinstance(data, dict) or not isinstance(data.get("files"), list):
+        raise SourceError("GitHub: invalid compare response")
+    changes = []
+    for item in data["files"]:
+        name = item.get("filename") if isinstance(item, dict) else None
+        if not isinstance(name, str) or "node_modules/" in name or not MANIFEST_FILE.search(name):
+            continue
+        lines = {"-": [], "+": []}
+        for line in str(item.get("patch") or "").splitlines():
+            if line[:1] in lines and not line.startswith(("---", "+++")) and len(line.strip(" \t+-,{}[]")) > 1 and not CREDENTIAL_LINE.search(line):
+                lines[line[0]].append(line[1:].strip()[:200])
+        if lines["-"] or lines["+"]:
+            changes.append({"file": name, "removed": lines["-"][:40], "added": lines["+"][:40]})
+    return changes[:12]
+
+
 async def unraid_releases(http: CachedHTTP, installed: str | None, token: str | None = None) -> list[Release]:
     """Read official versioned docs instead of inventing an OS GitHub repo.
 
@@ -619,8 +809,13 @@ def ha_records(states: list[JSON], notes: dict[str, str], existing: dict[str, Ap
             repo = "home-assistant/core"
         if not repo and re.search(r"home assistant (?:operating system|os)", title, re.I):
             repo = "home-assistant/operating-system"
-        profile = existing[key].profile if key in existing else inferred_profile(title)
-        apps.append(AppRecord(id=key, name=title, source="home_assistant", installed_version=installed, latest_version=latest, update_available=item.get("state")=="on" if item.get("state") in ("on", "off") else None, upstream_repo=repo, icon=safe_url(attr.get("entity_picture")), profile=profile, detected={"entity_id":entity_id}, error="Entity unavailable" if item.get("state") in ("unavailable", "unknown") else None))
+        profile = inferred_profile(title)
+        evidence = {}
+        if repo and repo == github_repo(url) and not (key in existing and existing[key].upstream_repo):
+            evidence["upstream_repo"] = "Home Assistant update entity release_url"
+        if INFRA.search(title):
+            evidence["tier"] = f"name matches '{INFRA.search(title).group(0).lower()}'"
+        apps.append(AppRecord(id=key, name=title, source="home_assistant", installed_version=installed, latest_version=latest, update_available=item.get("state")=="on" if item.get("state") in ("on", "off") else None, upstream_repo=repo, icon=safe_url(attr.get("entity_picture")), profile=profile, detected={"entity_id":entity_id, "profile_evidence":evidence}, error="Entity unavailable" if item.get("state") in ("unavailable", "unknown") else None))
         text = notes.get(entity_id) or attr.get("release_summary") or ""
         if latest and text:
             # HA update states do not include publication date. Do not start an
@@ -653,7 +848,11 @@ async def collect(settings: Settings, *, github_token: str | None = None, ha_tok
                 transport = httpx.AsyncHTTPTransport(uds=docker_socket)
                 async with httpx.AsyncClient(transport=transport, base_url="http://docker", timeout=15, trust_env=False) as docker:
                     reader = DockerReader(docker, host=urlparse(settings.dashboard_url).hostname or "localhost")
-                    apps.extend(await reader.apps(read_templates(templates_dir), existing))
+                    # Optional, off by default: only paths the user set are read (read-only).
+                    targets = read_npm_targets(settings.npm_database_path) + read_cloudflared_targets(settings.cloudflared_config_path)
+                    async def prober(url: str):
+                        return await probe_login(local, url)
+                    apps.extend(await reader.apps(read_templates(templates_dir), existing, targets, prober))
                     for skipped in reader.skipped:
                         error(skipped, "Docker: container record parse error")
             except SourceError as exc:
@@ -680,7 +879,7 @@ async def collect(settings: Settings, *, github_token: str | None = None, ha_tok
                 error("home_assistant", "Home Assistant: parse error")
         else:
             error("home_assistant", "Home Assistant connection is not configured; open Ripe Settings to enable discovery")
-        unraid = AppRecord(id="unraid:os", name="Unraid OS", source="unraid", installed_version=installed_unraid(unraid_version_file), upstream_repo=None, profile=existing["unraid:os"].profile if "unraid:os" in existing else Profile(tier="infrastructure", exposure="lan"))
+        unraid = AppRecord(id="unraid:os", name="Unraid OS", source="unraid", installed_version=installed_unraid(unraid_version_file), upstream_repo=None, profile=Profile(tier="infrastructure", exposure="lan", origin={f: "auto" for f in AUTO_FIELDS}), detected={"profile_evidence": {"tier": "Unraid OS is the host everything else runs on"}})
         if not unraid.installed_version:
             unraid.error = "Unraid version file not mounted or version unrecognised"
             error("unraid", unraid.error)
@@ -702,6 +901,7 @@ async def collect(settings: Settings, *, github_token: str | None = None, ha_tok
         # shorter span fetched for a newer installation of the same app.
         upstream_cache: dict[tuple[str, str | None], list[Release] | str] = {}
         for app in apps:
+            registry_ok = False
             if app.source == "docker" and app.image and is_local_image(app.image, app.installed_digest, bool(existing.get(app.id) and existing[app.id].latest_digest)):
                 # Never pulled from a registry: nothing to look up, and not an error.
                 app.detected["local_build"] = "local build (not tracked)"
@@ -726,6 +926,8 @@ async def collect(settings: Settings, *, github_token: str | None = None, ha_tok
                         app.detected["image_change_date_kind"] = "first_observed"
                     if metadata.get("truncated_tags"):
                         error(app.id, "Registry tag list is incomplete; latest-only status is unknown")
+                    previous = existing.get(app.id)
+                    registry_ok = True
                 except RateLimited:
                     # Keep the last known registry data and retry on the next poll.
                     previous = existing.get(app.id)
@@ -765,15 +967,41 @@ async def collect(settings: Settings, *, github_token: str | None = None, ha_tok
                     # Prefer GitHub's dated full release over HA's undated summary.
                     releases[:] = [r for r in releases if not (r.app_id==app.id and any(r.version==g.version or compare_versions(r.version, g.version)==0 for g in app_releases))]
                     releases.extend(app_releases)
+                    base = next((r.version for r in app_releases if compare_versions(r.version, app.installed_version) == 0), None)
+                    head = next((r.version for r in app_releases if compare_versions(r.version, app.latest_version) == 0), None)
+                    if base and head and compare_versions(head, base) == 1:
+                        span = {"repo": app.upstream_repo, "base": base, "head": head}
+                        try:
+                            if changes := await manifest_diff(cached, app.upstream_repo, base, head, github_token):
+                                app.detected["manifest_diff"] = changes
+                                app.detected["manifest_diff_for"] = span
+                        except (SourceError, *PARSE_ERRORS):
+                            previous = existing.get(app.id)
+                            # Reuse only a diff computed for exactly this repo, base and head.
+                            if previous and previous.detected.get("manifest_diff") and previous.detected.get("manifest_diff_for") == span:
+                                app.detected["manifest_diff"] = previous.detected["manifest_diff"]
+                                app.detected["manifest_diff_for"] = span
                 except SourceNotFound as exc:
                     upstream_cache[cache_key] = exc
-                    app.detected["invalid_mapping"] = {"repo": app.upstream_repo, "status": 404, "at": time.time(), "token": bool(github_token), "suggestion": mapping_suggestion(app)}
-                    app.error = MAPPING_ERROR
-                    error(app.id, f"GitHub: {app.upstream_repo} not found (HTTP 404); mapping needs attention")
+                    if app.detected.pop("upstream_auto", False):
+                        # An automatically detected repo that does not exist is dropped, not flagged.
+                        app.upstream_repo = None
+                        app.detected.get("profile_evidence", {}).pop("upstream_repo", None)
+                        app.detected["mapping_hint"] = "Detected upstream repository was not found; choose one in the app profile"
+                    else:
+                        app.detected["invalid_mapping"] = {"repo": app.upstream_repo, "status": 404, "at": time.time(), "token": bool(github_token), "suggestion": mapping_suggestion(app)}
+                        app.error = MAPPING_ERROR
+                        error(app.id, f"GitHub: {app.upstream_repo} not found (HTTP 404); mapping needs attention")
                 except SourceError as exc:
                     upstream_cache[cache_key] = str(exc)
-                    app.error = str(exc)
-                    error(app.id, str(exc))
+                    if str(exc) == "GitHub: HTTP 404" and app.detected.pop("upstream_auto", False):
+                        # An automatically detected repo that does not exist is dropped, not trusted.
+                        app.upstream_repo = None
+                        app.detected.get("profile_evidence", {}).pop("upstream_repo", None)
+                        app.detected["mapping_hint"] = "Detected upstream repository was not found; choose one in the app profile"
+                    else:
+                        app.error = str(exc)
+                        error(app.id, str(exc))
                 except PARSE_ERRORS:
                     upstream_cache[cache_key] = "GitHub: parse error"
                     app.error = "GitHub: parse error"
@@ -782,6 +1010,24 @@ async def collect(settings: Settings, *, github_token: str | None = None, ha_tok
                 # A missing mapping is a hint, not a source failure: the digest
                 # logic still gives a valid status for unmapped :latest images.
                 app.detected["mapping_hint"] = "No upstream repository mapping; choose one in the app profile"
+            if registry_ok and app.installed_digest and wants_image_diff(app):
+                # After the upstream lookup: version-tagged images need latest_version to pick the target.
+                previous = existing.get(app.id)
+                identity = {"image": app.image, "installed_digest": app.installed_digest,
+                            "latest_digest": app.latest_digest, "latest_version": app.latest_version}
+                try:
+                    diff = await registry.image_diff(app.image, app.installed_digest, app.latest_version or None, (app.installed_version, app.latest_version))
+                    if diff:
+                        app.detected["image_diff"] = diff
+                        app.detected["image_diff_for"] = identity
+                except RateLimited:
+                    app.detected["registry_status"] = "Registry rate limited; last known data kept, retrying next poll"
+                except (SourceError, *PARSE_ERRORS):
+                    pass
+                # Optional facts: keep the last diff only for the very same installed and target image.
+                if "image_diff" not in app.detected and previous and previous.detected.get("image_diff") and previous.detected.get("image_diff_for") == identity:
+                    app.detected["image_diff"] = previous.detected["image_diff"]
+                    app.detected["image_diff_for"] = identity
             if not app.installed_version and app.image_created_at:
                 app.detected["version_fallback"] = "unknown (image date " + app.image_created_at.date().isoformat() + ")"
     return apps, releases, errors

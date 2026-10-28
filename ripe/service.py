@@ -9,14 +9,20 @@ from typing import Any
 import httpx
 from .config import Runtime
 from .models import AppRecord, AppView, Profile, Release, Settings, utcnow
+from .autoprofile import AUTO_FIELDS, merge_profile
 from .store import Store
 from .sources import collect
-from .intelligence import classify_release, analyze_applicability, sanitize_profile, classification_key, prompt_digest
+from .intelligence import (classify_release, analyze_applicability, sanitize_profile, classification_key,
+                           prompt_digest, build_rollup, rollup_key)
 from .intelligence.evidence import conservative_applicability, keyword_warnings
 from .ripeness import build_view, dashboard_sort_key
 from .versions import compare_versions
 from .notifications import Notifier
 from .demo import seed_demo
+
+
+def rollup_latest(app: AppRecord, pending: list[Release]) -> str | None:
+    return pending[-1].version if pending else app.latest_version
 
 
 def fingerprint(value: Any) -> str:
@@ -107,13 +113,42 @@ class Coordinator:
         settings = self.store.settings(self.runtime.initial_settings())
         return settings.model_copy(update={'demo_mode': self.demo})
 
+    def with_rollup(self, view: AppView) -> AppView:
+        # A stored rollup is shown only while it still describes this installed -> latest span.
+        stored = (self.store.get('rollup:' + view.app.id) or {}).get('result')
+        if stored and stored.get('installed') == (view.app.installed_version or view.app.installed_digest) and stored.get('latest') == rollup_latest(view.app, view.pending):
+            view.rollup = stored
+        return view
+
     def views(self, now: datetime | None = None) -> list[AppView]:
         settings = self.settings()
-        return sorted([build_view(app, self.store.releases(app.id), settings, now) for app in self.store.apps()],key=dashboard_sort_key)
+        return sorted([self.with_rollup(build_view(app, self.store.releases(app.id), settings, now)) for app in self.store.apps()],key=dashboard_sort_key)
 
     def view(self, app_id: str) -> AppView | None:
         app = self.store.app(app_id)
-        return build_view(app, self.store.releases(app_id), self.settings()) if app else None
+        return self.with_rollup(build_view(app, self.store.releases(app_id), self.settings())) if app else None
+
+    async def refresh_rollup(self, app: AppRecord, settings: Settings, local_ready) -> None:
+        """Regenerate the app's rollup only when installed, latest, their notes or the model setup changed."""
+        pending = build_view(app, self.store.releases(app.id), settings).pending
+        image_diff, manifest = app.detected.get('image_diff'), app.detected.get('manifest_diff')
+        # No version known (latest-only image): the installed digest identifies the installation.
+        installed = app.installed_version or app.installed_digest
+        if not installed or not (pending or image_diff):
+            self.store.set('rollup:' + app.id, None)
+            return
+        latest = rollup_latest(app, pending)
+        key = rollup_key(app, installed, latest, pending, image_diff, manifest, settings)
+        stored = self.store.get('rollup:' + app.id) or {}
+        if stored.get('key') == key and stored['result'].get('status') == 'ok':
+            return
+        unavailable = None
+        if (any(r.notes.strip() for r in pending) or manifest) and settings.classification_provider == 'local' and not await local_ready():
+            unavailable = 'Local model is unavailable; no summary was inferred.'
+        result = await build_rollup(app, installed, latest, pending, settings, image_diff=image_diff,
+                                    manifest_diff=manifest, gemini_key=self.runtime.gemini_key,
+                                    model_unavailable=unavailable, log_call=self.store.log_llm)
+        self.store.set('rollup:' + app.id, {'key': key if result['status'] == 'ok' else None, 'result': result})
 
     def dashboard(self) -> dict:
         views = self.views()
@@ -121,7 +156,22 @@ class Coordinator:
         return {'apps': [v.model_dump(mode='json') for v in views], 'demo': self.demo,
                 'summary': {s:counts[s] for s in ('ripe','waiting','recommended_now','read_first','up_to_date','unknown')},
                 'last_poll':self.store.get('last_poll'), 'polling': self.polling,
-                'integration_status': self.integration_status(), 'timezone':self.settings().timezone}
+                'integration_status': self.integration_status(), 'timezone':self.settings().timezone,
+                'auto_profiles': self.auto_profiles()}
+
+    def auto_profiles(self) -> list[dict]:
+        """Apps Ripe filled in by itself that the user has not yet acknowledged."""
+        reviewed = set(self.store.get('autoprofile:reviewed', []))
+        found = []
+        for app in self.store.apps():
+            evidence = app.detected.get('profile_evidence') or {}
+            reasons = {f: evidence[f] for f in (*AUTO_FIELDS, 'upstream_repo') if evidence.get(f) and app.profile.origin.get(f, 'auto') != 'user'}
+            if reasons and app.id not in reviewed:
+                found.append({'id': app.id, 'name': app.name, 'reasons': reasons})
+        return found
+
+    def review_auto_profiles(self):
+        self.store.set('autoprofile:reviewed', sorted({*self.store.get('autoprofile:reviewed', []), *(a['id'] for a in self.auto_profiles())}))
 
     def integration_status(self) -> dict:
         return {'docker_socket': 'present' if __import__('os').path.exists(self.runtime.docker_socket) else 'not mounted',
@@ -184,12 +234,15 @@ class Coordinator:
                     if self.store.get('generation:' + app.id, 0) != generation:
                         continue
                     preference = self.store.get('profile:' + app.id)
-                    if preference is not None:
-                        app.profile = Profile.model_validate(preference)
+                    # Fields the user edited are never overwritten; the rest follow what was read this scan.
+                    app.profile, evidence = merge_profile(app.profile, dict(app.detected.get('profile_evidence') or {}),
+                                                          Profile.model_validate(preference) if preference is not None else None)
                     app.profile = sanitize_profile(app.profile)
                     mapping = self.store.get('mapping:' + app.id)
                     if mapping is not None:
                         app.upstream_repo = mapping.get('upstream_repo')
+                        evidence.pop('upstream_repo', None)
+                    app.detected['profile_evidence'] = evidence
                     self.store.save_app(app)
                     for release in by_app.get(app.id, []):
                         if self.store.get('generation:' + app.id, 0) != generation:
@@ -219,7 +272,7 @@ class Coordinator:
                                 release.classification = None
                                 release = await classify_release(release, app, settings, gemini_key=self.runtime.gemini_key,log_call=self.store.log_llm)
                             self.store.set('classification:' + key, {'classification':release.classification,'classification_key':release.classification_key, 'model_disagreement':release.model_disagreement})
-                        profile_key = fingerprint([app.profile.model_dump(),release.classification_key,settings.local_model,settings.ollama_url,prompt_digest()])
+                        profile_key = fingerprint([app.profile.model_dump(exclude={'origin'}),release.classification_key,settings.local_model,settings.ollama_url,prompt_digest()])
                         analysis = self.store.get('applicability:' + profile_key)
                         if analysis is not None and all(item.get('verified') for item in analysis):
                             release.applicability = analysis
@@ -234,6 +287,13 @@ class Coordinator:
                         if self.store.get('generation:' + app.id, 0) != generation:
                             break
                         self.store.save_release(release)
+                    if self.store.get('generation:' + app.id, 0) == generation:
+                        async def ready():
+                            nonlocal local_ready
+                            if local_ready is None:
+                                local_ready = await self.local_ready(settings)
+                            return local_ready
+                        await self.refresh_rollup(app, settings, ready)
                 # Mark a source failure as stale rather than silently deleting its
                 # previous records; these visible errors prevent a fresh-data claim.
                 current_ids = {a.id for a in apps}
@@ -243,8 +303,13 @@ class Coordinator:
                         self.store.save_app(prior)
                 self.store.set('last_poll',utcnow().isoformat())
                 self.store.set('poll_errors',errors)
+                failing = {str(e.get('source')) for e in errors}
                 if local_ready is False:
+                    failing.add('ollama')
                     self.store.log_error({'source':'ollama','message':'Configured model unavailable on the local Ollama endpoint. Pending classifications remain unknown.'})
+                # A source that didn't fail this time has recovered; hide its old errors.
+                self.store.resolve_errors(failing)
+                self.store.prune_errors()
                 await self.notify()
             except asyncio.CancelledError:
                 raise
