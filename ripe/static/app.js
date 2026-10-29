@@ -140,8 +140,18 @@
     return parts.join(' · ');
   }
   function pollPanel(s) {
+    // Built from text nodes only, so nothing from the status payload is ever parsed as HTML.
+    const frag=document.createDocumentFragment();
+    const el=(tag,content,className)=>{const node=document.createElement(tag);if(content!==undefined)node.textContent=content;if(className)node.className=className;return node;};
     const errors=s.errors||[];
-    return `<dl><dt>Phase</dt><dd>${h(phaseNames[s.phase]||(s.last_error?'Stopped':'Finished'))}</dd><dt>Sources</dt><dd>${h(s.sources?.done??0)} of ${h(s.sources?.total??0)}</dd><dt>Releases</dt><dd>${h(s.releases?.done??0)} of ${h(s.releases?.total??0)}</dd><dt>Skipped</dt><dd>${h(s.releases?.skipped??0)} (older than the analysis cap, or no notes)</dd><dt>Current</dt><dd>${h(s.current||'—')}</dd></dl>${s.last_error?`<h4>Check stopped</h4><p>${h(s.last_error)}</p>`:''}<h4>Errors so far</h4>${errors.length?`<ul>${errors.map(e=>`<li><strong>${h(e.source)}</strong>: ${h(e.message)}</li>`).join('')}</ul>`:'<p class="muted">None.</p>'}`;
+    const list=el('dl');
+    [['Phase',phaseNames[s.phase]||(s.last_error?'Stopped':'Finished')],['Sources',`${s.sources?.done??0} of ${s.sources?.total??0}`],['Releases',`${s.releases?.done??0} of ${s.releases?.total??0}`],['Skipped',`${s.releases?.skipped??0} (older than the analysis cap, or no notes)`],['Current',s.current||'—']].forEach(([term,value])=>{list.append(el('dt',term),el('dd',value));});
+    frag.append(list);
+    if(s.last_error)frag.append(el('h4','Check stopped'),el('p',s.last_error));
+    frag.append(el('h4','Errors so far'));
+    if(errors.length){const ul=el('ul');errors.forEach(e=>{const li=el('li');li.append(el('strong',String(e.source??'')),`: ${e.message??''}`);ul.append(li);});frag.append(ul);}
+    else frag.append(el('p','None.','muted'));
+    return frag;
   }
   function initProgress() {
     const strip=$('#poll-strip');if(!strip)return;
@@ -180,7 +190,7 @@
       }else if(strip.dataset.state!=='done'){
         hide();
       }
-      if(!panel.hidden)panel.innerHTML=pollPanel(s);
+      if(!panel.hidden)panel.replaceChildren(pollPanel(s));
       if(wasRunning&&!s.running)document.dispatchEvent(new CustomEvent('ripe:poll-finished',{detail:s}));
       wasRunning=Boolean(s.running);
     }
@@ -192,7 +202,7 @@
       try{render(await api('/api/poll/status'));}catch{}
       schedule();
     }
-    toggle.addEventListener('click',()=>{panel.hidden=!panel.hidden;toggle.setAttribute('aria-expanded',String(!panel.hidden));if(!panel.hidden&&last)panel.innerHTML=pollPanel(last);});
+    toggle.addEventListener('click',()=>{panel.hidden=!panel.hidden;toggle.setAttribute('aria-expanded',String(!panel.hidden));if(!panel.hidden&&last)panel.replaceChildren(pollPanel(last));});
     dismiss.addEventListener('click',()=>{try{sessionStorage.setItem(dismissKey,last?.finished_at||'x');}catch{}hide();});
     document.addEventListener('visibilitychange',()=>{if(!document.hidden)void refresh();});
     refreshPoll=refresh;
