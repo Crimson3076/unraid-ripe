@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import Any
 import httpx
 from .config import Runtime
-from .models import AppRecord, AppView, Profile, Release, Settings, utcnow
+from .models import AppRecord, AppView, Profile, Release, Settings, hidden, stopped, utcnow
 from .autoprofile import AUTO_FIELDS, merge_profile
 from .store import Store
 from .progress import PollProgress
@@ -17,7 +17,7 @@ from .sources import collect
 from .intelligence import (classify_release, analyze_applicability, sanitize_profile, classification_key,
                            prompt_digest, build_rollup, rollup_key)
 from .intelligence.evidence import conservative_applicability, keyword_warnings
-from .ripeness import build_view, dashboard_sort_key
+from .ripeness import build_view, dashboard_sort_key, _STATUS_ORDER
 from .versions import compare_versions, parse_version
 from .analysis_queue import is_pending, newest_first, priority, trivial_notes
 from .notifications import Notifier
@@ -124,13 +124,79 @@ class Coordinator:
             view.rollup = stored
         return view
 
-    def views(self, now: datetime | None = None) -> list[AppView]:
+    @staticmethod
+    def version_ignored(view: AppView) -> bool:
+        """The user hid this update; it stays hidden until something newer than the hidden version exists."""
+        app = view.app
+        if not app.ignored_version:
+            return False
+        latest = view.latest_version or app.latest_digest
+        if not latest or view.status == 'up_to_date':
+            return False
+        comparison = compare_versions(latest, app.ignored_version)
+        return latest == app.ignored_version or (comparison is not None and comparison <= 0)
+
+    def inventory(self, now: datetime | None = None) -> dict:
+        """Cards for the Overview: hidden apps removed, sidecars folded into their parent, ignored items listed apart."""
         settings = self.settings()
-        return sorted([self.with_rollup(build_view(app, self.store.releases(app.id), settings, now)) for app in self.store.apps()],key=dashboard_sort_key)
+        records = self.store.apps()
+        by_id = {a.id: a for a in records}
+        visible = [a for a in records if not hidden(a, settings, by_id)]
+        built = {a.id: self.with_rollup(build_view(a, self.store.releases(a.id), settings, now)) for a in visible}
+        ignored = [{'id': a.id, 'name': a.name, 'scope': 'app', 'version': None} for a in records if a.ignored and not a.merged_into]
+        cards: list[AppView] = []
+        quiet = set()
+        for view in built.values():
+            if view.app.ignored_version and self.version_ignored(view):
+                quiet.add(view.app.id)
+                ignored.append({'id': view.app.id, 'name': view.app.name, 'scope': 'version', 'version': view.app.ignored_version})
+            elif view.app.parent_id not in built:
+                cards.append(view)
+        for view in built.values():
+            parent = built.get(view.app.parent_id) if view.app.parent_id else None
+            if parent is None or view.app.id in quiet or parent.app.id in quiet:
+                continue
+            parent.sidecars.append(view)
+            # A sidecar's update is the parent's update: its status can only raise the card's.
+            if view.status in ('recommended_now', 'read_first', 'ripe', 'waiting') and _STATUS_ORDER[view.status] < _STATUS_ORDER.get(parent.status, 99):
+                parent.status, parent.status_label = view.status, view.status_label
+                parent.reason = f'{view.app.name}: {view.reason}'
+                parent.days_remaining, parent.next_ripe_at = view.days_remaining, view.next_ripe_at
+                parent.tags = sorted({*parent.tags, *view.tags})
+        hidden_stopped = sum(1 for a in records if stopped(a) and not settings.include_stopped and not a.ignored and not a.merged_into)
+        return {'views': sorted(cards, key=dashboard_sort_key), 'ignored': sorted(ignored, key=lambda i: i['name'].casefold()), 'stopped_hidden': hidden_stopped}
+
+    def views(self, now: datetime | None = None) -> list[AppView]:
+        return self.inventory(now)['views']
+
+    def set_ignore(self, app_id: str, scope: str, on: bool) -> AppRecord:
+        """Ignore or restore an app, or hide/unhide its current latest version. Undoing an app ignore re-polls it."""
+        app = self.store.app(app_id)
+        if app is None:
+            raise KeyError(app_id)
+        if scope == 'app':
+            app.ignored = on
+        elif on:
+            view = self.view(app_id)
+            latest = (view.latest_version or app.latest_digest) if view else None
+            if not latest:
+                raise ValueError('No newer version is known')
+            app.ignored_version = latest
+        else:
+            app.ignored_version = None
+        self.mark_changed(app_id)
+        self.store.save_app(app)
+        if scope == 'app' and not on:
+            self.request_poll()
+        return app
 
     def view(self, app_id: str) -> AppView | None:
         app = self.store.app(app_id)
-        return self.with_rollup(build_view(app, self.store.releases(app_id), self.settings())) if app else None
+        if app is None:
+            return None
+        # The card carries the sidecars and the status they raise; hidden or ignored apps fall back to their own view.
+        card = next((v for v in self.views() if v.app.id == app_id), None)
+        return card or self.with_rollup(build_view(app, self.store.releases(app_id), self.settings()))
 
     async def refresh_rollup(self, app: AppRecord, settings: Settings, local_ready) -> None:
         """Regenerate the app's rollup only when installed, latest, their notes or the model setup changed."""
@@ -141,6 +207,10 @@ class Coordinator:
         image_diff, manifest = app.detected.get('image_diff'), app.detected.get('manifest_diff')
         # No version known (latest-only image): the installed digest identifies the installation.
         installed = app.installed_version or app.installed_digest
+        if app.section == 'firmware' and not any(r.notes.strip() for r in pending):
+            # Firmware without release notes has nothing to summarise; never send it to a model.
+            self.store.set('rollup:' + app.id, None)
+            return
         if not installed or not (pending or image_diff):
             self.store.set('rollup:' + app.id, None)
             return
@@ -171,16 +241,20 @@ class Coordinator:
                 evidence = (c.get('tag_evidence') or {}).get(tag)
                 if tag not in quotes and norm(evidence) and norm(evidence) in norm(release.notes):
                     quotes[tag] = f'{release.version}: {evidence}'
-        data = view.model_dump(mode='json', exclude={'pending', 'history', 'available_notes', 'no_notes', 'rollup'})
+        data = view.model_dump(mode='json', exclude={'pending', 'history', 'available_notes', 'no_notes', 'rollup', 'sidecars'})
+        data['sidecars'] = [Coordinator.card(side) for side in view.sidecars]
         data['app']['detected'] = {k: v for k, v in data['app']['detected'].items() if k == 'mapping_hint'}
         data['tag_quotes'] = quotes
         data['rollup'] = {'headline': view.rollup['headline']} if view.rollup and view.rollup.get('headline') else None
         return data
 
     def dashboard(self) -> dict:
-        views = self.views()
+        inventory = self.inventory()
+        views = inventory['views']
         counts = Counter(v.status for v in views)
         return {'apps': [self.card(v) for v in views], 'demo': self.demo,
+                'ignored': inventory['ignored'], 'stopped_hidden': inventory['stopped_hidden'],
+                'include_stopped': self.settings().include_stopped,
                 'summary': {s:counts[s] for s in ('ripe','waiting','recommended_now','read_first','up_to_date','unknown')},
                 'last_poll':self.store.get('last_poll'), 'polling': self.polling,
                 'integration_status': self.integration_status(), 'timezone':self.settings().timezone,
@@ -190,7 +264,12 @@ class Coordinator:
         """Apps Ripe filled in by itself that the user has not yet acknowledged."""
         reviewed = set(self.store.get('autoprofile:reviewed', []))
         found = []
-        for app in self.store.apps():
+        settings = self.settings()
+        records = self.store.apps()
+        by_id = {a.id: a for a in records}
+        for app in records:
+            if hidden(app, settings, by_id):
+                continue
             evidence = app.detected.get('profile_evidence') or {}
             reasons = {f: evidence[f] for f in (*AUTO_FIELDS, 'upstream_repo') if evidence.get(f) and app.profile.origin.get(f, 'auto') != 'user'}
             if reasons and app.id not in reviewed:
@@ -265,6 +344,7 @@ class Coordinator:
                 by_app: dict[str,list[Release]] = {}
                 for release in releases:
                     by_app.setdefault(release.app_id, []).append(release)
+                by_id = {a.id: a for a in apps}
                 local_ready = None
                 queue: list = []
                 skipped = 0
@@ -284,6 +364,8 @@ class Coordinator:
                         evidence.pop('upstream_repo', None)
                     app.detected['profile_evidence'] = evidence
                     self.store.save_app(app)
+                    if hidden(app, settings, by_id):
+                        continue  # ignored, merged or stopped: no analysis, no model calls
                     # Same channel and latest-version ceiling as the dashboard span, so betas
                     # or releases above an authoritative latest don't use up the cap.
                     shown = {r.id for r in build_view(app, by_app.get(app.id, []), settings).pending}

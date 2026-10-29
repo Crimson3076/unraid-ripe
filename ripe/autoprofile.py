@@ -121,9 +121,12 @@ def read_facts(item: dict, info: dict, inspect: dict) -> dict:
             if isinstance(p.get("PublicPort"), int):
                 bindings.append((str(p.get("IP") or ""), p["PublicPort"]))
     exposed = image_config.get("ExposedPorts")
+    labels = item.get("Labels") if isinstance(item.get("Labels"), dict) else {}
+    group = labels.get("com.docker.compose.project") or labels.get("folder.view") or labels.get("folder.view2") or ""
     links = [str(link).split(":", 1)[0].strip("/") for link in host_config.get("Links") or [] if isinstance(link, str)]
     return {
         "readable": isinstance(ports, list) or bool(mode),
+        "group": str(group)[:100].lower(),
         "bindings": bindings, "private_ports": private_ports,
         "network_mode": mode if isinstance(mode, str) else "",
         "networks": {str(k): str((v or {}).get("IPAddress") or "") for k, v in networks.items() if isinstance(v, dict)},
@@ -199,6 +202,67 @@ def dependencies_of(app: AppRecord, facts: dict, all_facts: dict[str, dict], by_
     return sorted(deps), [deps[k] for k in sorted(deps)]
 
 
+SUPPORT_IMAGE = re.compile(r"(?:^|[/\W_])(?:postgres(?:ql)?|postgis|pgvecto[-_]?rs|mariadb|mysql|redis|valkey|mongo(?:db)?|chroma(?:db)?|memcached)(?:$|[\W_])", re.I)
+NAME_SPLIT = re.compile(r"[\s_.-]+")
+
+
+def image_name(app: AppRecord) -> str:
+    """Repository path of the image without tag or digest."""
+    repo = (app.image or "").split("@", 1)[0]
+    head, _, tail = repo.rpartition(":")
+    return head if head and "/" not in tail else repo
+
+
+def is_support_image(app: AppRecord) -> bool:
+    return bool(SUPPORT_IMAGE.search(image_name(app)))
+
+
+def link_sidecars(apps: list[AppRecord], facts: dict[str, dict]) -> None:
+    """Point databases and caches that serve exactly one other container at it (parent_id).
+
+    Signals, strongest first: the parent's env names the sidecar as a host; the same compose
+    project or Unraid folder; the sidecar's name carries the parent's leading name word; a small
+    network shared with a single other container. A datastore several apps use stays standalone.
+    """
+    docker = [a for a in apps if a.id in facts]
+    support = [a for a in docker if is_support_image(a)]
+    parents = [a for a in docker if not is_support_image(a)]
+
+    def brand(app: AppRecord) -> str:
+        return next((t for t in NAME_SPLIT.split(app.name.lower()) if t), "")
+
+    for side in support:
+        f = facts[side.id]
+        own = side.name.lower()
+        users = [p for p in parents if any(host_of(v) == own for v in facts[p.id]["env_values"].values())]
+        if len(users) == 1:
+            found = (users[0], f"{users[0].name} names it in its settings")
+        elif len(users) > 1:
+            continue  # shared by several apps
+        else:
+            found = None
+            same = [p for p in parents if f["group"] and facts[p.id]["group"] == f["group"]]
+            tokens = set(NAME_SPLIT.split(own))
+            related = [p for p in parents if len(brand(p)) >= 3 and brand(p) in tokens]
+            if len(same) == 1:
+                found = (same[0], f"same compose project or folder as {same[0].name}")
+            elif len(same) > 1 and len(narrowed := [p for p in same if p in related]) == 1:
+                found = (narrowed[0], f"same compose project or folder, and its name starts with {brand(narrowed[0])}")
+            elif len(related) >= 1:
+                best = sorted(related, key=lambda p: (p.name.lower() != brand(p), p.name.lower()))[0]
+                found = (best, f"its name contains {brand(best)}")
+            else:
+                for network in sorted(n for n in f["networks"] if n not in ("bridge", "host", "none")):
+                    members = [a for a in docker if network in facts[a.id]["networks"]]
+                    peers = [m for m in members if m.id != side.id and m in parents]
+                    if len(members) <= SHARED_NETWORK_MAX and len(peers) == 1:
+                        found = (peers[0], f"shares the small network {network} with {peers[0].name}")
+                        break
+        if found:
+            side.parent_id = found[0].id
+            side.detected["sidecar_reason"] = found[1]
+
+
 def tier_of(app: AppRecord) -> tuple[str | None, str]:
     match = INFRA.search(app.name + " " + (app.image or ""))
     return ("infrastructure", f"name or image matches '{match.group(0).lower()}'") if match else (None, "")
@@ -240,6 +304,7 @@ async def derive(apps: list[AppRecord], facts: dict[str, dict], proxy_targets: l
         if users and app.id in facts and app.profile.tier != "infrastructure":
             app.profile.tier = "infrastructure"
             app.detected["profile_evidence"]["tier"] = "required by " + ", ".join(users[:5])
+    link_sidecars(apps, facts)
 
 
 def probe_allowed(url: str, facts: dict, host: str) -> bool:
