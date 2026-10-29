@@ -1,6 +1,9 @@
 """LAN-only Stage 1 API and pages. No install/update/exec endpoints exist."""
 from __future__ import annotations
 import asyncio
+import base64
+import binascii
+import hmac
 import os
 import re
 from contextlib import asynccontextmanager, suppress
@@ -23,6 +26,27 @@ from .autoprofile import edited_origin
 from .notifications import Notifier, is_quiet
 
 PACKAGE = Path(__file__).parent
+TOKEN_PATHS = ('/settings','/logs','/api/settings','/api/logs')
+
+
+def needs_token(request: Request) -> bool:
+    path = request.url.path.rstrip('/') or '/'
+    return (request.method not in ('GET','HEAD','OPTIONS') or path in TOKEN_PATHS
+            or path == '/api/connections' or path.startswith('/api/connections/'))
+
+
+def token_ok(request: Request, token: str) -> bool:
+    header = request.headers.get('authorization', '')
+    scheme, _, value = header.partition(' ')
+    value = value.strip()
+    if scheme.lower() == 'basic':
+        try:
+            value = base64.b64decode(value, validate=True).decode().partition(':')[2]
+        except (binascii.Error, UnicodeDecodeError):
+            return False
+    elif scheme.lower() != 'bearer':
+        return False
+    return hmac.compare_digest(value.encode(), token.encode())
 
 
 def validate_settings(data: dict, current: Settings) -> Settings:
@@ -86,6 +110,10 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
 
     @app.middleware('http')
     async def protect(request: Request, call_next):
+        token = request.app.state.manager.runtime.ui_token
+        if token and needs_token(request) and not token_ok(request, token):
+            return JSONResponse({'detail':'Authentication required'}, status_code=401,
+                                headers={'WWW-Authenticate':'Basic realm="Ripe", charset="UTF-8"'})
         try:
             if int(request.headers.get('content-length', '0')) > 262144:
                 return JSONResponse({'detail':'Request too large'}, status_code=413)

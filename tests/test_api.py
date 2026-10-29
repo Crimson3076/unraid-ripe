@@ -238,3 +238,40 @@ def test_dashboard_payload_is_small_and_detail_keeps_notes(client):
     assert all('pending' not in c and 'history' not in c for c in cards)
     assert cards[0]['tag_quotes'] == {'bugfix': '1.1.0: Fixed a search bug.'}
     assert client.get('/api/apps/a0').json()['pending'][0]['notes'] == big
+
+
+@pytest.fixture
+def locked(tmp_path):
+    runtime = Runtime(config_dir=tmp_path, disable_scheduler=True, ui_token='lan-token-secret')
+    with TestClient(create_app(runtime), base_url='http://localhost') as browser:
+        browser.app.state.manager.request_poll = lambda: False
+        yield browser
+
+
+def test_ui_token_protects_settings_and_mutations(locked):
+    for url in ('/settings', '/logs', '/api/settings', '/api/logs', '/api/connections/home-assistant'):
+        response = locked.get(url)
+        assert response.status_code == 401, url
+        assert 'lan-token-secret' not in response.text
+    assert locked.patch('/api/settings', json={'poll_hours': 24}, headers={'X-Ripe-Request': '1'}).status_code == 401
+    assert locked.post('/api/poll').status_code == 401
+    for url in ('/', '/health', '/api/dashboard'):
+        assert locked.get(url).status_code == 200, url
+
+
+def test_ui_token_accepts_bearer_and_basic(locked):
+    assert locked.get('/api/settings', headers={'Authorization': 'Bearer wrong'}).status_code == 401
+    assert locked.get('/api/settings', headers={'Authorization': 'Bearer lan-token-secret'}).status_code == 200
+    assert locked.get('/settings', auth=('anyone', 'lan-token-secret')).status_code == 200
+    assert locked.get('/settings', auth=('lan-token-secret', 'nope')).status_code == 401
+    assert locked.get('/api/settings', headers={'Authorization': 'Basic !!!'}).status_code == 401
+    ok = locked.patch('/api/settings', json={'poll_hours': 24},
+                      headers={'X-Ripe-Request': '1', 'Authorization': 'Bearer lan-token-secret'})
+    assert ok.status_code == 200
+    # CSRF check still applies after authentication.
+    assert locked.patch('/api/settings', json={'poll_hours': 12},
+                        headers={'Authorization': 'Bearer lan-token-secret'}).status_code == 403
+
+
+def test_ui_token_is_off_by_default(client):
+    assert client.get('/api/settings').status_code == 200

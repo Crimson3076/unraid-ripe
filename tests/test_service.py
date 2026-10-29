@@ -555,3 +555,44 @@ async def test_stale_exclusions_reset_outside_the_analysis_cap(tmp_path,monkeypa
         manager.close()
     assert stored['1.1.0'].classification['status']=='ok'
     assert not any(i.get('status')=='does_not_apply' for i in stored['1.1.0'].applicability)
+
+
+@pytest.mark.asyncio
+async def test_unknown_installed_version_never_classifies_beyond_the_newest_three(tmp_path,monkeypatch):
+    app,releases=_many(30,installed=None)
+    app.image_created_at=utcnow()-timedelta(days=100)
+    calls,stored=await _run(tmp_path,monkeypatch,[app],releases)
+    assert {v for _,v in calls}=={'1.28.0','1.29.0','1.30.0'}
+    assert 'installed version unknown' in stored['1.20.0'].classification['skipped']
+
+
+@pytest.mark.asyncio
+async def test_rollback_summary_sends_only_the_three_releases_at_or_below_installed(tmp_path,monkeypatch):
+    app,releases=_many(12,installed='1.8.0')
+    sent=[]
+    async def fake_rollup(app_,installed,latest,pending,settings,**kwargs):
+        sent.append((kwargs.get('prompt'),[r.version for r in pending]))
+        return {'status':'ok','installed':installed,'latest':latest,'releases':[r.version for r in pending],'groups':{},'headline':'x','prompt_version':kwargs.get('prompt')}
+    monkeypatch.setattr(service,'build_rollup',fake_rollup)
+    await _run(tmp_path,monkeypatch,[app],releases)
+    rollback=[versions for prompt,versions in sent if prompt=='rollback-v1']
+    assert rollback==[['1.6.0','1.7.0','1.8.0']]
+    assert all(v not in rollback[0] for v in ('1.1.0','1.5.0','1.9.0'))
+
+
+@pytest.mark.asyncio
+async def test_rollback_window_zero_sends_nothing(tmp_path,monkeypatch):
+    app,releases=_many(5,installed='1.4.0')
+    sent=[]
+    async def fake_rollup(*args,**kwargs):
+        sent.append(kwargs.get('prompt'))
+        return {'status':'ok','installed':'1.4.0','latest':'1.5.0','groups':{},'headline':''}
+    monkeypatch.setattr(service,'build_rollup',fake_rollup)
+    manager=Coordinator(runtime(tmp_path))
+    try:
+        settings=manager.settings().model_copy(update={'rollback_window':0})
+        for r in releases: manager.store.save_release(r)
+        await manager.refresh_rollback(app,settings,lambda: asyncio.sleep(0,True))
+    finally:
+        manager.close()
+    assert sent==[]

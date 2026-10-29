@@ -6,7 +6,7 @@ import pytest
 
 from ripe.models import AppRecord
 from ripe.sources.collector import (
-    CachedHTTP, DockerReader, SourceError, RegistryReader, github_repo,
+    CachedHTTP, DockerReader, SourceError, RegistryReader, disambiguate_ha_names, github_repo,
     github_releases, ha_records, ha_states, installed_unraid, parse_image,
     read_templates, usable_version_label,
 )
@@ -747,6 +747,31 @@ async def test_image_diff_rate_limit_keeps_last_diff_and_reports_status(monkeypa
     apps, _, _ = await _collect(monkeypatch, tmp_path, [fresh()], existing=[previous])
     assert 'rate limited' in apps[0].detected['registry_status']
     assert apps[0].detected['image_diff'] == _diff('8.3')
+
+
+def test_ha_duplicate_update_titles_are_disambiguated():
+    def state(entity, friendly, title):
+        return {"entity_id": entity, "state": "on", "attributes": {"title": title, "friendly_name": friendly, "installed_version": "1", "latest_version": "2"}}
+    states = [state("update.lamp_firmware", "Lamp Firmware", "Cync Full Color A19 Firmware"),
+              state("update.desk_firmware", "Desk Firmware", "Cync Full Color A19 Firmware"),
+              state("update.other", "Other", "Unique Title")]
+    # collect() parses one entity at a time, so mirror that here.
+    def collected(items):
+        apps = [a for s in items for a in ha_records([s], {}, {})[0]]
+        disambiguate_ha_names(apps, items)
+        return [a.name for a in apps]
+    assert collected(states) == ["Lamp Firmware", "Desk Firmware", "Unique Title"]
+    same = [state("update.a", "Dyson Device Firmware", "Dyson Device Firmware"), state("update.b", "Dyson Device Firmware", "Dyson Device Firmware")]
+    assert collected(same) == ["Dyson Device Firmware (update.a)", "Dyson Device Firmware (update.b)"]
+
+
+def test_ha_shared_friendly_names_fall_back_to_entity_ids():
+    def state(entity):
+        return {"entity_id": entity, "state": "on", "attributes": {"title": "Device Firmware", "friendly_name": "Lamp Firmware", "installed_version": "1", "latest_version": "2"}}
+    states = [state("update.a"), state("update.b")]
+    apps = [a for s in states for a in ha_records([s], {}, {})[0]]
+    disambiguate_ha_names(apps, states)
+    assert [a.name for a in apps] == ["Device Firmware (update.a)", "Device Firmware (update.b)"]
 
 
 async def test_stopped_ignored_and_merged_apps_are_not_polled(monkeypatch, tmp_path):

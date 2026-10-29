@@ -24,6 +24,10 @@ from .notifications import Notifier
 from .demo import seed_demo
 
 
+UNKNOWN_SPAN_CAP = 3
+ROLLBACK_PROMPT = 'rollback-v1'
+
+
 def rollup_latest(app: AppRecord, pending: list[Release]) -> str | None:
     return pending[-1].version if pending else app.latest_version
 
@@ -134,6 +138,9 @@ class Coordinator:
         stored = (self.store.get('rollup:' + view.app.id) or {}).get('result')
         if stored and stored.get('installed') == (view.app.installed_version or view.app.installed_digest) and stored.get('latest') == rollup_latest(view.app, view.pending):
             view.rollup = stored
+        back = (self.store.get('rollback:' + view.app.id) or {}).get('result')
+        if back and back.get('installed') == (view.app.installed_version or view.app.installed_digest):
+            view.rollback = back
         return view
 
     @staticmethod
@@ -259,6 +266,23 @@ class Coordinator:
             result['span_note'] = f'Covers the newest {len(pending)} of {total} releases; {omitted} older not analysed.'
         self.store.set('rollup:' + app.id, {'key': key if result['status'] == 'ok' else None, 'result': result})
 
+    async def refresh_rollback(self, app: AppRecord, settings: Settings, local_ready) -> None:
+        """Summarise only the newest few stable releases at or below the installed version; nothing older is sent."""
+        window = [r for r in build_view(app, self.store.releases(app.id), settings).history
+                  if not r.prerelease and not parse_version(r.version).is_prerelease][-settings.rollback_window:] if settings.rollback_window else []
+        if not window or not app.installed_version or not any(r.notes.strip() for r in window):
+            self.store.set('rollback:' + app.id, None)
+            return
+        key = rollup_key(app, app.installed_version, app.installed_version, window, None, None, settings, ROLLBACK_PROMPT)
+        stored = self.store.get('rollback:' + app.id) or {}
+        if stored.get('key') == key and stored['result'].get('status') == 'ok':
+            return
+        unavailable = 'Local model is unavailable; no summary was inferred.' if settings.classification_provider == 'local' and not await local_ready() else None
+        result = await build_rollup(app, app.installed_version, app.installed_version, window, settings,
+                                    gemini_key=self.runtime.gemini_key, model_unavailable=unavailable,
+                                    log_call=self.store.log_llm, prompt=ROLLBACK_PROMPT)
+        self.store.set('rollback:' + app.id, {'key': key if result['status'] == 'ok' else None, 'result': result})
+
     @staticmethod
     def card(view: AppView) -> dict:
         """Overview fields only; notes, history and classifications load from /api/apps/{id}."""
@@ -271,7 +295,7 @@ class Coordinator:
                 evidence = (c.get('tag_evidence') or {}).get(tag)
                 if tag not in quotes and norm(evidence) and norm(evidence) in norm(release.notes):
                     quotes[tag] = f'{release.version}: {evidence}'
-        data = view.model_dump(mode='json', exclude={'pending', 'history', 'available_notes', 'no_notes', 'rollup', 'sidecars'})
+        data = view.model_dump(mode='json', exclude={'pending', 'history', 'available_notes', 'no_notes', 'rollup', 'rollback', 'sidecars'})
         data['sidecars'] = [Coordinator.card(side) for side in view.sidecars]
         data['app']['detected'] = {k: v for k, v in data['app']['detected'].items() if k == 'mapping_hint'}
         data['tag_quotes'] = quotes
@@ -483,14 +507,16 @@ class Coordinator:
         shown = {r.id for r in build_view(app, releases, settings).pending}
         unknown_installed = parse_version(app.installed_version) is None
         pending = newest_first([r for r in releases if is_pending(r, app) and (unknown_installed or r.id in shown)])
+        # An installed version that can't be ordered means the span is unknown: classify only the newest few for context.
+        cap = min(settings.analysis_cap, UNKNOWN_SPAN_CAP) if unknown_installed else settings.analysis_cap
         for rank, release in enumerate(pending):
             if trivial_notes(release.notes):
                 release = release.model_copy(update={'classification':{'status':'unknown','tags':[],'skipped':'no notes','keyword_warnings':keyword_warnings(release.notes, [])},'classification_key':None})
                 self.store.save_release(release.model_copy(update={'applicability':conservative_applicability(release.classification)}))
                 continue
-            if rank >= settings.analysis_cap:
+            if rank >= cap:
                 if not release.classification or release.classification.get('status') != 'ok':
-                    release = release.model_copy(update={'classification':{'status':'unknown','tags':[],'skipped':f'not analysed (older than the newest {settings.analysis_cap})','keyword_warnings':keyword_warnings(release.notes, [])},'classification_key':None})
+                    release = release.model_copy(update={'classification':{'status':'unknown','tags':[],'skipped':f'not analysed (older than the newest {cap})' if not unknown_installed else f'not analysed (installed version unknown; only the newest {cap} are read)','keyword_warnings':keyword_warnings(release.notes, [])},'classification_key':None})
                     release = release.model_copy(update={'applicability':conservative_applicability(release.classification)})
                 else:
                     # Keep the classification, but don't let exclusions made under an
@@ -546,7 +572,18 @@ class Coordinator:
                     return True
             elif self.store.get('rollup:' + app.id):
                 return True
+            if self.rollback_due(app, settings):
+                return True
         return False
+
+    def rollback_due(self, app: AppRecord, settings: Settings) -> bool:
+        window = [r for r in build_view(app, self.store.releases(app.id), settings).history
+                  if not r.prerelease and not parse_version(r.version).is_prerelease][-settings.rollback_window:] if settings.rollback_window else []
+        if not window or not app.installed_version or not any(r.notes.strip() for r in window):
+            return bool(self.store.get('rollback:' + app.id))
+        key = rollup_key(app, app.installed_version, app.installed_version, window, None, None, settings, ROLLBACK_PROMPT)
+        stored = self.store.get('rollback:' + app.id) or {}
+        return stored.get('key') != key or stored['result'].get('status') != 'ok'
 
     def request_classification(self) -> bool:
         if self.demo or self.closing or (self.classify_task and not self.classify_task.done()) or not (self.queue_length() or self.rollups_due()):
@@ -596,6 +633,7 @@ class Coordinator:
                 continue
             try:
                 await self.refresh_rollup(app, settings, local_ready)
+                await self.refresh_rollback(app, settings, local_ready)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

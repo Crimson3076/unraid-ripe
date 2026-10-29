@@ -165,6 +165,10 @@ def _build_view(app: AppRecord, releases: list[Release], settings: Settings,
         signals.append("Semver major version change")
         if _DATABASE.search(f"{app.name} {app.image or ''}"):
             signals.append("Database image major version change")
+    newest_known, installed_parts = version_parts(ordered[-1].version) if ordered else None, version_parts(app.installed_version)
+    if (app.upstream_repo and newest_known and installed_parts and newest_known[0] < installed_parts[0]
+            and installed_parts[0] < 1900 and newest_known[0] < 1900):
+        signals.append(f"Probably the wrong repository: its newest release ({ordered[-1].version}) is much older than the installed {app.installed_version}")
     view = AppView(app=app, status="unknown", status_label="Unknown", latest_version=latest,
                    pending=pending, history=history, available_notes=available_notes,
                    no_notes=[r.version for r in pending if not r.notes.strip()], releases_behind=len(pending), tags=tags,
@@ -195,6 +199,9 @@ def _build_view(app: AppRecord, releases: list[Release], settings: Settings,
     if security and (target is None or compare_versions(target.version, security[-1].version) == -1):
         target = security[-1]
     view.recommended_version = target.version if target else None
+    # Releases that normalise equal (V1.07 vs v1.7.0) display with the latest's spelling.
+    if target and latest and compare_versions(target.version, latest) == 0:
+        view.recommended_version = latest
     view.next_ripe_at = deadline
     view.days_remaining = days_left
     applicable_break = any(_has_applicable(r, kind) for r in pending for kind in ("breaking", "migration"))

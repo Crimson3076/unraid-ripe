@@ -53,6 +53,7 @@ class Runtime:
     templates_dir: str = field(default_factory=lambda: os.getenv('UNRAID_TEMPLATES_DIR', '/host/templates'))
     unraid_version_file: str = field(default_factory=lambda: os.getenv('UNRAID_VERSION_FILE', '/host/unraid-version'))
     demo: bool = field(default_factory=lambda: os.getenv('RIPE_DEMO_MODE', '0') == '1')
+    ui_token: str | None = field(default_factory=lambda: os.getenv('RIPE_UI_TOKEN') or None, repr=False)
     disable_scheduler: bool = field(default_factory=lambda: os.getenv('RIPE_DISABLE_SCHEDULER', '0') == '1')
 
     def initial_settings(self) -> Settings:
@@ -65,4 +66,4 @@ class Runtime:
         )
 
     def secret_values(self) -> list[str]:
-        return [value for value in (self.ha_token, self.github_token, self.gemini_key) if value]
+        return [value for value in (self.ha_token, self.github_token, self.gemini_key, self.ui_token) if value]

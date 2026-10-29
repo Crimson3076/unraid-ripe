@@ -71,6 +71,7 @@ recipients, tokens or app profiles.
 | `DASHBOARD_URL` | Dashboard URL included in notifications | `http://localhost:8087` |
 | `TZ` | Initial scheduling timezone | `UTC` in Docker |
 | `RIPE_CONFIG_DIR` | Private Ripe data directory | `/config` |
+| `RIPE_UI_TOKEN` | Optional. When set, Settings, logs, connection endpoints and every change require it (Bearer token, or Basic password with any username). The dashboard stays open. Sent over plain HTTP, so it keeps casual LAN peers out but is not a substitute for TLS | Unset (no login) |
 | `RIPE_ALLOWED_HOSTS` | Comma-separated UI hostnames/IPs without ports | Loopback names/addresses |
 
 The Home Assistant token, GitHub token and Gemini API key can each be entered in
