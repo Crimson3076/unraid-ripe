@@ -151,6 +151,8 @@ async def build_rollup(app: AppRecord, installed: str | None, latest: str | None
         requested = [primary]
         if settings.second_opinion and public:
             requested.append('gemini' if primary == 'local' else 'local')
+        if 'gemini' in requested and not gemini_key:
+            requested = [p for p in requested if p != 'gemini'] or ['local']
         pseudo = Release(id='rollup:' + app.id, app_id=app.id, version=latest or '')
         full_notes = {r.version: r.notes for r in with_notes}
         plan = plan_chunks(with_notes, manifest)

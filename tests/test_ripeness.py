@@ -244,20 +244,20 @@ def test_keyword_coverage_warning_requires_review_without_inventing_breaking_tag
     v=build_view(app(),[r],Settings(),NOW)
     assert v.status == 'read_first'
     assert v.tags == ['bugfix']
-    assert 'Review incomplete keyword coverage/model disagreement' in v.reason
+    assert 'Review incomplete keyword coverage' in v.reason
 
 
 def test_model_disagreement_requires_review_without_inventing_breaking_tag():
-    r=release('1.1.0',30,model_disagreement=True)
+    r=release('1.1.0',30,model_disagreement=True,classification={'status':'ok','tags':['bugfix'],'provenance':[{},{}]})
     v=build_view(app(),[r],Settings(),NOW)
     assert v.status == 'read_first'
     assert v.tags == ['bugfix']
-    assert 'Review incomplete keyword coverage/model disagreement' in v.reason
+    assert 'Review model disagreement' in v.reason
 
 
 def test_latest_only_model_disagreement_requires_review():
     a=app(latest_version='1.1.0',latest_only=True,update_available=True,image_changed_at=NOW-timedelta(days=30))
-    v=build_view(a,[release('1.1.0',30,model_disagreement=True)],Settings(),NOW)
+    v=build_view(a,[release('1.1.0',30,model_disagreement=True,classification={'status':'ok','tags':['bugfix'],'provenance':[{},{}]})],Settings(),NOW)
     assert v.status == 'read_first'
     assert v.recommended_version == 'latest'
 
@@ -266,7 +266,7 @@ def test_security_still_recommended_but_keyword_coverage_caution_survives():
     r=release('1.1.0',1,classification={'tags':['security'],'security':[{'evidence':'Security fix.'}],'keyword_warnings':[{'term':'must'}]})
     v=build_view(app(),[r],Settings(),NOW)
     assert v.status == 'recommended_now'
-    assert 'Review incomplete keyword coverage/model disagreement' in v.reason
+    assert 'Review incomplete keyword coverage' in v.reason
 
 
 def test_unknown_installed_span_still_exposes_available_notes():
@@ -276,3 +276,16 @@ def test_unknown_installed_span_still_exposes_available_notes():
     assert not v.pending and not v.history
     assert v.releases_behind==0
     assert v.available_notes==[r]
+
+
+def test_review_reason_names_only_what_happened():
+    from ripe.ripeness import _review_reason
+    keyword = release('2.0.0', 20, classification={'status': 'ok', 'keyword_warnings': ['x'], 'provenance': [{}]})
+    assert _review_reason([keyword]) == 'Review incomplete keyword coverage before deciding.'
+    both = release('2.0.0', 20, model_disagreement=True,
+                   classification={'status': 'ok', 'keyword_warnings': ['x'], 'provenance': [{}, {}]})
+    assert _review_reason([both]) == 'Review model disagreement and incomplete keyword coverage before deciding.'
+    # A disagreement flag without two answering models is not a disagreement.
+    stale = release('2.0.0', 20, model_disagreement=True, classification={'status': 'ok', 'provenance': [{}]})
+    v = build_view(app('1.0.0'), [stale], Settings())
+    assert 'disagreement' not in v.reason

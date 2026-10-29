@@ -212,6 +212,10 @@ async def classify_release(release: Release, app: AppRecord, settings: Settings,
     provider_failures: list[str] = []
     if not public_notes and (settings.classification_provider == 'gemini' or settings.second_opinion):
         provider_failures.append('gemini: local-source notes are restricted to the local model')
+    if 'gemini' in requested and not gemini_key:
+        # An unconfigured provider is skipped outright: no call, no audit record,
+        # and no effect on second-opinion or disagreement statistics.
+        requested = [p for p in requested if p != 'gemini'] or ['local']
 
     async def run_provider(provider: str) -> tuple[str, dict]:
         model = settings.local_model if provider == 'local' else settings.gemini_model
