@@ -747,3 +747,16 @@ async def test_image_diff_rate_limit_keeps_last_diff_and_reports_status(monkeypa
     apps, _, _ = await _collect(monkeypatch, tmp_path, [fresh()], existing=[previous])
     assert 'rate limited' in apps[0].detected['registry_status']
     assert apps[0].detected['image_diff'] == _diff('8.3')
+
+
+def test_ha_duplicate_update_titles_are_disambiguated():
+    def state(entity, friendly, title):
+        return {"entity_id": entity, "state": "on", "attributes": {"title": title, "friendly_name": friendly, "installed_version": "1", "latest_version": "2"}}
+    states = [state("update.lamp_firmware", "Lamp Firmware", "Cync Full Color A19 Firmware"),
+              state("update.desk_firmware", "Desk Firmware", "Cync Full Color A19 Firmware"),
+              state("update.other", "Other", "Unique Title")]
+    apps, _ = ha_records(states, {}, {})
+    names = [a.name for a in apps]
+    assert names == ["Lamp Firmware", "Desk Firmware", "Unique Title"]
+    same = [state("update.a", "Dyson Device Firmware", "Dyson Device Firmware"), state("update.b", "Dyson Device Firmware", "Dyson Device Firmware")]
+    assert [a.name for a in ha_records(same, {}, {})[0]] == ["Dyson Device Firmware (update.a)", "Dyson Device Firmware (update.b)"]

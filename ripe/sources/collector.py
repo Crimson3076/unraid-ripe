@@ -6,6 +6,7 @@ import hashlib
 import ipaddress
 import json
 import re
+from collections import Counter
 import socket
 import time
 from datetime import datetime, timezone
@@ -44,7 +45,7 @@ def usable_version_label(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
     value = value.strip()
-    if not value or len(value) > 100 or value.lower() in ("latest", "unknown", "develop", "master", "main"):
+    if not value or len(value) > 100 or value.lower() in ("latest", "unknown", "develop", "master", "main", "null", "none"):
         return None
     return None if BASE_OS_LABEL.fullmatch(value) else value
 
@@ -825,6 +826,13 @@ def ha_records(states: list[JSON], notes: dict[str, str], existing: dict[str, Ap
             # HA update states do not include publication date. Do not start an
             # invented soak clock from state.last_changed or poll time.
             releases.append(Release(id=f"ha:{entity_id}:{latest}", app_id=key, version=latest, notes=str(text), source_url=url or ""))
+    # Many devices share one update title ("Cync Full Color A19 Firmware"); keep them distinguishable.
+    counts = Counter(a.name for a in apps)
+    friendly = {"ha:" + i["entity_id"]: str(i["attributes"].get("friendly_name") or "") for i in states}
+    for a in apps:
+        if counts[a.name] > 1:
+            name = friendly.get(a.id)
+            a.name = name if name and name != a.name and counts[name] == 0 else f"{a.name} ({a.detected['entity_id']})"
     return apps, releases
 
 

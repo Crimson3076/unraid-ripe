@@ -276,3 +276,20 @@ def test_unknown_installed_span_still_exposes_available_notes():
     assert not v.pending and not v.history
     assert v.releases_behind==0
     assert v.available_notes==[r]
+
+
+def test_recommendation_uses_latest_spelling_when_versions_normalize_equal():
+    v = build_view(app('1.6.0', latest_version='v1.7.0'), [release('V1.07', 30)], Settings(), NOW)
+    assert v.recommended_version == 'v1.7.0'
+
+
+def test_no_recommendation_when_candidate_normalizes_equal_to_installed():
+    v = build_view(app('v1.7.0', latest_version='v1.7.0'), [release('V1.07', 30)], Settings(), NOW)
+    assert v.recommended_version is None
+    assert v.status == 'up_to_date'
+
+
+def test_linuxserver_installed_tag_compares_with_latest():
+    v = build_view(app('12.2ubu2604-ls54', latest_version='v12.4'), [release('v12.4', 30)], Settings(), NOW)
+    assert v.status != 'unknown'
+    assert v.recommended_version == 'v12.4'

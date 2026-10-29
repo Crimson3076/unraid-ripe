@@ -26,3 +26,19 @@ def test_unknown_not_lexically_sorted(bad):
 def test_calendar_versions_are_not_semver_major_warnings():
     assert not semver_major_bump('2025.12.0','2026.1.0')
     assert semver_major_bump('5.4.0','6.0.0')
+
+
+def test_linuxserver_ubuntu_build_suffix_compares_upstream_version():
+    assert normalize_version('12.2ubu2604-ls54') == '12.2'
+    assert compare_versions('12.2ubu2604-ls54', 'v12.4') == -1
+    assert compare_versions('v12.4', '12.2ubu2604-ls54') == 1
+
+
+def test_case_and_leading_zero_minor_compare_equal():
+    assert compare_versions('V1.07', 'v1.7.0') == 0
+
+
+def test_null_version_label_is_not_a_version():
+    from ripe.sources.collector import usable_version_label
+    assert usable_version_label('null') is None
+    assert usable_version_label('None') is None

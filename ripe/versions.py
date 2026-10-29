@@ -10,6 +10,7 @@ from packaging.version import InvalidVersion, Version
 
 _PREFIX = re.compile(r"^(?:version[-_]|release[-_]|v(?=\d))", re.I)
 _LINUXSERVER = re.compile(r"(?:[-_](?:ls|linuxserver)\d+)$", re.I)
+_PACKAGING = re.compile(r"(?:ubu\d+|[-_]r\d+)$", re.I)
 _DATE = re.compile(r"^(?:RELEASE[.-])?(\d{4})[-.](\d{2})[-.](\d{2})(?:[Tt](\d{2})[-:](\d{2})[-:](\d{2})[Zz]?)?$")
 
 
@@ -17,7 +18,7 @@ def normalize_version(value: str | None) -> str | None:
     if not value:
         return None
     text = _PREFIX.sub("", value.strip())
-    text = _LINUXSERVER.sub("", text)
+    text = _PACKAGING.sub("", _LINUXSERVER.sub("", text))
     date = _DATE.fullmatch(text)
     if date:
         text = ".".join(str(int(part)) for part in date.groups() if part is not None)

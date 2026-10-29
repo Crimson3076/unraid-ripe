@@ -183,6 +183,9 @@ def _build_view(app: AppRecord, releases: list[Release], settings: Settings,
     if security and (target is None or compare_versions(target.version, security[-1].version) == -1):
         target = security[-1]
     view.recommended_version = target.version if target else None
+    # Releases that normalise equal (V1.07 vs v1.7.0) display with the latest's spelling.
+    if target and latest and compare_versions(target.version, latest) == 0:
+        view.recommended_version = latest
     view.next_ripe_at = deadline
     view.days_remaining = days_left
     applicable_break = any(_has_applicable(r, kind) for r in pending for kind in ("breaking", "migration"))
