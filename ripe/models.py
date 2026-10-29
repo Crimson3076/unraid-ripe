@@ -39,6 +39,17 @@ class AppRecord(BaseModel):
     detected: dict[str, Any] = Field(default_factory=dict)
     last_seen: datetime = Field(default_factory=utcnow)
     error: str | None = None
+    # Docker state ("running", "exited", ...); None for sources that have no such notion.
+    state: str | None = None
+    # Home Assistant grouping on the Overview: "firmware" or "cards" (HACS cards and integrations).
+    section: Literal["firmware", "cards"] | None = None
+    # A container that only supports another one (database, cache) points at its parent's id.
+    parent_id: str | None = None
+    # A Home Assistant entity folded into another one that tracks the same repository.
+    merged_into: str | None = None
+    ignored: bool = False
+    # Latest version (or digest) the user chose to hide; shown again once something newer exists.
+    ignored_version: str | None = None
 
 class Release(BaseModel):
     id: str
@@ -75,6 +86,7 @@ class Settings(BaseModel):
     classification_provider: Literal["local", "gemini"] = "local"
     second_opinion: bool = False
     demo_mode: bool = False
+    include_stopped: bool = False
     # Optional read-only internet-exposure sources; an empty path leaves them off.
     npm_database_path: str = ""
     cloudflared_config_path: str = ""
@@ -96,3 +108,16 @@ class AppView(BaseModel):
     rollup: dict[str, Any] | None = None
     reason: str = ""
     next_ripe_at: datetime | None = None
+    sidecars: list["AppView"] = Field(default_factory=list)
+
+
+def stopped(app: AppRecord) -> bool:
+    return app.state is not None and app.state.lower() in ("exited", "created", "dead")
+
+
+def hidden(app: AppRecord, settings: Settings, apps: dict[str, AppRecord]) -> bool:
+    """Not polled, not analysed and not listed: ignored, merged, stopped (unless included), or a sidecar of such an app."""
+    if app.ignored or app.merged_into or (stopped(app) and not settings.include_stopped):
+        return True
+    parent = apps.get(app.parent_id) if app.parent_id else None
+    return bool(parent and (parent.ignored or parent.merged_into or (stopped(parent) and not settings.include_stopped)))

@@ -169,6 +169,30 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         manager.request_poll()
         return {'profile':profile,'sanitized':True}
 
+    def ignore_scope(data: dict) -> str:
+        scope = data.get('scope')
+        if scope not in ('app', 'version'):
+            raise HTTPException(422, 'Choose to ignore the app or its current version')
+        return scope
+
+    @app.post('/api/apps/{app_id}/ignore')
+    async def ignore(request: Request, app_id: str, data: dict = Body(...)):
+        try:
+            record = request.app.state.manager.set_ignore(app_id, ignore_scope(data), True)
+        except KeyError:
+            raise HTTPException(404, 'App not found') from None
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from None
+        return {'ignored': record.ignored, 'ignored_version': record.ignored_version}
+
+    @app.delete('/api/apps/{app_id}/ignore')
+    async def unignore(request: Request, app_id: str, scope: str = ''):
+        try:
+            record = request.app.state.manager.set_ignore(app_id, ignore_scope({'scope': scope}), False)
+        except KeyError:
+            raise HTTPException(404, 'App not found') from None
+        return {'ignored': record.ignored, 'ignored_version': record.ignored_version}
+
     @app.post('/api/auto-profiles/review')
     async def review_auto_profiles(request:Request):
         request.app.state.manager.review_auto_profiles()
@@ -293,7 +317,10 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         except ValueError as exc:
             # Pydantic messages can echo submitted secrets; only return fixed text.
             raise HTTPException(422,'Invalid settings: use valid timezone, HH:MM times, local model URL and complete soak tiers') from None
+        was_included = manager.settings().include_stopped
         manager.store.save_settings(updated)
+        if updated.include_stopped and not was_included:
+            manager.request_poll()  # containers that were skipped need their first lookup
         return updated
 
     @app.post('/api/poll',status_code=202)
