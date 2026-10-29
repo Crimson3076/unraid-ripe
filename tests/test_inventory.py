@@ -227,6 +227,28 @@ def test_sidecars_fold_into_parent_and_raise_its_status(tmp_path):
     manager.close()
 
 
+def test_ignored_parent_version_keeps_sidecar_updates_visible(tmp_path):
+    manager = make(tmp_path)
+    add(manager, "docker:app", name="app", state="running", installed_version="1.0.0", latest_version="1.1.0", ignored_version="1.1.0")
+    add(manager, "docker:app_db", name="app_db", state="running", parent_id="docker:app", installed_version="16.1.0", latest_version="16.2.0")
+    manager.store.save_release(release("docker:app", "1.1.0"))
+    manager.store.save_release(release("docker:app_db", "16.2.0", classification={"status": "ok", "tags": ["security"], "security": [{"description": "d", "evidence": "e"}]},
+                  applicability=[{"kind": "security", "index": 0, "status": "applies", "evidence": "e", "profile_evidence": "p", "verified": True}]))
+    card = manager.dashboard()["apps"][0]
+    assert card["app"]["id"] == "docker:app" and card["status"] == "recommended_now"
+    assert [s["app"]["id"] for s in card["sidecars"]] == ["docker:app_db"]
+    manager.close()
+
+
+def test_unknown_sidecar_status_reaches_up_to_date_parent(tmp_path):
+    manager = make(tmp_path)
+    add(manager, "docker:app", name="app", state="running", installed_version="2.0.0", latest_version="2.0.0")
+    add(manager, "docker:app_db", name="app_db", state="running", parent_id="docker:app", installed_version="16.1.0", latest_version="16.2.0")
+    card = manager.dashboard()["apps"][0]
+    assert card["sidecars"][0]["status"] == "unknown" and card["status"] == "unknown"
+    manager.close()
+
+
 async def test_firmware_without_notes_never_reaches_a_model(tmp_path, monkeypatch):
     manager = make(tmp_path)
     app = add(manager, "ha:update.fw", source="home_assistant", section="firmware", installed_version="1.0.0", latest_version="1.1.0")

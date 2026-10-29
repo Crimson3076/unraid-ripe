@@ -83,10 +83,15 @@ class Notifier:
             if view.status != 'recommended_now':
                 continue
             fixes = [(r.version, (r.classification or {}).get('security', [])) for r in view.pending if (r.classification or {}).get('security')]
-            key = 'security-sent:' + hashlib.sha256(repr((view.app.id, fixes)).encode()).hexdigest()
+            # A sidecar's security fix raised this card; key on it so each new one alerts once.
+            side_fixes = [(side.app.id, r.version, (r.classification or {}).get('security', [])) for side in view.sidecars
+                          if side.status == 'recommended_now' for r in side.pending if (r.classification or {}).get('security')]
+            key = 'security-sent:' + hashlib.sha256(repr((view.app.id, fixes, side_fixes) if side_fixes else (view.app.id, fixes)).encode()).hexdigest()
             if self.store.get(key):
                 continue
-            if await self.send(settings, f'{view.app.name}: applicable security fix available. Review {view.recommended_version or "the release notes"}; no update has been performed.', 'ripe-security-' + hashlib.sha256(view.app.id.encode()).hexdigest()[:12], now=now):
+            names = sorted({side.app.name for side in view.sidecars if side.status == 'recommended_now'})
+            who = view.app.name + (f' ({", ".join(names)})' if names and not fixes else '')
+            if await self.send(settings, f'{who}: applicable security fix available. Review {view.recommended_version or "the release notes"}; no update has been performed.', 'ripe-security-' + hashlib.sha256(view.app.id.encode()).hexdigest()[:12], now=now):
                 self.store.set(key, now.isoformat())
         if self.store.get('digest-sent-for') != due_key:
             if await self.send(settings, digest_text(views), 'ripe-weekly', now=now):

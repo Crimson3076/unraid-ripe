@@ -153,13 +153,21 @@ class Coordinator:
                 ignored.append({'id': view.app.id, 'name': view.app.name, 'scope': 'version', 'version': view.app.ignored_version})
             elif view.app.parent_id not in built:
                 cards.append(view)
+        attention = ('recommended_now', 'read_first', 'unknown', 'waiting', 'ripe')
         for view in built.values():
             parent = built.get(view.app.parent_id) if view.app.parent_id else None
-            if parent is None or view.app.id in quiet or parent.app.id in quiet:
+            if parent is None or view.app.id in quiet:
                 continue
+            if parent.app.id in quiet:
+                # Only the parent's version was ignored: a sidecar that needs attention brings the card back.
+                if view.status not in attention:
+                    continue
+                if parent not in cards:
+                    parent.status, parent.status_label, parent.reason = 'up_to_date', 'Up to date', ''
+                    cards.append(parent)
             parent.sidecars.append(view)
             # A sidecar's update is the parent's update: its status can only raise the card's.
-            if view.status in ('recommended_now', 'read_first', 'ripe', 'waiting') and _STATUS_ORDER[view.status] < _STATUS_ORDER.get(parent.status, 99):
+            if view.status in attention and _STATUS_ORDER[view.status] < _STATUS_ORDER.get(parent.status, 99):
                 parent.status, parent.status_label = view.status, view.status_label
                 parent.reason = f'{view.app.name}: {view.reason}'
                 parent.days_remaining, parent.next_ripe_at = view.days_remaining, view.next_ripe_at

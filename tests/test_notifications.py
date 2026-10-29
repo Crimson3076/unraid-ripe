@@ -173,3 +173,18 @@ async def test_first_run_seeds_digest_instead_of_sending(store):
     assert store.get('digest-sent-for') == '2026-10-26'
     await notifier.tick(settings, [], now=instant('2026-11-02T12:00:00Z'))
     assert len(calls) == 1
+
+
+async def test_sidecar_security_fixes_alert_separately(store):
+    calls, transport = recorder()
+    notifier = Notifier(store, 'http://homeassistant.local:8123', 'test-ha-secret', transport=transport)
+    settings = configured_settings(timezone='UTC', quiet_start='00:00', quiet_end='00:00')
+    def view(version):
+        side = AppView(app=AppRecord(id='docker:db', name='db', source='docker'), status='recommended_now', status_label='Recommended now',
+                       pending=[Release(id='docker:db:'+version, app_id='docker:db', version=version, notes='n', classification={'security': [{'description': 'd'}]})])
+        return AppView(app=AppRecord(id='docker:app', name='app', source='docker'), status='recommended_now', status_label='Recommended now', sidecars=[side])
+    now = instant('2026-10-27T12:00:00Z')
+    for version in ('16.2.0', '16.2.0', '16.3.0'):
+        await notifier.tick(settings, [view(version)], now=now)
+    store.set('digest-sent-for', Notifier.digest_due_key(settings, now))
+    assert len([c for c in calls if b'ripe-security' in c.content]) == 2
