@@ -191,3 +191,23 @@ async def test_queue_runs_exposed_then_security_then_newest(tmp_path,monkeypatch
     for r in infra_r: r.id=r.id.replace('big','infra')
     calls,_=await _run(tmp_path,monkeypatch,[plain,sec,infra],plain_r+sec_r+infra_r)
     assert [c for c in calls]==[('infra','1.2.0'),('infra','1.1.0'),('sec','1.2.0'),('sec','1.1.0'),('plain','1.2.0'),('plain','1.1.0')]
+
+
+@pytest.mark.asyncio
+async def test_prereleases_do_not_consume_the_analysis_cap(tmp_path,monkeypatch):
+    app,releases=_many(2)
+    for i in range(20):
+        beta=releases[1].model_copy(update={'id':f'big-beta{i}','version':f'2.0.0b{i}','prerelease':True})
+        releases.append(beta)
+    calls,_=await _run(tmp_path,monkeypatch,[app],releases)
+    assert {v for _,v in calls}=={'1.1.0','1.2.0'}
+
+
+@pytest.mark.asyncio
+async def test_short_security_notes_keep_keyword_warnings(tmp_path,monkeypatch):
+    app,releases=_many(2)
+    releases[0].notes='Fix CVE-2026-1234'
+    releases[1].notes='Small fix'
+    calls,stored=await _run(tmp_path,monkeypatch,[app],releases)
+    assert calls==[]
+    assert stored['1.1.0'].classification['keyword_warnings']

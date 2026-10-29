@@ -16,7 +16,7 @@ from .intelligence import (classify_release, analyze_applicability, sanitize_pro
                            prompt_digest, build_rollup, rollup_key)
 from .intelligence.evidence import conservative_applicability, keyword_warnings
 from .ripeness import build_view, dashboard_sort_key
-from .versions import compare_versions
+from .versions import compare_versions, parse_version
 from .analysis_queue import is_pending, newest_first, priority, trivial_notes
 from .notifications import Notifier
 from .demo import seed_demo
@@ -270,7 +270,11 @@ class Coordinator:
                         evidence.pop('upstream_repo', None)
                     app.detected['profile_evidence'] = evidence
                     self.store.save_app(app)
-                    pending = newest_first([r for r in by_app.get(app.id, []) if is_pending(r, app)])
+                    # Same channel and latest-version ceiling as the dashboard span, so betas
+                    # or releases above an authoritative latest don't use up the cap.
+                    shown = {r.id for r in build_view(app, by_app.get(app.id, []), settings).pending}
+                    unknown_installed = parse_version(app.installed_version) is None
+                    pending = newest_first([r for r in by_app.get(app.id, []) if is_pending(r, app) and (unknown_installed or r.id in shown)])
                     analysed = {r.id: rank for rank, r in enumerate(pending[:settings.analysis_cap])}
                     for release in by_app.get(app.id, []):
                         if self.store.get('generation:' + app.id, 0) != generation:
@@ -287,7 +291,7 @@ class Coordinator:
                             self.store.save_release(release)
                             continue
                         if trivial_notes(release.notes):
-                            release.classification = {'status':'unknown','tags':[],'skipped':'no notes','keyword_warnings':[]}
+                            release.classification = {'status':'unknown','tags':[],'skipped':'no notes','keyword_warnings':keyword_warnings(release.notes, [])}
                             release.classification_key = None
                             release.applicability = conservative_applicability(release.classification)
                             self.store.save_release(release)
