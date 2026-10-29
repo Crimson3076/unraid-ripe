@@ -26,27 +26,29 @@ from .autoprofile import edited_origin
 from .notifications import Notifier, is_quiet
 
 PACKAGE = Path(__file__).parent
-TOKEN_PATHS = ('/settings','/logs','/api/settings','/api/logs')
-
-
-def needs_token(request: Request) -> bool:
-    path = request.url.path.rstrip('/') or '/'
-    return (request.method not in ('GET','HEAD','OPTIONS') or path in TOKEN_PATHS
-            or path == '/api/connections' or path.startswith('/api/connections/'))
+# Read-only pages that stay open when RIPE_UI_TOKEN is set; everything else needs the token.
+OPEN_READS = ('/', '/health', '/static', '/apps', '/api/dashboard', '/api/apps', '/api/poll/status')
 
 
 def token_ok(request: Request, token: str) -> bool:
-    header = request.headers.get('authorization', '')
-    scheme, _, value = header.partition(' ')
+    """Accept the token as a Bearer token or as the HTTP Basic password (any username)."""
+    kind, _, value = request.headers.get('authorization', '').partition(' ')
     value = value.strip()
-    if scheme.lower() == 'basic':
+    if kind.lower() == 'basic':
         try:
             value = base64.b64decode(value, validate=True).decode().partition(':')[2]
         except (binascii.Error, UnicodeDecodeError):
             return False
-    elif scheme.lower() != 'bearer':
+    elif kind.lower() != 'bearer':
         return False
     return hmac.compare_digest(value.encode(), token.encode())
+
+
+def needs_token(request: Request) -> bool:
+    if request.method not in ('GET', 'HEAD', 'OPTIONS'):
+        return True
+    path = request.url.path
+    return not any(path == p or path.startswith(p + '/') for p in OPEN_READS)
 
 
 def validate_settings(data: dict, current: Settings) -> Settings:
