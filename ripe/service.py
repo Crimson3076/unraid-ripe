@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import time
 from collections import Counter
 from datetime import datetime
 from typing import Any
@@ -11,6 +12,7 @@ from .config import Runtime
 from .models import AppRecord, AppView, Profile, Release, Settings, utcnow
 from .autoprofile import AUTO_FIELDS, merge_profile
 from .store import Store
+from .progress import PollProgress
 from .sources import collect
 from .intelligence import (classify_release, analyze_applicability, sanitize_profile, classification_key,
                            prompt_digest, build_rollup, rollup_key)
@@ -48,6 +50,7 @@ class Coordinator:
         self.demo = False
         self.store = self.real_store
         self.polling = False
+        self.progress = PollProgress()
         self.closing = False
         self.lock = asyncio.Lock()
         self.task: asyncio.Task | None = None
@@ -181,7 +184,7 @@ class Coordinator:
                 'summary': {s:counts[s] for s in ('ripe','waiting','recommended_now','read_first','up_to_date','unknown')},
                 'last_poll':self.store.get('last_poll'), 'polling': self.polling,
                 'integration_status': self.integration_status(), 'timezone':self.settings().timezone,
-                'auto_profiles': self.auto_profiles(), 'analysis': self.store.get('analysis_progress')}
+                'auto_profiles': self.auto_profiles(), 'analysis': self.store.get('analysis_progress'), 'poll': self.progress.snapshot()}
 
     def auto_profiles(self) -> list[dict]:
         """Apps Ripe filled in by itself that the user has not yet acknowledged."""
@@ -225,8 +228,12 @@ class Coordinator:
         if self.demo or self.polling or (self.poll_task and not self.poll_task.done()):
             return False
         self.polling = True
+        self.progress.start()
         self.poll_task = asyncio.create_task(self.poll())
         return True
+
+    def poll_status(self) -> dict:
+        return self.progress.snapshot()
 
     def mark_changed(self, app_id: str):
         self.store.set('generation:' + app_id, self.store.get('generation:' + app_id, 0) + 1)
@@ -238,6 +245,9 @@ class Coordinator:
             return
         async with self.lock:
             self.polling = True
+            if not self.progress.running:
+                self.progress.start()
+            failure = None
             try:
                 settings = self.settings()
                 prior_apps = self.store.apps()
@@ -246,7 +256,10 @@ class Coordinator:
                     ha_token=self.runtime.ha_token, ha_url=self.runtime.ha_url,
                     docker_socket=self.runtime.docker_socket, templates_dir=self.runtime.templates_dir,
                     unraid_version_file=self.runtime.unraid_version_file,
-                    cache_get=self.store.get, cache_set=self.store.set, existing_apps=self.store.apps())
+                    cache_get=self.store.get, cache_set=self.store.set, existing_apps=self.store.apps(),
+                    progress=self.progress)
+                self.progress.end_collecting()
+                self.progress.add_errors(errors)
                 for error in errors:
                     self.store.log_error(error)
                 by_app: dict[str,list[Release]] = {}
@@ -254,6 +267,7 @@ class Coordinator:
                     by_app.setdefault(release.app_id, []).append(release)
                 local_ready = None
                 queue: list = []
+                skipped = 0
                 refresh: list = []
                 for app in apps:
                     generation = generations.get(app.id, 0)
@@ -295,6 +309,7 @@ class Coordinator:
                             release.classification_key = None
                             release.applicability = conservative_applicability(release.classification)
                             self.store.save_release(release)
+                            skipped += 1
                             continue
                         if release.id not in analysed:
                             if not release.classification or release.classification.get('status') != 'ok':
@@ -311,14 +326,19 @@ class Coordinator:
                                 else:
                                     release.applicability = conservative_applicability(release.classification)
                             self.store.save_release(release)
+                            skipped += 1
                             continue
                         queue.append((priority(app, release, analysed[release.id]), len(queue), app, release, generation))
                     refresh.append((app, generation))
                 queue.sort(key=lambda item: item[:2])
                 self.store.set('analysis_progress', {'done': 0, 'total': len(queue)})
+                self.progress.begin_analysis(len(queue), skipped)
                 for done, (_, _, app, release, generation) in enumerate(queue):
                     if self.store.get('generation:' + app.id, 0) != generation:
+                        self.progress.release_done(app.name)
                         continue
+                    self.progress.working_on(app.name)
+                    started, called = time.monotonic(), False
                     key = classification_key(release, app, settings)
                     cached = self.store.get('classification:' + key)
                     if cached and (cached.get('classification') or {}).get('status') == 'ok':
@@ -331,6 +351,7 @@ class Coordinator:
                             release.classification_key = key
                         else:
                             release.classification = None
+                            called = True
                             release = await classify_release(release, app, settings, gemini_key=self.runtime.gemini_key,log_call=self.store.log_llm)
                         self.store.set('classification:' + key, {'classification':release.classification,'classification_key':release.classification_key, 'model_disagreement':release.model_disagreement})
                     profile_key = fingerprint([app.profile.model_dump(exclude={'origin'}),release.classification_key,settings.local_model,settings.ollama_url,prompt_digest()])
@@ -341,15 +362,18 @@ class Coordinator:
                         if local_ready is None:
                             local_ready = await self.local_ready(settings)
                         if local_ready:
+                            called = True
                             release = await analyze_applicability(release,app,settings,log_call=self.store.log_llm)
                         else:
                             release.applicability = conservative_applicability(release.classification)
                         self.store.set('applicability:' + profile_key,release.applicability)
+                    self.progress.release_done(app.name, time.monotonic() - started if called else None)
                     if self.store.get('generation:' + app.id, 0) != generation:
                         continue
                     self.store.save_release(release)
                     self.store.set('analysis_progress', {'done': done + 1, 'total': len(queue)})
                 self.store.set('analysis_progress', None)
+                self.progress.begin_summaries()
                 for app, generation in refresh:
                     if self.store.get('generation:' + app.id, 0) == generation:
                         async def ready():
@@ -376,14 +400,18 @@ class Coordinator:
                 self.store.prune_errors()
                 await self.notify()
             except asyncio.CancelledError:
+                failure = 'Check was interrupted.'
                 raise
             except Exception as exc:
                 # External response bodies/exception strings can contain secrets.
-                self.store.log_error({'source':'collector','message':f'Collection failed ({type(exc).__name__}); last known records preserved.'})
+                failure = f'Collection failed ({type(exc).__name__}); last known records preserved.'
+                self.store.log_error({'source':'collector','message':failure})
             finally:
+                self.progress.finish(failure)
                 self.polling = False
                 if not self.closing and self.store.get('poll_again'):
                     self.store.set('poll_again',False)
+                    self.progress.start()
                     self.poll_task = asyncio.create_task(self.poll())
 
     async def notify(self):

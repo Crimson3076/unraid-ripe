@@ -119,12 +119,92 @@
       renderGroups();renderIntegrations(data.integration_status);renderAutoProfiles(data.auto_profiles||[]);clearError('#dashboard-error');
     } catch(e) {if(!quiet){$('#app-groups').innerHTML='';errorAt('#dashboard-error',e);}}
   }
+  const phaseNames={collecting:'Collecting sources',analysing:'Analysing releases',summarising:'Writing summaries'};
+  let refreshPoll=async()=>{};
+  function pollPercent(s) {
+    if(s.phase==='collecting'){const t=s.sources?.total||0;return t?Math.min(100,Math.round(100*s.sources.done/t)):null;}
+    if(s.phase==='analysing'){const t=s.releases?.total||0;return t?Math.min(100,Math.round(100*s.releases.done/t)):100;}
+    return 100;
+  }
+  function etaText(seconds) {
+    if(!Number.isFinite(seconds))return '';
+    return seconds<60?'less than a minute left':`about ${Math.round(seconds/60)} min left`;
+  }
+  function pollLine(s) {
+    const parts=[phaseNames[s.phase]||'Checking'];
+    const c=s.phase==='collecting'?s.sources:s.phase==='analysing'?s.releases:null;
+    if(c?.total)parts.push(`${c.done} of ${c.total}`);
+    if(s.current)parts.push(s.current);
+    const eta=s.phase==='analysing'?etaText(s.eta_seconds):'';
+    if(eta)parts.push(eta);
+    return parts.join(' · ');
+  }
+  function pollPanel(s) {
+    const errors=s.errors||[];
+    return `<dl><dt>Phase</dt><dd>${h(phaseNames[s.phase]||(s.last_error?'Stopped':'Finished'))}</dd><dt>Sources</dt><dd>${h(s.sources?.done??0)} of ${h(s.sources?.total??0)}</dd><dt>Releases</dt><dd>${h(s.releases?.done??0)} of ${h(s.releases?.total??0)}</dd><dt>Skipped</dt><dd>${h(s.releases?.skipped??0)} (older than the analysis cap, or no notes)</dd><dt>Current</dt><dd>${h(s.current||'—')}</dd></dl>${s.last_error?`<h4>Check stopped</h4><p>${h(s.last_error)}</p>`:''}<h4>Errors so far</h4>${errors.length?`<ul>${errors.map(e=>`<li><strong>${h(e.source)}</strong>: ${h(e.message)}</li>`).join('')}</ul>`:'<p class="muted">None.</p>'}`;
+  }
+  function initProgress() {
+    const strip=$('#poll-strip');if(!strip)return;
+    const bar=$('#poll-bar'),fill=$('#poll-bar-fill'),line=$('#poll-line'),panel=$('#poll-panel'),toggle=$('#poll-strip-toggle'),logs=$('#poll-logs-link'),dismiss=$('#poll-dismiss');
+    let last=null,timer,hideTimer,wasRunning=false;
+    const dismissKey='ripe-poll-dismissed';
+    const dismissed=()=>{try{return sessionStorage.getItem(dismissKey);}catch{return null;}};
+    const setBar=pct=>{
+      bar.classList.toggle('indeterminate',pct===null);
+      if(pct===null){bar.removeAttribute('aria-valuenow');fill.style.width='';}
+      else{bar.setAttribute('aria-valuenow',String(pct));fill.style.width=pct+'%';}
+    };
+    const setButton=s=>{
+      const button=$('#poll-button');if(!button)return;
+      if(s.running){
+        const pct=pollPercent(s);
+        button.disabled=true;button.setAttribute('aria-disabled','true');button.setAttribute('aria-busy','true');
+        button.innerHTML=`<span class="spinner" aria-hidden="true"></span>Checking…${pct===null?'':' '+pct+'%'}`;
+      }else if(button.getAttribute('aria-busy')==='true'){
+        button.disabled=false;button.removeAttribute('aria-disabled');button.removeAttribute('aria-busy');
+        button.innerHTML='<span data-icon="refresh"></span>Check for updates';hydrateIcons(button);
+      }
+    };
+    const hide=()=>{clearTimeout(hideTimer);strip.hidden=true;strip.dataset.state='idle';strip.classList.remove('fading');panel.hidden=true;toggle.setAttribute('aria-expanded','false');};
+    const show=state=>{clearTimeout(hideTimer);strip.hidden=false;strip.dataset.state=state;strip.classList.remove('fading');logs.hidden=dismiss.hidden=state!=='failed';};
+    function render(s) {
+      last=s;setButton(s);
+      if(s.running){
+        show('running');setBar(pollPercent(s));line.textContent=pollLine(s);
+      }else if(s.last_error){
+        if(dismissed()===(s.finished_at||'x')){hide();}
+        else{show('failed');setBar(100);line.textContent=`Check stopped: ${s.last_error}`;}
+      }else if(wasRunning){
+        show('done');setBar(100);line.textContent='Update check finished';
+        hideTimer=setTimeout(()=>{strip.classList.add('fading');hideTimer=setTimeout(hide,600);},3000);
+      }else if(strip.dataset.state!=='done'){
+        hide();
+      }
+      if(!panel.hidden)panel.innerHTML=pollPanel(s);
+      if(wasRunning&&!s.running)document.dispatchEvent(new CustomEvent('ripe:poll-finished',{detail:s}));
+      wasRunning=Boolean(s.running);
+    }
+    function schedule() {
+      clearTimeout(timer);
+      timer=setTimeout(()=>{if(document.hidden&&!last?.running)schedule();else refresh();},last?.running?2000:30000);
+    }
+    async function refresh() {
+      try{render(await api('/api/poll/status'));}catch{}
+      schedule();
+    }
+    toggle.addEventListener('click',()=>{panel.hidden=!panel.hidden;toggle.setAttribute('aria-expanded',String(!panel.hidden));if(!panel.hidden&&last)panel.innerHTML=pollPanel(last);});
+    dismiss.addEventListener('click',()=>{try{sessionStorage.setItem(dismissKey,last?.finished_at||'x');}catch{}hide();});
+    document.addEventListener('visibilitychange',()=>{if(!document.hidden)refresh();});
+    refreshPoll=refresh;
+    refresh();
+  }
   function initDashboard() {
+    document.addEventListener('ripe:poll-finished',()=>loadDashboard(true));
     $$('[data-filter]').forEach(button=>button.addEventListener('click',()=>{filter=button.dataset.filter;renderGroups();}));
     const openHint=e=>{const hint=e.target.closest?.('.mapping-hint');if(!hint||(e.type==='keydown'&&e.key!=='Enter')||(e.type==='auxclick'&&e.button!==1))return;e.preventDefault();e.stopPropagation();if(e.ctrlKey||e.metaKey||e.shiftKey||e.type==='auxclick')window.open(hint.dataset.href,'_blank','noopener');else location.href=hint.dataset.href;};
     $('#app-groups').addEventListener('click',openHint);$('#app-groups').addEventListener('auxclick',openHint);$('#app-groups').addEventListener('keydown',openHint);
     $('#app-search').addEventListener('input',e=>{appSearch=e.target.value.toLowerCase().trim();renderGroups();});
-    $('#poll-button').onclick=async()=>{const button=$('#poll-button');button.disabled=true;try{const result=await api('/api/poll',{method:'POST'});toast(result.message || (result.status==='demo'?'Demo mode uses sample data and does not scan your homelab.':result.status==='already running'?'An update check is already running.':'Update check started. This may take a little while.'));setTimeout(()=>loadDashboard(true),1500);}catch(e){errorAt('#dashboard-error',e);}finally{button.disabled=false;}};
+    $('#poll-button').onclick=async()=>{const button=$('#poll-button');if(button.getAttribute('aria-busy')==='true')return;button.disabled=true;try{const result=await api('/api/poll',{method:'POST'});toast(result.message || (result.status==='demo'?'Demo mode uses sample data and does not scan your homelab.':result.status==='already running'?'An update check is already running.':'Update check started. This may take a little while.'));await refreshPoll();}catch(e){errorAt('#dashboard-error',e);}finally{if(button.getAttribute('aria-busy')!=='true')button.disabled=false;}};
     $('#demo-button').onclick=async()=>{const button=$('#demo-button');button.disabled=true;try{await api('/api/demo',{method:'POST'});filter='all';await loadDashboard();toast('Exploring synthetic examples. No live actions or notifications.');}catch(e){errorAt('#dashboard-error',e);}finally{button.disabled=false;}};
     loadDashboard();setInterval(()=>{if(!document.hidden)loadDashboard(true);},30000);
   }
@@ -344,12 +424,12 @@
     const setTheme=value=>{document.documentElement.dataset.theme=value;$('#theme-toggle').innerHTML=icon(value==='dark'?'sun':'moon');$('#theme-toggle').setAttribute('aria-label',`Switch to ${value==='dark'?'light':'dark'} theme`);};
     setTheme(theme);$('#theme-toggle').onclick=()=>{const next=document.documentElement.dataset.theme==='dark'?'light':'dark';setTheme(next);try{localStorage.setItem('ripe-theme',next);}catch{}};
   }
-  hydrateIcons();initTheme();
+  hydrateIcons();initTheme();initProgress();
   const active=page==='app'?'dashboard':page;
   const link=$(`[data-nav="${active}"]`);if(link){link.classList.add('active');link.setAttribute('aria-current','page');}
   text('#breadcrumb-page',{dashboard:'Overview',settings:'Settings',logs:'Activity & logs',app:'Application'}[page]||'Overview');
   if(page==='dashboard')initDashboard();
   if(page==='app')loadDetail();
   if(page==='settings')initSettings();
-  if(page==='logs'){loadLogs();$('#refresh-logs').onclick=loadLogs;}
+  if(page==='logs'){document.addEventListener('ripe:poll-finished',loadLogs);loadLogs();$('#refresh-logs').onclick=loadLogs;}
 })();
