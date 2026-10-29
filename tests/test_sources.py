@@ -389,6 +389,15 @@ async def test_long_unparseable_history_is_not_an_error():
     assert len(releases) == 1000
 
 
+async def test_exhausted_page_limit_with_versions_is_an_error():
+    def handler(request):
+        page = int(request.url.params['page'])
+        return httpx.Response(200, json=[_gh(f'1.0.{(11 - page) * 100 - i}') for i in range(100)])
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(SourceError):
+            await github_releases(CachedHTTP(client), 'o/a', 'docker:a', None, '0.9.0')
+
+
 async def test_404_mapping_flagged_once_and_not_retried(monkeypatch, tmp_path):
     from ripe.sources import collector
     hits = []
@@ -411,6 +420,14 @@ async def test_404_mapping_flagged_once_and_not_retried(monkeypatch, tmp_path):
     # A token change or an expired flag retries too.
     hits.clear()
     await _collect_404(monkeypatch, tmp_path, [make()], hits, existing=[flagged], token='x')
+    assert hits
+    # Replacing one token with another also retries, and the token is never stored.
+    hits.clear()
+    first = await _collect_404(monkeypatch, tmp_path, [make()], hits, token='tok-one')
+    stored = next(a for a in first[0] if a.id == 'docker:tdarr')
+    assert 'tok-one' not in str(stored.detected)
+    hits.clear()
+    await _collect_404(monkeypatch, tmp_path, [make()], hits, existing=[stored], token='tok-two')
     assert hits
     hits.clear()
     stale = flagged.model_copy(deep=True)

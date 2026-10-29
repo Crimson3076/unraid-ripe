@@ -133,6 +133,11 @@ PARSE_ERRORS = (AttributeError, TypeError, ValueError, KeyError)
 
 
 MAPPING_RETRY_SECONDS = 6 * 3600
+
+
+def token_fingerprint(token: str | None) -> str:
+    # Non-reversible tag so a replaced token retries a flagged mapping without storing the token.
+    return hashlib.sha256(("ripe-mapping:" + token).encode()).hexdigest()[:12] if token else ""
 MAPPING_ERROR = "GitHub: mapping needs attention (repository not found)"
 
 
@@ -663,13 +668,12 @@ async def github_releases(http: CachedHTTP, repo: str, app_id: str, token: str |
             known = [k for r in releases if (k := version_parts(r.version))]
             if target and known and min(known) < target and any(len(k)>=3 and k[:2]==target[:2] and k[2]==0 for k in known):
                 break
-            # GitHub orders by creation date, so a late backport can sit above newer
-            # minors. Only stop once a whole page is older than the installed minor.
-            page_keys = [k for item in data if isinstance(item, dict) and isinstance(item.get("tag_name"), str) and (k := version_parts(item["tag_name"]))]
-            if target and page_keys and all(k[:2] < target[:2] for k in page_keys):
-                break
-    # Intentional: a history longer than 10 pages is truncated silently, not an error.
-    # Only releases near the installed version matter; older ones cannot be pending.
+    else:
+        # Page limit reached without proving coverage of the pending span. Creation order is not
+        # version order, so dropped pages could hold pending releases; do not report "up to date".
+        # A history with no parseable versions has nothing to mis-rank, so it is not an error.
+        if any(version_parts(r.version) for r in releases):
+            raise SourceError("GitHub: release history exceeded 1000 records; narrow repository mapping or inspect manually")
     return releases
 
 
@@ -943,7 +947,7 @@ async def collect(settings: Settings, *, github_token: str | None = None, ha_tok
                     error(app.id, "Registry: parse error")
             flagged = (existing[app.id].detected.get("invalid_mapping") if app.id in existing else None) or {}
             if app.upstream_repo and str(flagged.get("repo", "")).lower() == app.upstream_repo.lower() \
-                    and flagged.get("token") == bool(github_token) and time.time() - float(flagged.get("at") or 0) < MAPPING_RETRY_SECONDS:
+                    and flagged.get("token") == token_fingerprint(github_token) and time.time() - float(flagged.get("at") or 0) < MAPPING_RETRY_SECONDS:
                 # Known to 404: keep the flag until the mapping or token changes, or the retry window passes.
                 app.detected["invalid_mapping"] = flagged
                 app.error = MAPPING_ERROR
@@ -989,7 +993,7 @@ async def collect(settings: Settings, *, github_token: str | None = None, ha_tok
                         app.detected.get("profile_evidence", {}).pop("upstream_repo", None)
                         app.detected["mapping_hint"] = "Detected upstream repository was not found; choose one in the app profile"
                     else:
-                        app.detected["invalid_mapping"] = {"repo": app.upstream_repo, "status": 404, "at": time.time(), "token": bool(github_token), "suggestion": mapping_suggestion(app)}
+                        app.detected["invalid_mapping"] = {"repo": app.upstream_repo, "status": 404, "at": time.time(), "token": token_fingerprint(github_token), "suggestion": mapping_suggestion(app)}
                         app.error = MAPPING_ERROR
                         error(app.id, f"GitHub: {app.upstream_repo} not found (HTTP 404); mapping needs attention")
                 except SourceError as exc:
