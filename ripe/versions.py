@@ -12,8 +12,10 @@ _PREFIX = re.compile(r"^(?:version[-_]|release[-_]|v(?=\d))", re.I)
 _LINUXSERVER = re.compile(r"(?:[-_](?:ls|linuxserver)\d+)$", re.I)
 # Monorepo tags such as "n8n@1.2.3" or "@scope/pkg@1.2.3" carry the package name before the version.
 _PACKAGE = re.compile(r"^(?:@?[\w.-]+(?:/[\w.-]+)?)@(?=v?\d)")
+# Segments exclude '-' and '_' so each separator can only match one way (no catastrophic backtracking).
 # Image build flavours that follow the app version: -python3.13-alpine3.23, -r0-ls237, -bookworm-slim.
-_BUILD = re.compile(r"(?:[-_](?:py(?:thon)?\d[\w.]*|alpine[\d.]*|debian[\d.]*|ubuntu[\d.]*|bookworm|bullseye|trixie|jammy|noble|slim|r\d+|(?:ls|linuxserver)\d+))+$", re.I)
+_BUILD = re.compile(r"(?:[-_](?:py(?:thon)?\d[\d.]*|alpine[\d.]*|debian[\d.]*|ubuntu[\d.]*|bookworm|bullseye|trixie|jammy|noble|slim|r\d+|(?:ls|linuxserver)\d+))+$", re.I)
+_MAX_TAG = 128
 _DATE = re.compile(r"^(?:RELEASE[.-])?(\d{4})[-.](\d{2})[-.](\d{2})(?:[Tt](\d{2})[-:](\d{2})[-:](\d{2})[Zz]?)?$")
 
 
@@ -22,7 +24,8 @@ def normalize_version(value: str | None) -> str | None:
         return None
     text = _PACKAGE.sub("", value.strip())
     text = _PREFIX.sub("", text)
-    text = _BUILD.sub("", text)
+    if len(text) <= _MAX_TAG:  # real tags are short; this bounds the unanchored scan
+        text = _BUILD.sub("", text)
     text = _LINUXSERVER.sub("", text)
     date = _DATE.fullmatch(text)
     if date:

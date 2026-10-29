@@ -26,3 +26,10 @@ def test_unknown_not_lexically_sorted(bad):
 def test_calendar_versions_are_not_semver_major_warnings():
     assert not semver_major_bump('2025.12.0','2026.1.0')
     assert semver_major_bump('5.4.0','6.0.0')
+
+
+def test_build_suffix_pattern_does_not_backtrack_catastrophically():
+    import time
+    start = time.perf_counter()
+    normalize_version('1.0.0-py9' + '_py0' * 5000 + '!')
+    assert time.perf_counter() - start < 1

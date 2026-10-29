@@ -13,6 +13,7 @@ from .service import (CHUNK_SIZE, MAX_NOTES, LLMUnavailable, LogCall, _prompt, _
 ROLLUP_PROMPT = 'rollup-v1'
 REDUCE_PROMPT = 'rollup-reduce-v1'
 ROLLBACK_PROMPT = 'rollback-v1'
+ROLLBACK_REDUCE_PROMPT = 'rollback-reduce-v1'
 GROUPS = ('action', 'security', 'features', 'fixes', 'under_the_hood')
 LABELS = {'action': 'What you need to do', 'security': 'Security', 'features': 'New features',
           'fixes': 'Fixes', 'under_the_hood': 'Under the hood'}
@@ -44,11 +45,15 @@ def image_items(diff: list[dict] | None) -> list[dict]:
     return items
 
 
+def _reduce_prompt(prompt: str) -> str:
+    return ROLLBACK_REDUCE_PROMPT if prompt == ROLLBACK_PROMPT else REDUCE_PROMPT
+
+
 def rollup_key(app: AppRecord, installed: str | None, latest: str | None, pending: list[Release],
                image_diff: list[dict] | None, manifest: list[dict] | None, settings: Settings,
                prompt: str = ROLLUP_PROMPT) -> str:
     """Per (app, installed, latest) plus the inputs those versions imply and the model setup."""
-    values = [app.id, str(installed), str(latest), str(app.latest_digest), prompt, _prompt(prompt), _prompt(REDUCE_PROMPT),
+    values = [app.id, str(installed), str(latest), str(app.latest_digest), prompt, _prompt(prompt), _prompt(_reduce_prompt(prompt)),
               json.dumps([[r.version, hashlib.sha256(r.notes.encode()).hexdigest()] for r in pending]),
               json.dumps(image_diff or [], sort_keys=True), json.dumps(manifest or [], sort_keys=True),
               settings.ollama_url, settings.classification_provider, settings.local_model,
@@ -179,7 +184,7 @@ async def build_rollup(app: AppRecord, installed: str | None, latest: str | None
             merged = _union(parts)
             if len(parts) > 1 and any(merged.values()):
                 try:
-                    reduced, _ = await _structured(provider, model, REDUCE_PROMPT, {**head, 'candidate_items': {
+                    reduced, _ = await _structured(provider, model, _reduce_prompt(prompt), {**head, 'candidate_items': {
                         g: [{k: redact_text(str(v), private=True) for k, v in item.items()} for item in items]
                         for g, items in merged.items()}}, RollupModel, settings, gemini_key, log_call, pseudo, len(parts),
                         lambda parsed: verify_rollup(parsed, full_notes, manifest))

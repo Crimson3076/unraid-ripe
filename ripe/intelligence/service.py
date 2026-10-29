@@ -32,7 +32,7 @@ def _prompt(name: str) -> str:
 
 def prompt_digest(name: str = APPLICABILITY_PROMPT_VERSION) -> str:
     """Content digest so editing a prompt invalidates cached model output."""
-    if name not in {PROMPT_VERSION, APPLICABILITY_PROMPT_VERSION, 'rollup-v1', 'rollup-reduce-v1', 'rollback-v1'}:
+    if name not in {PROMPT_VERSION, APPLICABILITY_PROMPT_VERSION, 'rollup-v1', 'rollup-reduce-v1', 'rollback-v1', 'rollback-reduce-v1'}:
         raise ValueError('Unknown prompt version')
     return hashlib.sha256(_prompt(name).encode()).hexdigest()
 

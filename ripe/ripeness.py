@@ -95,8 +95,9 @@ def soak_deadline(release: Release, releases: list[Release], settings: Settings,
 def rollback_window(history: list[Release], installed: str | None, size: int) -> list[Release]:
     """The newest `size` stable releases at or below the installed version, oldest first."""
     installed_version = parse_version(installed)
-    stable = [r for r in history if installed_version is not None and installed_version.is_prerelease
-              or not (r.prerelease or parse_version(r.version).is_prerelease)]
+    # Prereleases are kept only when the installed version is itself a prerelease.
+    keep_pre = installed_version is not None and installed_version.is_prerelease
+    stable = [r for r in history if keep_pre or not (r.prerelease or parse_version(r.version).is_prerelease)]
     return stable[-size:] if size > 0 else []
 
 
