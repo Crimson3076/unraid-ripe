@@ -6,7 +6,7 @@ import pytest
 
 from ripe.models import AppRecord
 from ripe.sources.collector import (
-    CachedHTTP, DockerReader, SourceError, RegistryReader, github_repo,
+    CachedHTTP, DockerReader, SourceError, RegistryReader, disambiguate_ha_names, github_repo,
     github_releases, ha_records, ha_states, installed_unraid, parse_image,
     read_templates, usable_version_label,
 )
@@ -755,8 +755,11 @@ def test_ha_duplicate_update_titles_are_disambiguated():
     states = [state("update.lamp_firmware", "Lamp Firmware", "Cync Full Color A19 Firmware"),
               state("update.desk_firmware", "Desk Firmware", "Cync Full Color A19 Firmware"),
               state("update.other", "Other", "Unique Title")]
-    apps, _ = ha_records(states, {}, {})
-    names = [a.name for a in apps]
-    assert names == ["Lamp Firmware", "Desk Firmware", "Unique Title"]
+    # collect() parses one entity at a time, so mirror that here.
+    def collected(items):
+        apps = [a for s in items for a in ha_records([s], {}, {})[0]]
+        disambiguate_ha_names(apps, items)
+        return [a.name for a in apps]
+    assert collected(states) == ["Lamp Firmware", "Desk Firmware", "Unique Title"]
     same = [state("update.a", "Dyson Device Firmware", "Dyson Device Firmware"), state("update.b", "Dyson Device Firmware", "Dyson Device Firmware")]
-    assert [a.name for a in ha_records(same, {}, {})[0]] == ["Dyson Device Firmware (update.a)", "Dyson Device Firmware (update.b)"]
+    assert collected(same) == ["Dyson Device Firmware (update.a)", "Dyson Device Firmware (update.b)"]

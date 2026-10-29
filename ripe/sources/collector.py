@@ -826,14 +826,20 @@ def ha_records(states: list[JSON], notes: dict[str, str], existing: dict[str, Ap
             # HA update states do not include publication date. Do not start an
             # invented soak clock from state.last_changed or poll time.
             releases.append(Release(id=f"ha:{entity_id}:{latest}", app_id=key, version=latest, notes=str(text), source_url=url or ""))
-    # Many devices share one update title ("Cync Full Color A19 Firmware"); keep them distinguishable.
+    return apps, releases
+
+
+def disambiguate_ha_names(apps: list[AppRecord], states: list[JSON]) -> None:
+    """Many devices share one update title ("Cync Full Color A19 Firmware"); keep them distinguishable.
+
+    Runs over all collected HA apps at once, since collect() parses entities one at a time.
+    """
     counts = Counter(a.name for a in apps)
-    friendly = {"ha:" + i["entity_id"]: str(i["attributes"].get("friendly_name") or "") for i in states}
+    friendly = {"ha:" + str(s.get("entity_id")): str((s.get("attributes") or {}).get("friendly_name") or "") for s in states}
     for a in apps:
         if counts[a.name] > 1:
             name = friendly.get(a.id)
             a.name = name if name and name != a.name and counts[name] == 0 else f"{a.name} ({a.detected['entity_id']})"
-    return apps, releases
 
 
 def installed_unraid(path: str) -> str | None:
@@ -877,14 +883,17 @@ async def collect(settings: Settings, *, github_token: str | None = None, ha_tok
             try:
                 states = await ha_states(local, ha_url, ha_token)
                 notes = await ha_release_notes(ha_url, ha_token, [e["entity_id"] for e in states if e.get("state")=="on"])
+                collected: list[AppRecord] = []
                 for state in states:
                     try:
                         ha_apps, ha_notes = ha_records([state], notes, existing)
                     except PARSE_ERRORS:
                         error("ha:" + str(state.get("entity_id")), "Home Assistant: entity parse error")
                         continue
-                    apps.extend(ha_apps)
+                    collected.extend(ha_apps)
                     releases.extend(ha_notes)
+                disambiguate_ha_names(collected, states)
+                apps.extend(collected)
             except SourceError as exc:
                 error("home_assistant", str(exc))
             except PARSE_ERRORS:
