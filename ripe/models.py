@@ -11,11 +11,13 @@ Tier = Literal["infrastructure", "internet", "general"]
 
 class Profile(BaseModel):
     tier: Tier = "general"
-    exposure: Literal["lan", "internet", "vpn", "unknown"] = "unknown"
+    exposure: Literal["lan", "internet", "vpn", "internal", "unknown"] = "unknown"
     own_login: bool | None = None
     config: dict[str, Any] = Field(default_factory=dict)
     dependencies: list[str] = Field(default_factory=list)
     notes: str = ""
+    # Per field: "auto" (derived by Ripe, refreshed every scan) or "user" (edited, never overwritten).
+    origin: dict[str, str] = Field(default_factory=dict)
 
 class AppRecord(BaseModel):
     id: str
@@ -72,6 +74,9 @@ class Settings(BaseModel):
     classification_provider: Literal["local", "gemini"] = "local"
     second_opinion: bool = False
     demo_mode: bool = False
+    # Optional read-only internet-exposure sources; an empty path leaves them off.
+    npm_database_path: str = ""
+    cloudflared_config_path: str = ""
 
 class AppView(BaseModel):
     app: AppRecord
@@ -86,5 +91,7 @@ class AppView(BaseModel):
     pending: list[Release] = Field(default_factory=list)
     history: list[Release] = Field(default_factory=list)
     available_notes: list[Release] = Field(default_factory=list)
+    no_notes: list[str] = Field(default_factory=list)
+    rollup: dict[str, Any] | None = None
     reason: str = ""
     next_ripe_at: datetime | None = None

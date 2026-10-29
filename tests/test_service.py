@@ -39,7 +39,8 @@ async def test_public_release_cache_shared_and_installed_version_moves_history(t
         await manager.poll()
         await manager.classify_task
         await manager.poll()
-        assert not manager.classify_task or manager.classify_task.done()
+        if manager.classify_task:
+            await manager.classify_task  # may be a rollup refresh; nothing is queued
         assert manager.queue_length()==0
         assert calls==['github:example/app:1']
         assert len(manager.store.releases('one'))==len(manager.store.releases('two'))==1
@@ -215,7 +216,8 @@ async def test_classified_releases_are_not_requeued_or_resent(tmp_path,monkeypat
         await manager.classify_task
         # A fresh store row without the carried-over fields still hits the key cache.
         await manager.poll()
-        assert manager.queue_length()==0 and manager.classify_task.done()
+        await manager.classify_task  # may be a rollup refresh; nothing is queued
+        assert manager.queue_length()==0
         assert len(calls)==1
     finally:
         manager.close()

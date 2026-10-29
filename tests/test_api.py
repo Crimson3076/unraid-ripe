@@ -206,6 +206,15 @@ def test_unconfigured_runtime_does_not_choose_integration_hosts(tmp_path,monkeyp
     assert runtime.initial_settings().dashboard_url=='http://localhost:8087'
 
 
+def test_version_comes_from_the_build():
+    from ripe import version_from
+    assert version_from("v0.3.1") == "0.3.1"
+    assert version_from("v0.3.0-2-g1ba3d833917") == "0.3.0+1ba3d83"
+    assert version_from("1ba3d83") == "1ba3d83"
+    assert version_from("") == "dev"
+    assert version_from(None) == "dev"
+
+
 def test_pages_show_the_ripe_version_number(client):
     from ripe import __version__
     page = client.get('/')
