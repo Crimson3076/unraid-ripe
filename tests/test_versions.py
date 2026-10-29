@@ -42,3 +42,8 @@ def test_null_version_label_is_not_a_version():
     from ripe.sources.collector import usable_version_label
     assert usable_version_label('null') is None
     assert usable_version_label('None') is None
+
+
+def test_revision_suffix_kept_without_linuxserver_tag():
+    assert compare_versions('1.0-r1', '1.0-r2') == -1
+    assert normalize_version('1.0-r1-ls5') == '1.0'

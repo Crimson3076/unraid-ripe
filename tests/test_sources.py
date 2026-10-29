@@ -763,3 +763,12 @@ def test_ha_duplicate_update_titles_are_disambiguated():
     assert collected(states) == ["Lamp Firmware", "Desk Firmware", "Unique Title"]
     same = [state("update.a", "Dyson Device Firmware", "Dyson Device Firmware"), state("update.b", "Dyson Device Firmware", "Dyson Device Firmware")]
     assert collected(same) == ["Dyson Device Firmware (update.a)", "Dyson Device Firmware (update.b)"]
+
+
+def test_ha_shared_friendly_names_fall_back_to_entity_ids():
+    def state(entity):
+        return {"entity_id": entity, "state": "on", "attributes": {"title": "Device Firmware", "friendly_name": "Lamp Firmware", "installed_version": "1", "latest_version": "2"}}
+    states = [state("update.a"), state("update.b")]
+    apps = [a for s in states for a in ha_records([s], {}, {})[0]]
+    disambiguate_ha_names(apps, states)
+    assert [a.name for a in apps] == ["Device Firmware (update.a)", "Device Firmware (update.b)"]

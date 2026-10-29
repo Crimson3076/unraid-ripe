@@ -18,7 +18,9 @@ def normalize_version(value: str | None) -> str | None:
     if not value:
         return None
     text = _PREFIX.sub("", value.strip())
-    text = _PACKAGING.sub("", _LINUXSERVER.sub("", text))
+    text, linuxserver = _LINUXSERVER.subn("", text)
+    if linuxserver:  # -rN alone is a real upstream post-release, so only strip it on LinuxServer tags
+        text = _PACKAGING.sub("", text)
     date = _DATE.fullmatch(text)
     if date:
         text = ".".join(str(int(part)) for part in date.groups() if part is not None)

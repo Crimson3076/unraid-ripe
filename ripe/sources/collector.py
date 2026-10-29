@@ -836,10 +836,13 @@ def disambiguate_ha_names(apps: list[AppRecord], states: list[JSON]) -> None:
     """
     counts = Counter(a.name for a in apps)
     friendly = {"ha:" + str(s.get("entity_id")): str((s.get("attributes") or {}).get("friendly_name") or "") for s in states}
+    proposed = {a.id: friendly.get(a.id) for a in apps if counts[a.name] > 1}
+    proposed_counts = Counter(proposed.values())
     for a in apps:
         if counts[a.name] > 1:
-            name = friendly.get(a.id)
-            a.name = name if name and name != a.name and counts[name] == 0 else f"{a.name} ({a.detected['entity_id']})"
+            name = proposed[a.id]
+            unique = name and name != a.name and counts[name] == 0 and proposed_counts[name] == 1
+            a.name = name if unique else f"{a.name} ({a.detected['entity_id']})"
 
 
 def installed_unraid(path: str) -> str | None:
