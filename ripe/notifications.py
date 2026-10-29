@@ -6,6 +6,7 @@ import hashlib
 import re
 import httpx
 from .models import Settings, AppView, utcnow
+from .ripeness import _security_ready
 from .store import Store
 
 
@@ -82,10 +83,12 @@ class Notifier:
         for view in views:
             if view.status != 'recommended_now':
                 continue
-            fixes = [(r.version, (r.classification or {}).get('security', [])) for r in view.pending if (r.classification or {}).get('security')]
+            # Only fixes past their soak are keyed, so a later fix finishing its soak alerts
+            # again, while an unrelated non-security target change does not.
+            fixes = [(r.version, (r.classification or {}).get('security', [])) for r in view.pending if _security_ready(r, settings, now)]
             # A sidecar's security fix raised this card; key on it so each new one alerts once.
             side_fixes = [(side.app.id, r.version, (r.classification or {}).get('security', [])) for side in view.sidecars
-                          if side.status == 'recommended_now' for r in side.pending if (r.classification or {}).get('security')]
+                          if side.status == 'recommended_now' for r in side.pending if _security_ready(r, settings, now)]
             key = 'security-sent:' + hashlib.sha256(repr((view.app.id, fixes, side_fixes) if side_fixes else (view.app.id, fixes)).encode()).hexdigest()
             if self.store.get(key):
                 continue

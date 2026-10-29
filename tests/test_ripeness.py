@@ -97,7 +97,7 @@ def test_unquoted_security_claim_is_not_a_security_fix():
 
 def test_later_security_fix_not_omitted():
     rs=[release('1.1.0',15,classification={'tags':['security'],'security':[{'evidence':'Security fix.'}]}),
-        release('1.2.0',2,classification={'tags':['security'],'security':[{'evidence':'Security fix.'}]}),release('1.3.0',1)]
+        release('1.2.0',2,classification={'tags':['security'],'security':[{'severity':'high','evidence':'Security fix.'}]}),release('1.3.0',1)]
     assert build_view(app(),rs,Settings(),NOW).recommended_version == '1.2.0'
 
 
@@ -199,7 +199,7 @@ def test_stale_ripe_or_current_record_cannot_claim_fresh_readiness():
 
 
 def test_stale_data_retains_supported_security_warning():
-    r=release('1.1.0',2,classification={'tags':['security'],'security':[{'evidence':'Security fix.'}]})
+    r=release('1.1.0',2,classification={'tags':['security'],'security':[{'severity':'high','evidence':'Security fix.'}]})
     v=build_view(app(error='Source failed'),[r],Settings(),NOW)
     assert v.status == 'recommended_now'
     assert v.recommended_version == '1.1.0'
@@ -215,7 +215,7 @@ def test_stale_data_retains_read_first_caution():
 
 def test_latest_only_evidenced_security_overrides_soak_and_targets_latest():
     a=app(latest_version='1.1.0',latest_only=True,installed_digest='sha256:old',latest_digest='sha256:new',image_changed_at=NOW-timedelta(days=1))
-    r=release('1.1.0',1,classification={'tags':['security'],'security':[{'evidence':'Security fix.'}]})
+    r=release('1.1.0',1,classification={'tags':['security'],'security':[{'severity':'high','evidence':'Security fix.'}]})
     v=build_view(a,[r],Settings(),NOW)
     assert v.status == 'recommended_now'
     assert v.recommended_version == 'latest'
@@ -263,7 +263,7 @@ def test_latest_only_model_disagreement_requires_review():
 
 
 def test_security_still_recommended_but_keyword_coverage_caution_survives():
-    r=release('1.1.0',1,classification={'tags':['security'],'security':[{'evidence':'Security fix.'}],'keyword_warnings':[{'term':'must'}]})
+    r=release('1.1.0',1,classification={'tags':['security'],'security':[{'severity':'high','evidence':'Security fix.'}],'keyword_warnings':[{'term':'must'}]})
     v=build_view(app(),[r],Settings(),NOW)
     assert v.status == 'recommended_now'
     assert 'Review incomplete keyword coverage' in v.reason
@@ -276,6 +276,59 @@ def test_unknown_installed_span_still_exposes_available_notes():
     assert not v.pending and not v.history
     assert v.releases_behind==0
     assert v.available_notes==[r]
+
+
+SEC=lambda **kw:{'tags':['security'],'security':[{'evidence':'Security fix.',**kw}]}
+
+
+def test_unrated_security_claim_still_waits_patch_soak():
+    v=build_view(app(),[release('1.1.0',1,classification=SEC())],Settings(),NOW)
+    assert v.status != 'recommended_now'
+    assert v.recommended_version is None
+
+
+def test_unrated_security_claim_recommended_after_patch_soak():
+    v=build_view(app(),[release('1.1.0',4,classification=SEC())],Settings(),NOW)
+    assert v.status == 'recommended_now'
+    assert v.recommended_version == '1.1.0'
+
+
+def test_low_severity_security_waits_but_high_skips_soak():
+    assert build_view(app(),[release('1.1.0',1,classification=SEC(severity='low'))],Settings(),NOW).status != 'recommended_now'
+    v=build_view(app(),[release('1.1.0',1,classification=SEC(severity='critical'))],Settings(),NOW)
+    assert v.status == 'recommended_now'
+    assert 'severity critical' in v.reason
+
+
+def test_advisory_id_in_notes_skips_soak_and_is_shown():
+    r=release('1.1.0',1,classification={'tags':['security'],'security':[{'evidence':'Security: fixes CVE-2026-12345 and GHSA-abcd-2345-wxyz.'}]})
+    r.notes='Security: fixes CVE-2026-12345 and GHSA-abcd-2345-wxyz.'
+    v=build_view(app(),[r],Settings(),NOW)
+    assert v.status == 'recommended_now'
+    assert 'CVE-2026-12345' in v.reason
+
+
+
+def test_unsoaked_later_security_fix_still_constrains_target():
+    v=build_view(app(),[release('1.1.0',15,classification=SEC(severity='low')),
+                        release('1.2.0',1,classification=SEC(severity='low'))],Settings(),NOW)
+    assert v.status == 'recommended_now'
+    assert v.recommended_version == '1.2.0'
+
+
+def test_advisory_of_excluded_fix_does_not_make_other_fix_urgent():
+    r=release('1.1.0',1,classification={'tags':['security'],'security':[
+        {'evidence':'Fixes CVE-2026-12345 in the proxy.'},{'severity':'low','evidence':'Security fix.'}]})
+    r.notes='Fixes CVE-2026-12345 in the proxy. Security fix.'
+    r.applicability=[{'kind':'security','index':0,'status':'does_not_apply','evidence':'x','profile_evidence':'y'}]
+    v=build_view(app(),[r],Settings(),NOW)
+    assert v.status != 'recommended_now'
+
+
+def test_waiting_countdown_reflects_security_soak():
+    v=build_view(app(),[release('1.1.0',1,classification=SEC(severity='low'))],Settings(),NOW)
+    assert v.status == 'waiting'
+    assert v.days_remaining == 2
 
 
 def test_recommendation_uses_latest_spelling_when_versions_normalize_equal():
