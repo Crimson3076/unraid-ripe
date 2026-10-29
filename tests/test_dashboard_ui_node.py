@@ -9,7 +9,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 
 
-@pytest.mark.parametrize("script", ["tests/test_dashboard_ui.cjs", "tests/test_app_page_ui.cjs"])
+@pytest.mark.parametrize("script", ["tests/test_dashboard_ui.cjs", "tests/test_app_page_ui.cjs", "tests/test_progress_ui.cjs", "tests/test_logs_ui.cjs"])
 def test_dashboard_ui_script(script):
     node = shutil.which("node")
     if not node:

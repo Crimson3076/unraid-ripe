@@ -275,7 +275,7 @@ def _gh(tag, prerelease=False):
     return {'id': tag, 'tag_name': tag, 'body': 'notes', 'published_at': '2026-10-01T00:00:00Z', 'prerelease': prerelease}
 
 
-async def _collect(monkeypatch, tmp_path, apps, github=None, registry_digest='sha256:' + 'f' * 64, existing=None):
+async def _collect(monkeypatch, tmp_path, apps, github=None, registry_digest='sha256:' + 'f' * 64, existing=None, settings=None):
     from ripe.models import Settings
     from ripe.sources import collector
     socket = tmp_path / 'docker.sock'
@@ -297,7 +297,7 @@ async def _collect(monkeypatch, tmp_path, apps, github=None, registry_digest='sh
         return original_client(*args, **kwargs)
     monkeypatch.setattr(collector.httpx, 'AsyncClient', make_client)
     cache = {}
-    return await collector.collect(Settings(), docker_socket=str(socket), unraid_version_file=str(tmp_path / 'no-version'), cache_get=cache.get, cache_set=cache.__setitem__, existing_apps=existing)
+    return await collector.collect(settings or Settings(), docker_socket=str(socket), unraid_version_file=str(tmp_path / 'no-version'), cache_get=cache.get, cache_set=cache.__setitem__, existing_apps=existing)
 
 
 async def test_unmapped_latest_app_uses_digest_logic(monkeypatch, tmp_path):
@@ -366,6 +366,116 @@ async def test_docker_allowlist_excludes_everything_but_list_inspect_and_image()
         for path in ('/containers/' + 'a' * 64 + '/exec', '/containers/' + 'a' * 64 + '/logs', '/containers/' + 'a' * 64 + '/json?size=1', '/version'):
             with pytest.raises(SourceError):
                 await reader.read(path)
+
+
+async def test_long_release_history_stops_at_installed_version():
+    pages = []
+    def handler(request):
+        page = int(request.url.params['page'])
+        pages.append(page)
+        start = 300 - (page - 1) * 100
+        return httpx.Response(200, json=[_gh(f'1.{minor}.0') for minor in range(start, start - 100, -1)])
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        releases = await github_releases(CachedHTTP(client), 'o/a', 'docker:a', None, '1.150.0')
+    assert pages == [1, 2]
+    assert any(r.version == '1.150.0' for r in releases)
+
+
+async def test_long_unparseable_history_is_not_an_error():
+    def handler(request):
+        return httpx.Response(200, json=[_gh(f'nightly-{request.url.params["page"]}-{i}') for i in range(100)])
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        releases = await github_releases(CachedHTTP(client), 'o/a', 'docker:a', None, '1.0.0')
+    assert len(releases) == 1000
+
+
+async def test_exhausted_page_limit_with_versions_is_an_error():
+    def handler(request):
+        page = int(request.url.params['page'])
+        return httpx.Response(200, json=[_gh(f'1.0.{(11 - page) * 100 - i}') for i in range(100)])
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(SourceError):
+            await github_releases(CachedHTTP(client), 'o/a', 'docker:a', None, '0.9.0')
+
+
+async def test_404_mapping_flagged_once_and_not_retried(monkeypatch, tmp_path):
+    from ripe.sources import collector
+    hits = []
+    def make(repo='HaveAGitGat/tdarr_express_be'):
+        return AppRecord(id='docker:tdarr', name='tdarr', source='docker', installed_version='1.0.0', upstream_repo=repo, image='ghcr.io/haveagitgat/tdarr:latest', detected={'image_source': 'https://github.com/HaveAGitGat/Tdarr'})
+    app = make()
+    apps, _, errors = await _collect_404(monkeypatch, tmp_path, [app], hits)
+    flagged = next(a for a in apps if a.id == 'docker:tdarr')
+    assert hits and flagged.detected['invalid_mapping']['status'] == 404
+    assert flagged.detected['invalid_mapping']['suggestion'] == 'HaveAGitGat/Tdarr'
+    assert 'mapping needs attention' in flagged.error
+    assert sum(e['source'] == 'docker:tdarr' for e in errors) == 1
+    # Next poll: same mapping is skipped entirely, with no new error entries.
+    hits.clear()
+    apps, _, errors = await _collect_404(monkeypatch, tmp_path, [make()], hits, existing=[flagged])
+    again = next(a for a in apps if a.id == 'docker:tdarr')
+    assert not hits and again.detected['invalid_mapping'] == flagged.detected['invalid_mapping']
+    assert 'mapping needs attention' in again.error
+    assert not any(e['source'] == 'docker:tdarr' for e in errors)
+    # A token change or an expired flag retries too.
+    hits.clear()
+    await _collect_404(monkeypatch, tmp_path, [make()], hits, existing=[flagged], token='x')
+    assert hits
+    # Replacing one token with another also retries, and the token is never stored.
+    hits.clear()
+    first = await _collect_404(monkeypatch, tmp_path, [make()], hits, token='tok-one')
+    stored = next(a for a in first[0] if a.id == 'docker:tdarr')
+    assert 'tok-one' not in str(stored.detected)
+    hits.clear()
+    await _collect_404(monkeypatch, tmp_path, [make()], hits, existing=[stored], token='tok-two')
+    assert hits
+    hits.clear()
+    stale = flagged.model_copy(deep=True)
+    stale.detected['invalid_mapping']['at'] -= 7 * 3600
+    await _collect_404(monkeypatch, tmp_path, [make()], hits, existing=[stale])
+    assert hits
+    hits.clear()
+    # Changing the mapping retries.
+    apps, _, _ = await _collect_404(monkeypatch, tmp_path, [make('HaveAGitGat/Tdarr')], hits, existing=[flagged])
+    assert hits
+
+
+async def _collect_404(monkeypatch, tmp_path, apps, hits, existing=None, token=None):
+    from ripe.models import Settings
+    from ripe.sources import collector
+    socket = tmp_path / 'docker.sock'
+    socket.touch()
+    async def docker_apps(self, *args, **kwargs):
+        return apps
+    async def no_unraid(*args, **kwargs):
+        return []
+    async def registry_meta(self, image, installed_digest, match_version=True):
+        return {}
+    monkeypatch.setattr(collector.DockerReader, 'apps', docker_apps)
+    monkeypatch.setattr(collector.RegistryReader, 'metadata', registry_meta)
+    monkeypatch.setattr(collector, 'unraid_releases', no_unraid)
+    def handler(request):
+        hits.append(request.url.path)
+        return httpx.Response(404, json={'message': 'Not Found'})
+    original_client = httpx.AsyncClient
+    def make_client(*args, **kwargs):
+        kwargs['transport'] = httpx.MockTransport(handler)
+        return original_client(*args, **kwargs)
+    monkeypatch.setattr(collector.httpx, 'AsyncClient', make_client)
+    return await collector.collect(Settings(), docker_socket=str(socket), unraid_version_file=str(tmp_path / 'none'), existing_apps=existing, github_token=token)
+
+
+async def test_backport_at_page_boundary_does_not_stop_early():
+    pages = []
+    def handler(request):
+        page = int(request.url.params['page'])
+        pages.append(page)
+        if page == 1:  # backport published late sits above the newer minor
+            return httpx.Response(200, json=[_gh('1.149.5')] + [_gh(f'1.150.{i}') for i in range(99, 0, -1)])
+        return httpx.Response(200, json=[_gh('1.150.0')] + [_gh(f'1.149.{i}') for i in range(4, -95, -1)][:99])
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        releases = await github_releases(CachedHTTP(client), 'o/a', 'docker:a', None, '1.150.0')
+    assert 2 in pages and any(r.version == '1.150.0' for r in releases)
 
 
 def _registry(handler, **kwargs):
@@ -637,3 +747,22 @@ async def test_image_diff_rate_limit_keeps_last_diff_and_reports_status(monkeypa
     apps, _, _ = await _collect(monkeypatch, tmp_path, [fresh()], existing=[previous])
     assert 'rate limited' in apps[0].detected['registry_status']
     assert apps[0].detected['image_diff'] == _diff('8.3')
+
+
+async def test_stopped_ignored_and_merged_apps_are_not_polled(monkeypatch, tmp_path):
+    def app(name, **extra):
+        return AppRecord(id='docker:' + name, name=name, source='docker', image=f'ghcr.io/o/{name}:latest', installed_digest='sha256:' + '1' * 64, **extra)
+    live, stopped, ignored = app('live', state='running'), app('stopped', state='exited'), app('ign')
+    previous = ignored.model_copy(update={'ignored': True})
+    apps, _, _ = await _collect(monkeypatch, tmp_path, [live, stopped, ignored], existing=[previous])
+    by_id = {a.id: a for a in apps}
+    assert by_id['docker:live'].latest_digest and not by_id['docker:stopped'].latest_digest and not by_id['docker:ign'].latest_digest
+    assert by_id['docker:ign'].ignored
+
+
+async def test_stopped_container_is_polled_once_included(monkeypatch, tmp_path):
+    from ripe.models import Settings
+    from ripe.sources import collector
+    stopped = AppRecord(id='docker:stopped', name='stopped', source='docker', image='ghcr.io/o/stopped:latest', installed_digest='sha256:' + '1' * 64, state='exited')
+    apps, _, _ = await _collect(monkeypatch, tmp_path, [stopped], settings=Settings(include_stopped=True))
+    assert next(a for a in apps if a.id == 'docker:stopped').latest_digest

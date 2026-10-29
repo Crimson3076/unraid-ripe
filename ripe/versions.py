@@ -9,14 +9,19 @@ import re
 from packaging.version import InvalidVersion, Version
 
 _PREFIX = re.compile(r"^(?:version[-_]|release[-_]|v(?=\d))", re.I)
-_LINUXSERVER = re.compile(r"(?:[-_](?:ls|linuxserver)\d+)$", re.I)
+# "n8n@1.2.3": a package name before the version.
+_TAG_NAME = re.compile(r"^[A-Za-z][\w.-]*@(?=v?\d)")
+# Image build suffixes after the version: -r0-ls237, -python3.13-alpine3.23, -bookworm-slim.
+# Pre-release markers (-rc1, -beta.2) are deliberately not listed.
+_LINUXSERVER = re.compile(r"(?:[-_](?:r\d+|ls\d+|linuxserver\d+|python\d+(?:\.\d+)*|alpine(?:\d+(?:\.\d+)*)?"
+                          r"|debian\d*|ubuntu[\d.]*|bookworm|bullseye|buster|trixie|jammy|noble|focal|slim))+$", re.I)
 _DATE = re.compile(r"^(?:RELEASE[.-])?(\d{4})[-.](\d{2})[-.](\d{2})(?:[Tt](\d{2})[-:](\d{2})[-:](\d{2})[Zz]?)?$")
 
 
 def normalize_version(value: str | None) -> str | None:
     if not value:
         return None
-    text = _PREFIX.sub("", value.strip())
+    text = _PREFIX.sub("", _TAG_NAME.sub("", value.strip()))
     text = _LINUXSERVER.sub("", text)
     date = _DATE.fullmatch(text)
     if date:

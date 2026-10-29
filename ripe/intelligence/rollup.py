@@ -44,9 +44,10 @@ def image_items(diff: list[dict] | None) -> list[dict]:
 
 
 def rollup_key(app: AppRecord, installed: str | None, latest: str | None, pending: list[Release],
-               image_diff: list[dict] | None, manifest: list[dict] | None, settings: Settings) -> str:
+               image_diff: list[dict] | None, manifest: list[dict] | None, settings: Settings,
+               prompt: str = ROLLUP_PROMPT) -> str:
     """Per (app, installed, latest) plus the inputs those versions imply and the model setup."""
-    values = [app.id, str(installed), str(latest), str(app.latest_digest), ROLLUP_PROMPT, _prompt(ROLLUP_PROMPT), _prompt(REDUCE_PROMPT),
+    values = [app.id, str(installed), str(latest), str(app.latest_digest), prompt, _prompt(prompt), _prompt(REDUCE_PROMPT),
               json.dumps([[r.version, hashlib.sha256(r.notes.encode()).hexdigest()] for r in pending]),
               json.dumps(image_diff or [], sort_keys=True), json.dumps(manifest or [], sort_keys=True),
               settings.ollama_url, settings.classification_provider, settings.local_model,
@@ -129,14 +130,15 @@ def headline(groups: Groups, installed: str | None, missing: int) -> str:
 async def build_rollup(app: AppRecord, installed: str | None, latest: str | None, pending: list[Release],
                        settings: Settings, *, image_diff: list[dict] | None = None,
                        manifest_diff: list[dict] | None = None, gemini_key: str | None = None,
-                       model_unavailable: str | None = None, log_call: LogCall = lambda _: None) -> dict:
+                       model_unavailable: str | None = None, log_call: LogCall = lambda _: None,
+                       prompt: str = ROLLUP_PROMPT) -> dict:
     """status 'ok' is cacheable; 'unavailable' keeps the deterministic image facts and is retried."""
     with_notes = [r for r in pending if r.notes.strip() and len(r.notes) <= MAX_NOTES]
     no_notes = [r.version for r in pending if r not in with_notes]
     facts = image_items(image_diff)
     manifest = manifest_text(manifest_diff)
     base = {'installed': installed, 'latest': latest, 'releases': [r.version for r in pending],
-            'no_notes': no_notes, 'prompt_version': ROLLUP_PROMPT}
+            'no_notes': no_notes, 'prompt_version': prompt}
     ai: Groups = {group: [] for group in GROUPS}
     provider_failures: list[str] = []
     provenance: list[dict[str, str]] = []
@@ -151,6 +153,8 @@ async def build_rollup(app: AppRecord, installed: str | None, latest: str | None
         requested = [primary]
         if settings.second_opinion and public:
             requested.append('gemini' if primary == 'local' else 'local')
+        if 'gemini' in requested and not gemini_key:
+            requested = [p for p in requested if p != 'gemini'] or ['local']
         pseudo = Release(id='rollup:' + app.id, app_id=app.id, version=latest or '')
         full_notes = {r.version: r.notes for r in with_notes}
         plan = plan_chunks(with_notes, manifest)
@@ -167,7 +171,7 @@ async def build_rollup(app: AppRecord, installed: str | None, latest: str | None
                 payload = {**head, 'releases': [{'version': redact_text(v, private=True), 'notes': redact_text(t, private=True)} for v, t in notes.items()]}
                 if chunk['manifest']:
                     payload['dependency_changes'] = redact_text(chunk['manifest'], private=True)
-                part, _ = await _structured(provider, model, ROLLUP_PROMPT, payload, RollupModel, settings, gemini_key,
+                part, _ = await _structured(provider, model, prompt, payload, RollupModel, settings, gemini_key,
                                             log_call, pseudo, index,
                                             lambda parsed, n=notes, m=chunk['manifest']: verify_rollup(parsed, n, m))
                 parts.append(part)

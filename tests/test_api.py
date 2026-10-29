@@ -285,3 +285,21 @@ def test_ui_token_is_a_redacted_secret():
     runtime = Runtime(ui_token='lan-token-xyz')
     assert 'lan-token-xyz' in runtime.secret_values()
     assert 'lan-token-xyz' not in repr(runtime)
+
+
+def test_dashboard_payload_is_small_and_detail_keeps_notes(client):
+    manager = client.app.state.manager
+    big = 'Fixed a search bug. ' * 20000
+    for n in range(186):
+        manager.store.save_app(AppRecord(id=f'a{n}', name=f'App {n}', source='docker', installed_version='1.0.0',
+                                         latest_version='1.1.0', detected={'junk': 'x' * 2000}))
+        manager.store.save_release(Release(
+            id=f'github:o/a{n}:1.1.0', app_id=f'a{n}', version='1.1.0', notes=big,
+            classification={'status': 'ok', 'tags': ['bugfix'], 'tag_evidence': {'bugfix': 'Fixed a search bug.'}}))
+    response = client.get('/api/dashboard')
+    assert len(response.content) < 1_000_000
+    cards = response.json()['apps']
+    assert len(cards) == 186
+    assert all('pending' not in c and 'history' not in c for c in cards)
+    assert cards[0]['tag_quotes'] == {'bugfix': '1.1.0: Fixed a search bug.'}
+    assert client.get('/api/apps/a0').json()['pending'][0]['notes'] == big
