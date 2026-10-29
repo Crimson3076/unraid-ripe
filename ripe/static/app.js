@@ -186,7 +186,7 @@
     }
     function schedule() {
       clearTimeout(timer);
-      timer=setTimeout(()=>{if(document.hidden&&!last?.running)schedule();else refresh();},last?.running?2000:30000);
+      timer=setTimeout(()=>{if(document.hidden&&!last?.running)schedule();else void refresh();},last?.running?2000:30000);
     }
     async function refresh() {
       try{render(await api('/api/poll/status'));}catch{}
@@ -194,9 +194,9 @@
     }
     toggle.addEventListener('click',()=>{panel.hidden=!panel.hidden;toggle.setAttribute('aria-expanded',String(!panel.hidden));if(!panel.hidden&&last)panel.innerHTML=pollPanel(last);});
     dismiss.addEventListener('click',()=>{try{sessionStorage.setItem(dismissKey,last?.finished_at||'x');}catch{}hide();});
-    document.addEventListener('visibilitychange',()=>{if(!document.hidden)refresh();});
+    document.addEventListener('visibilitychange',()=>{if(!document.hidden)void refresh();});
     refreshPoll=refresh;
-    refresh();
+    void refresh();
   }
   function initDashboard() {
     document.addEventListener('ripe:poll-finished',()=>loadDashboard(true));
@@ -431,5 +431,5 @@
   if(page==='dashboard')initDashboard();
   if(page==='app')loadDetail();
   if(page==='settings')initSettings();
-  if(page==='logs'){document.addEventListener('ripe:poll-finished',loadLogs);loadLogs();$('#refresh-logs').onclick=loadLogs;}
+  if(page==='logs'){document.addEventListener('ripe:poll-finished',loadLogs);void loadLogs();$('#refresh-logs').onclick=loadLogs;}
 })();
