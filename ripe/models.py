@@ -73,6 +73,7 @@ class Settings(BaseModel):
     quiet_end: str = "09:00"
     poll_hours: int = Field(default=12, ge=1, le=168)
     analysis_cap: int = Field(default=15, ge=1, le=500)
+    rollback_window: int = Field(default=3, ge=0, le=10)
     digest_weekday: int = Field(default=0, ge=0, le=6)
     digest_time: str = "09:00"
     notification_script: str = ""
@@ -104,6 +105,8 @@ class AppView(BaseModel):
     pending: list[Release] = Field(default_factory=list)
     history: list[Release] = Field(default_factory=list)
     available_notes: list[Release] = Field(default_factory=list)
+    rollback: list[Release] = Field(default_factory=list)
+    rollback_rollup: dict[str, Any] | None = None
     no_notes: list[str] = Field(default_factory=list)
     rollup: dict[str, Any] | None = None
     reason: str = ""

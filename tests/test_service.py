@@ -242,3 +242,163 @@ async def test_stale_exclusions_reset_outside_the_analysis_cap(tmp_path,monkeypa
         manager.close()
     assert stored['1.1.0'].classification['status']=='ok'
     assert not any(i.get('status')=='does_not_apply' for i in stored['1.1.0'].applicability)
+
+
+@pytest.mark.asyncio
+async def test_unknown_span_classifies_only_the_newest_three(tmp_path,monkeypatch):
+    app,releases=_many(30,installed=None)
+    app.image_created_at=utcnow()-timedelta(days=200)
+    calls,stored=await _run(tmp_path,monkeypatch,[app],releases)
+    assert {v for _,v in calls}=={'1.28.0','1.29.0','1.30.0'}
+    assert 'not analysed' in stored['1.10.0'].classification['skipped']
+
+
+@pytest.mark.asyncio
+async def test_unorderable_installed_tag_is_not_analysed_beyond_three(tmp_path,monkeypatch):
+    app,releases=_many(30,installed='latest')
+    app.image_created_at=utcnow()-timedelta(days=200)
+    calls,_=await _run(tmp_path,monkeypatch,[app],releases)
+    assert len(calls)==3
+
+
+@pytest.mark.asyncio
+async def test_rollback_window_covers_three_releases_at_or_below_installed(tmp_path,monkeypatch):
+    app,releases=_many(10,installed='1.6.0')
+    manager=Coordinator(runtime(tmp_path))
+    sent=[]
+    async def collect(*args,**kwargs):
+        return [app],releases,[]
+    async def ready(*args):
+        return True
+    async def classify(release,app,settings,**kwargs):
+        return release.model_copy(update={'classification':{'status':'ok','tags':[],'tag_evidence':{}},'classification_key':classification_key(release,app,settings)})
+    async def applic(release,app,settings,**kwargs):
+        return release
+    async def rollup(app,installed,latest,pending,settings,**kwargs):
+        sent.append((kwargs.get('prompt'),[r.version for r in pending]))
+        return {'status':'ok','installed':installed,'latest':latest,'releases':[r.version for r in pending],'groups':{},'headline':'x'}
+    monkeypatch.setattr(service,'collect',collect)
+    monkeypatch.setattr(service,'classify_release',classify)
+    monkeypatch.setattr(service,'analyze_applicability',applic)
+    monkeypatch.setattr(service,'build_rollup',rollup)
+    monkeypatch.setattr(manager,'local_ready',ready)
+    try:
+        await manager.poll()
+        view=manager.view('big')
+    finally:
+        manager.close()
+    assert [r.version for r in view.rollback]==['1.4.0','1.5.0','1.6.0']
+    assert ('rollback-v1',['1.4.0','1.5.0','1.6.0']) in sent
+    assert not any(v in ('1.1.0','1.2.0','1.3.0') for _,vs in sent for v in vs)
+    assert view.rollback_rollup['releases']==['1.4.0','1.5.0','1.6.0']
+
+
+def test_rollback_window_setting_bounds():
+    from ripe.models import Settings
+    from ripe.ripeness import build_view
+    app,releases=_many(10,installed='1.6.0')
+    assert Settings().rollback_window==3
+    assert build_view(app,releases,Settings(rollback_window=0)).rollback==[]
+    assert len(build_view(app,releases,Settings(rollback_window=10)).rollback)==6
+    with pytest.raises(ValueError):
+        Settings(rollback_window=11)
+
+
+def test_tag_prefixes_and_build_suffixes_are_ordered():
+    from ripe.versions import compare_versions
+    assert compare_versions('n8n@1.2.3','1.2.2')==1
+    assert compare_versions('1.2.3-python3.13-alpine3.23','1.2.3')==0
+    assert compare_versions('4.5.6-r0-ls237','4.5.5')==1
+    assert compare_versions('1.0.0-rc1','1.0.0')==-1
+
+
+def test_mapping_with_much_older_releases_is_flagged():
+    from ripe.models import Settings
+    from ripe.ripeness import build_view
+    app,releases=_many(3,installed='11.4.2')
+    view=build_view(app,releases,Settings())
+    assert any('mapping is probably wrong' in s for s in view.hard_signals)
+    app,releases=_many(3,installed='1.2.0')
+    assert not any('mapping' in s for s in build_view(app,releases,Settings()).hard_signals)
+
+
+def test_rollback_window_drops_prereleases_unless_installed_is_one():
+    from ripe.ripeness import rollback_window
+    history=[Release(id=str(i),app_id='a',version=v,notes='n') for i,v in enumerate(['1.0.0','1.1.0-rc.1','1.1.0'])]
+    assert [r.version for r in rollback_window(history,'1.1.0',3)]==['1.0.0','1.1.0']
+    assert [r.version for r in rollback_window(history,None,3)]==['1.0.0','1.1.0']
+    assert [r.version for r in rollback_window(history,'1.1.0-rc.1',3)]==['1.0.0','1.1.0-rc.1','1.1.0']
+
+
+def test_rollback_prompt_uses_its_own_reduce_prompt():
+    from ripe.intelligence.rollup import _reduce_prompt, ROLLBACK_PROMPT, REDUCE_PROMPT
+    from ripe.intelligence import prompt_digest
+    assert _reduce_prompt(ROLLBACK_PROMPT)=='rollback-reduce-v1'
+    assert _reduce_prompt('rollup-v1')==REDUCE_PROMPT
+    assert prompt_digest('rollback-reduce-v1')
+
+
+async def _rollback(monkeypatch,manager,app,releases,results,ready=True):
+    calls=[]
+    async def rollup(app,installed,latest,pending,settings,**kwargs):
+        calls.append(kwargs)
+        return results.pop(0)
+    async def local_ready():
+        return ready
+    monkeypatch.setattr(service,'build_rollup',rollup)
+    from ripe.models import Settings
+    await manager.refresh_rollback(app,Settings(),local_ready)
+    return calls
+
+
+def _ok(app):
+    return {'status':'ok','installed':app.installed_version,'latest':app.installed_version,'releases':['1.4.0','1.5.0','1.6.0'],'groups':{},'headline':'x'}
+
+
+@pytest.mark.asyncio
+async def test_refresh_rollback_caches_retries_and_resets(tmp_path,monkeypatch):
+    app,releases=_many(10,installed='1.6.0')
+    manager=Coordinator(runtime(tmp_path))
+    monkeypatch.setattr(manager.store,'releases',lambda app_id:releases)
+    try:
+        calls=await _rollback(monkeypatch,manager,app,releases,[_ok(app)])
+        assert len(calls)==1
+        assert (await _rollback(monkeypatch,manager,app,releases,[_ok(app)]))==[]  # cache hit
+        bad={'status':'unavailable','installed':'1.6.0','latest':'1.6.0','releases':[],'groups':{}}
+        app2=app.model_copy(update={'installed_version':'1.5.0'})
+        await _rollback(monkeypatch,manager,app2,releases,[bad])
+        assert manager.store.get('rollback:'+app.id)['key'] is None  # retried next check
+        assert len(await _rollback(monkeypatch,manager,app2,releases,[_ok(app2)]))==1
+        app3=app.model_copy(update={'installed_version':None})
+        await _rollback(monkeypatch,manager,app3,releases,[])
+        assert manager.store.get('rollback:'+app.id) is None
+    finally:
+        manager.close()
+
+
+def test_stored_rollback_is_dropped_when_installed_or_window_changes(tmp_path,monkeypatch):
+    app,releases=_many(10,installed='1.6.0')
+    manager=Coordinator(runtime(tmp_path))
+    monkeypatch.setattr(manager.store,'releases',lambda app_id:releases)
+    monkeypatch.setattr(manager.store,'app',lambda app_id:app)
+    try:
+        manager.store.set('rollback:'+app.id,{'key':'k','result':_ok(app)})
+        assert manager.view(app.id).rollback_rollup is not None
+        stale={**_ok(app),'installed':'1.5.0'}
+        manager.store.set('rollback:'+app.id,{'key':'k','result':stale})
+        assert manager.view(app.id).rollback_rollup is None
+        other={**_ok(app),'releases':['1.1.0']}
+        manager.store.set('rollback:'+app.id,{'key':'k','result':other})
+        assert manager.view(app.id).rollback_rollup is None
+    finally:
+        manager.close()
+
+
+def test_card_excludes_rollback_payload():
+    from ripe.models import Settings
+    from ripe.ripeness import build_view
+    app,releases=_many(10,installed='1.6.0')
+    view=build_view(app,releases,Settings())
+    view.rollback_rollup={'status':'ok'}
+    data=Coordinator.card(view)
+    assert 'rollback' not in data and 'rollback_rollup' not in data

@@ -92,6 +92,23 @@ def soak_deadline(release: Release, releases: list[Release], settings: Settings,
     return published + timedelta(days=days)
 
 
+def rollback_window(history: list[Release], installed: str | None, size: int) -> list[Release]:
+    """The newest `size` stable releases at or below the installed version, oldest first."""
+    installed_version = parse_version(installed)
+    # Prereleases are kept only when the installed version is itself a prerelease.
+    keep_pre = installed_version is not None and installed_version.is_prerelease
+    stable = [r for r in history if keep_pre or not (r.prerelease or parse_version(r.version).is_prerelease)]
+    return stable[-size:] if size > 0 else []
+
+
+def _stale_mapping(ordered: list[Release], installed: str | None) -> str | None:
+    """Newest release of the mapped repository, when a whole major behind the installed version."""
+    old, new = parse_version(installed), parse_version(ordered[-1].version) if ordered else None
+    if old is None or new is None or new >= old:
+        return None
+    return ordered[-1].version if old.release[0] > new.release[0] else None
+
+
 def _sort_releases(releases: list[Release]) -> list[Release]:
     return sorted(releases, key=lambda r: parse_version(r.version))
 
@@ -152,6 +169,7 @@ def _build_view(app: AppRecord, releases: list[Release], settings: Settings,
     available_notes = [r for r in releases
                        if compare_versions(r.version, app.installed_version) is None
                        and (compare_versions(r.version, latest) in (None, -1, 0))]
+    rollback = rollback_window(history, app.installed_version, settings.rollback_window)
     # A card-level tag must hold for the whole pending span, not for one release in it.
     tag_sets = [set(_classification(r).get("tags", [])) for r in pending]
     tags = sorted(set.intersection(*tag_sets) if tag_sets else set(),
@@ -165,8 +183,10 @@ def _build_view(app: AppRecord, releases: list[Release], settings: Settings,
         signals.append("Semver major version change")
         if _DATABASE.search(f"{app.name} {app.image or ''}"):
             signals.append("Database image major version change")
+    if (stale := _stale_mapping(ordered, app.installed_version)):
+        signals.append(f"Newest release in the mapped repository ({stale}) is much older than the installed version; the mapping is probably wrong")
     view = AppView(app=app, status="unknown", status_label="Unknown", latest_version=latest,
-                   pending=pending, history=history, available_notes=available_notes,
+                   pending=pending, history=history, available_notes=available_notes, rollback=rollback,
                    no_notes=[r.version for r in pending if not r.notes.strip()], releases_behind=len(pending), tags=tags,
                    hard_signals=signals, reason="Could not determine an installed version or release notes.")
     if app.detected.get("local_build"):
