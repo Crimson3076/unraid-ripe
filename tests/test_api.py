@@ -144,7 +144,7 @@ def test_pages_have_read_only_stage1_surface_and_security_headers(client):
         assert response.status_code == 200
         assert response.headers['x-content-type-options'] == 'nosniff'
         assert "frame-ancestors 'none'" in response.headers['content-security-policy']
-    assert client.get('/health').json() == {'status': 'ok', 'stage': 1, 'read_only': True}
+    assert client.get('/health').json() == {'status': 'ok', 'stage': 1, 'read_only': True, 'last_collection': None, 'classification_queue_length': 0, 'last_classification': None, 'polling': False}
     for path in ('/api/update', '/api/exec', '/api/pull', '/api/install'):
         assert change(client, 'post', path).status_code == 404
     assert client.get('/api/settings', headers={'Host': 'hostile.example'}).status_code == 400

@@ -131,11 +131,11 @@ async def test_poll_reports_progress_from_start_to_finish(tmp_path, monkeypatch)
         assert manager.progress.snapshot()['running'] and manager.request_poll() is False
         await manager.poll_task
         assert seen[0]['phase'] == 'collecting' and seen[0]['sources']['done'] == 1
-        assert all(s['phase'] == 'analysing' and s['releases']['total'] == 15 for s in seen[1:])
-        assert [s['releases']['done'] for s in seen[1:]] == list(range(15))
         final = manager.progress.snapshot()
+        # Collection only: model work is queued, so the check finishes without waiting for it.
         assert final['running'] is False and final['phase'] == 'done' and final['last_error'] is None
-        assert final['releases'] == {'done': 15, 'total': 15, 'skipped': 5}
+        await manager.classify_task
+        assert manager.queue_length() == 0
         assert final['errors'] == [{'source': 'docker', 'message': 'no socket'}]
     finally:
         manager.close()

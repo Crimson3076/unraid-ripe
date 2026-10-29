@@ -286,14 +286,17 @@ async def test_poll_passes_current_credentials_to_collect_and_classify(tmp_path,
     manager = Coordinator(make_runtime(tmp_path, github='env-github-token-value', gemini='env-gemini-key-value'))
     manager.request_poll = lambda: False
     manager.local_ready = ready
-    try:
+    async def poll_and_classify():
         await manager.poll()
+        await manager.classify_task
+    try:
+        await poll_and_classify()
         manager.change_api_credential('github', {'token': 'saved-github-token-value'})
         manager.change_api_credential('gemini', {'api_key': 'saved-gemini-key-value'})
-        await manager.poll()
+        await poll_and_classify()
         manager.change_api_credential('github', clear=True)
         manager.change_api_credential('gemini', clear=True)
-        await manager.poll()
+        await poll_and_classify()
     finally:
         manager.close()
     assert seen['collect'] == ['env-github-token-value', 'saved-github-token-value', 'env-github-token-value']

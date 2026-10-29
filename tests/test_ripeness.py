@@ -121,6 +121,16 @@ def test_missing_dates_and_classifications_are_honestly_unknown():
     assert build_view(app(None),[release('1.1.0',30)],Settings(),NOW).status == 'unknown'
 
 
+def test_summary_pending_when_any_release_is_unclassified():
+    view=build_view(app(),[release('1.1.0',30,classification=None)],Settings(),NOW)
+    assert view.status=='unknown' and view.status_label=='Summary pending'
+    failed={'status':'unknown','tags':[]}
+    mixed=build_view(app(),[release('1.1.0',30,classification=failed),release('1.2.0',29,classification=None)],Settings(),NOW)
+    assert mixed.status=='unknown' and mixed.status_label=='Summary pending'
+    only_failed=build_view(app(),[release('1.1.0',30,classification=failed)],Settings(),NOW)
+    assert only_failed.status=='unknown' and only_failed.status_label!='Summary pending'
+
+
 def test_update_moves_pending_into_history():
     rs=[release('1.1.0',30),release('1.2.0',2)]
     v=build_view(app('1.1.0'),rs,Settings(),NOW)
