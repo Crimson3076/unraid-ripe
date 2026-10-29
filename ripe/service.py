@@ -301,6 +301,15 @@ class Coordinator:
                                 release.classification = {'status':'unknown','tags':[],'skipped':f'not analysed (older than the newest {settings.analysis_cap})','keyword_warnings':keyword_warnings(release.notes, [])}
                                 release.classification_key = None
                                 release.applicability = conservative_applicability(release.classification)
+                            else:
+                                # Keep the classification, but don't let exclusions made under an
+                                # older profile keep suppressing the item without a model call.
+                                profile_key = fingerprint([app.profile.model_dump(exclude={'origin'}),release.classification_key,settings.local_model,settings.ollama_url,prompt_digest()])
+                                current = self.store.get('applicability:' + profile_key)
+                                if current is not None and all(item.get('verified') for item in current):
+                                    release.applicability = current
+                                else:
+                                    release.applicability = conservative_applicability(release.classification)
                             self.store.save_release(release)
                             continue
                         queue.append((priority(app, release, analysed[release.id]), len(queue), app, release, generation))

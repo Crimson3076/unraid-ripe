@@ -211,3 +211,34 @@ async def test_short_security_notes_keep_keyword_warnings(tmp_path,monkeypatch):
     calls,stored=await _run(tmp_path,monkeypatch,[app],releases)
     assert calls==[]
     assert stored['1.1.0'].classification['keyword_warnings']
+
+
+@pytest.mark.asyncio
+async def test_stale_exclusions_reset_outside_the_analysis_cap(tmp_path,monkeypatch):
+    app,releases=_many(2)
+    manager=Coordinator(runtime(tmp_path))
+    async def collect(*args,**kwargs):
+        return [app],releases,[]
+    async def ready(*args):
+        return True
+    async def classify(release,app,settings,**kwargs):
+        return release.model_copy(update={'classification':{'status':'ok','tags':['security'],'tag_evidence':{}},'classification_key':classification_key(release,app,settings)})
+    async def applic(release,app,settings,**kwargs):
+        return release
+    monkeypatch.setattr(service,'collect',collect)
+    monkeypatch.setattr(service,'classify_release',classify)
+    monkeypatch.setattr(service,'analyze_applicability',applic)
+    monkeypatch.setattr(manager,'local_ready',ready)
+    try:
+        await manager.poll()
+        old=next(r for r in manager.store.releases(app.id) if r.version=='1.1.0')
+        old.applicability=[{'kind':'security','index':0,'status':'does_not_apply','reason':'x','evidence':'y','profile_evidence':'z','verified':True}]
+        manager.store.save_release(old)
+        _,releases[:]=_many(20)
+        app.latest_version='1.20.0'
+        await manager.poll()
+        stored={r.version:r for r in manager.store.releases(app.id)}
+    finally:
+        manager.close()
+    assert stored['1.1.0'].classification['status']=='ok'
+    assert not any(i.get('status')=='does_not_apply' for i in stored['1.1.0'].applicability)
