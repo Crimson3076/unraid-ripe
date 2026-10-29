@@ -9,15 +9,17 @@ from datetime import datetime
 from typing import Any
 import httpx
 from .config import Runtime
-from .models import AppRecord, AppView, Profile, Release, Settings, utcnow
+from .models import AppRecord, AppView, Profile, Release, Settings, hidden, stopped, utcnow
 from .autoprofile import AUTO_FIELDS, merge_profile
 from .store import Store
+from .progress import PollProgress
 from .sources import collect
 from .intelligence import (classify_release, analyze_applicability, sanitize_profile, classification_key,
                            prompt_digest, build_rollup, rollup_key)
 from .intelligence.evidence import conservative_applicability, keyword_warnings
-from .ripeness import build_view, dashboard_sort_key
-from .versions import compare_versions
+from .ripeness import build_view, dashboard_sort_key, _STATUS_ORDER
+from .versions import compare_versions, parse_version
+from .analysis_queue import is_pending, newest_first, priority, trivial_notes
 from .notifications import Notifier
 from .demo import seed_demo
 
@@ -53,6 +55,7 @@ class Coordinator:
         self.demo = False
         self.store = self.real_store
         self.polling = False
+        self.progress = PollProgress()
         self.closing = False
         self.lock = asyncio.Lock()
         self.task: asyncio.Task | None = None
@@ -133,20 +136,111 @@ class Coordinator:
             view.rollup = stored
         return view
 
-    def views(self, now: datetime | None = None) -> list[AppView]:
+    @staticmethod
+    def ignore_target(view: AppView) -> str | None:
+        """What an ignore pins: the image digest for latest-only images (rebuilds keep the same upstream version), else the version."""
+        app = view.app
+        if app.latest_only and app.latest_digest:
+            return app.latest_digest
+        return view.latest_version or app.latest_digest
+
+    @staticmethod
+    def version_ignored(view: AppView) -> bool:
+        """The user hid this update; it stays hidden until something newer than the hidden version exists."""
+        app = view.app
+        if not app.ignored_version:
+            return False
+        latest = Coordinator.ignore_target(view)
+        if not latest or view.status == 'up_to_date':
+            return False
+        comparison = compare_versions(latest, app.ignored_version)
+        return latest == app.ignored_version or (comparison is not None and comparison <= 0)
+
+    def inventory(self, now: datetime | None = None, only: str | None = None) -> dict:
+        """Cards for the Overview: hidden apps removed, sidecars folded into their parent, ignored items listed apart."""
         settings = self.settings()
-        return sorted([self.with_rollup(build_view(app, self.store.releases(app.id), settings, now)) for app in self.store.apps()],key=dashboard_sort_key)
+        records = self.store.apps()
+        by_id = {a.id: a for a in records}
+        # `only` builds a single app and its sidecars instead of the whole inventory.
+        visible = [a for a in records if not hidden(a, settings, by_id) and (only is None or only in (a.id, a.parent_id))]
+        built = {a.id: self.with_rollup(build_view(a, self.store.releases(a.id), settings, now)) for a in visible}
+        ignored = [{'id': a.id, 'name': a.name, 'scope': 'app', 'version': None} for a in records if a.ignored and not a.merged_into]
+        cards: list[AppView] = []
+        quiet = set()
+        for view in built.values():
+            if view.app.ignored_version and self.version_ignored(view):
+                quiet.add(view.app.id)
+                ignored.append({'id': view.app.id, 'name': view.app.name, 'scope': 'version', 'version': view.app.ignored_version})
+            elif view.app.parent_id not in built:
+                cards.append(view)
+        attention = ('recommended_now', 'read_first', 'unknown', 'waiting', 'ripe')
+        for view in built.values():
+            parent = built.get(view.app.parent_id) if view.app.parent_id else None
+            if parent is None or view.app.id in quiet:
+                continue
+            if parent.app.id in quiet:
+                # Only the parent's version was ignored: a sidecar that needs attention brings the card back.
+                if view.status not in attention:
+                    continue
+                if parent not in cards:
+                    parent.status, parent.status_label, parent.reason = 'up_to_date', 'Up to date', ''
+                    cards.append(parent)
+            parent.sidecars.append(view)
+            # A sidecar's update is the parent's update: its status can only raise the card's.
+            if view.status in attention and _STATUS_ORDER[view.status] < _STATUS_ORDER.get(parent.status, 99):
+                parent.status, parent.status_label = view.status, view.status_label
+                parent.reason = f'{view.app.name}: {view.reason}'
+                parent.recommended_version = view.recommended_version
+                parent.days_remaining, parent.next_ripe_at = view.days_remaining, view.next_ripe_at
+                parent.tags = sorted({*parent.tags, *view.tags})
+        hidden_stopped = sum(1 for a in records if stopped(a) and not settings.include_stopped and not a.ignored and not a.merged_into)
+        return {'views': sorted(cards, key=dashboard_sort_key), 'ignored': sorted(ignored, key=lambda i: i['name'].casefold()), 'stopped_hidden': hidden_stopped}
+
+    def views(self, now: datetime | None = None) -> list[AppView]:
+        return self.inventory(now)['views']
+
+    def set_ignore(self, app_id: str, scope: str, on: bool) -> AppRecord:
+        """Ignore or restore an app, or hide/unhide its current latest version. Undoing an app ignore re-polls it."""
+        app = self.store.app(app_id)
+        if app is None:
+            raise KeyError(app_id)
+        if scope == 'app':
+            app.ignored = on
+        elif on:
+            view = self.view(app_id)
+            latest = self.ignore_target(view) if view else None
+            if not latest:
+                raise ValueError('No newer version is known')
+            app.ignored_version = latest
+        else:
+            app.ignored_version = None
+        self.mark_changed(app_id)
+        self.store.save_app(app)
+        if scope == 'app' and not on:
+            self.request_poll()
+        return app
 
     def view(self, app_id: str) -> AppView | None:
         app = self.store.app(app_id)
-        return self.with_rollup(build_view(app, self.store.releases(app_id), self.settings())) if app else None
+        if app is None:
+            return None
+        # The card carries the sidecars and the status they raise; hidden or ignored apps fall back to their own view.
+        card = next((v for v in self.inventory(only=app_id)['views'] if v.app.id == app_id), None)
+        return card or self.with_rollup(build_view(app, self.store.releases(app_id), self.settings()))
 
     async def refresh_rollup(self, app: AppRecord, settings: Settings, local_ready) -> None:
         """Regenerate the app's rollup only when installed, latest, their notes or the model setup changed."""
         pending = build_view(app, self.store.releases(app.id), settings).pending
+        omitted = max(0, len(pending) - settings.analysis_cap)
+        total = len(pending)
+        pending = pending[omitted:]
         image_diff, manifest = app.detected.get('image_diff'), app.detected.get('manifest_diff')
         # No version known (latest-only image): the installed digest identifies the installation.
         installed = app.installed_version or app.installed_digest
+        if app.section == 'firmware' and not any(r.notes.strip() for r in pending):
+            # Firmware without release notes has nothing to summarise; never send it to a model.
+            self.store.set('rollup:' + app.id, None)
+            return
         if not installed or not (pending or image_diff):
             self.store.set('rollup:' + app.id, None)
             return
@@ -161,23 +255,52 @@ class Coordinator:
         result = await build_rollup(app, installed, latest, pending, settings, image_diff=image_diff,
                                     manifest_diff=manifest, gemini_key=self.runtime.gemini_key,
                                     model_unavailable=unavailable, log_call=self.store.log_llm)
+        if omitted:
+            result['span_note'] = f'Covers the newest {len(pending)} of {total} releases; {omitted} older not analysed.'
         self.store.set('rollup:' + app.id, {'key': key if result['status'] == 'ok' else None, 'result': result})
 
+    @staticmethod
+    def card(view: AppView) -> dict:
+        """Overview fields only; notes, history and classifications load from /api/apps/{id}."""
+        def norm(text) -> str:
+            return ' '.join(str(text or '').lower().split())
+        quotes: dict[str, str] = {}
+        for release in view.pending:
+            c = release.classification or {}
+            for tag in c.get('tags', []):
+                evidence = (c.get('tag_evidence') or {}).get(tag)
+                if tag not in quotes and norm(evidence) and norm(evidence) in norm(release.notes):
+                    quotes[tag] = f'{release.version}: {evidence}'
+        data = view.model_dump(mode='json', exclude={'pending', 'history', 'available_notes', 'no_notes', 'rollup', 'sidecars'})
+        data['sidecars'] = [Coordinator.card(side) for side in view.sidecars]
+        data['app']['detected'] = {k: v for k, v in data['app']['detected'].items() if k == 'mapping_hint'}
+        data['tag_quotes'] = quotes
+        data['rollup'] = {'headline': view.rollup['headline']} if view.rollup and view.rollup.get('headline') else None
+        return data
+
     def dashboard(self) -> dict:
-        views = self.views()
+        inventory = self.inventory()
+        views = inventory['views']
         counts = Counter(v.status for v in views)
-        return {'apps': [v.model_dump(mode='json') for v in views], 'demo': self.demo,
+        return {'apps': [self.card(v) for v in views], 'demo': self.demo,
+                'ignored': inventory['ignored'], 'stopped_hidden': inventory['stopped_hidden'],
+                'include_stopped': self.settings().include_stopped,
                 'summary': {s:counts[s] for s in ('ripe','waiting','recommended_now','read_first','up_to_date','unknown')},
                 'last_poll':self.store.get('last_poll'), 'polling': self.polling,
-                **self.progress(),
+                **self.queue_progress(),
                 'integration_status': self.integration_status(), 'timezone':self.settings().timezone,
-                'auto_profiles': self.auto_profiles()}
+                'auto_profiles': self.auto_profiles(), 'analysis': self.store.get('analysis_progress'), 'poll': self.progress.snapshot()}
 
     def auto_profiles(self) -> list[dict]:
         """Apps Ripe filled in by itself that the user has not yet acknowledged."""
         reviewed = set(self.store.get('autoprofile:reviewed', []))
         found = []
-        for app in self.store.apps():
+        settings = self.settings()
+        records = self.store.apps()
+        by_id = {a.id: a for a in records}
+        for app in records:
+            if hidden(app, settings, by_id):
+                continue
             evidence = app.detected.get('profile_evidence') or {}
             reasons = {f: evidence[f] for f in (*AUTO_FIELDS, 'upstream_repo') if evidence.get(f) and app.profile.origin.get(f, 'auto') != 'user'}
             if reasons and app.id not in reviewed:
@@ -187,7 +310,7 @@ class Coordinator:
     def review_auto_profiles(self):
         self.store.set('autoprofile:reviewed', sorted({*self.store.get('autoprofile:reviewed', []), *(a['id'] for a in self.auto_profiles())}))
 
-    def progress(self) -> dict:
+    def queue_progress(self) -> dict:
         return {'last_collection': self.store.get('last_collection') or self.store.get('last_poll'),
                 'classification_queue_length': self.queue_length(),
                 'last_classification': self.store.get('last_classification')}
@@ -232,6 +355,7 @@ class Coordinator:
         token = object()
         self.poll_token = token
         self.polling = True
+        self.progress.start()
         self.poll_started = time.monotonic()
         self.poll_task = asyncio.create_task(self.poll(token))
 
@@ -245,6 +369,9 @@ class Coordinator:
         self.start_poll()
         return True
 
+    def poll_status(self) -> dict:
+        return self.progress.snapshot()
+
     def mark_changed(self, app_id: str):
         self.store.set('generation:' + app_id, self.store.get('generation:' + app_id, 0) + 1)
         if self.polling:
@@ -255,20 +382,26 @@ class Coordinator:
         if self.demo:
             return
         token = token or object()
+        failure = None
         try:
             async with self.lock:
                 self.poll_token = token
                 self.polling = True
                 self.poll_started = time.monotonic()
+                if not self.progress.running:
+                    self.progress.start()
                 await self.collect_inventory()
         except asyncio.CancelledError:
+            failure = 'Check was interrupted.'
             raise
         except Exception as exc:
             # External response bodies/exception strings can contain secrets.
-            self.store.log_error({'source':'collector','message':f'Collection failed ({type(exc).__name__}); last known records preserved.'})
+            failure = f'Collection failed ({type(exc).__name__}); last known records preserved.'
+            self.store.log_error({'source':'collector','message':failure})
         finally:
             # An abandoned poll no longer owns the flag (a newer poll may).
             if self.poll_token is token:
+                self.progress.finish(failure)
                 self.polling = False
                 self.poll_token = None
                 if not self.closing and self.store.get('poll_again'):
@@ -283,13 +416,17 @@ class Coordinator:
             ha_token=self.runtime.ha_token, ha_url=self.runtime.ha_url,
             docker_socket=self.runtime.docker_socket, templates_dir=self.runtime.templates_dir,
             unraid_version_file=self.runtime.unraid_version_file,
-            cache_get=self.store.get, cache_set=self.store.set, existing_apps=self.store.apps())
+            cache_get=self.store.get, cache_set=self.store.set, existing_apps=self.store.apps(),
+            progress=self.progress)
+        self.progress.end_collecting()
+        self.progress.add_errors(errors)
         for error in errors:
             self.store.log_error(error)
         by_app: dict[str,list[Release]] = {}
         for release in releases:
             by_app.setdefault(release.app_id, []).append(release)
-        work: list[Release] = []
+        work: list = []
+        by_id = {a.id: a for a in apps}
         # No awaits below: the stored queue is replaced atomically.
         for app in apps:
             if self.store.get('generation:' + app.id, 0) != generations.get(app.id, 0):
@@ -314,6 +451,8 @@ class Coordinator:
                     release.classification_key = old.classification_key
                     release.model_disagreement = old.model_disagreement
                 self.store.save_release(release)
+            if hidden(app, settings, by_id):
+                continue  # ignored, merged or stopped: no analysis, no model calls
             work.extend(self.pending_work(app, settings))
         # Mark a source failure as stale rather than silently deleting its
         # previous records; these visible errors prevent a fresh-data claim.
@@ -322,9 +461,9 @@ class Coordinator:
             if prior.id not in current_ids:
                 prior.error = 'Not seen in the latest collection; source may be unavailable. Last known data shown.'
                 self.store.save_app(prior)
-        # Newest first, so the releases that matter most are summarised first.
-        work.sort(key=lambda r: r.published_at.timestamp() if r.published_at else 0, reverse=True)
-        self.store.set('classification_queue', [{'app_id':r.app_id,'release_id':r.id} for r in work])
+        # Exposed apps and security wording first, then newest, so what matters most is summarised first.
+        work.sort(key=lambda item: item[0])
+        self.store.set('classification_queue', [{'app_id':r.app_id,'release_id':r.id} for _, r in work])
         now = utcnow().isoformat()
         self.store.set('last_poll', now)
         self.store.set('last_collection', now)
@@ -335,12 +474,32 @@ class Coordinator:
         self.request_classification()
         await self.notify()
 
-    def pending_work(self, app: AppRecord, settings: Settings) -> list[Release]:
-        """Apply cached results to pending releases; return those still needing the model."""
+    def pending_work(self, app: AppRecord, settings: Settings) -> list[tuple]:
+        """Apply cached results to pending releases; return (priority, release) for those still needing the model."""
         work = []
-        # Older records supply history and base-line dates without spending LLM
-        # work on releases that aren't pending.
-        for release in build_view(app, self.store.releases(app.id), settings).pending:
+        releases = self.store.releases(app.id)
+        # Same channel and latest-version ceiling as the dashboard span, so betas
+        # or releases above an authoritative latest don't use up the cap.
+        shown = {r.id for r in build_view(app, releases, settings).pending}
+        unknown_installed = parse_version(app.installed_version) is None
+        pending = newest_first([r for r in releases if is_pending(r, app) and (unknown_installed or r.id in shown)])
+        for rank, release in enumerate(pending):
+            if trivial_notes(release.notes):
+                release = release.model_copy(update={'classification':{'status':'unknown','tags':[],'skipped':'no notes','keyword_warnings':keyword_warnings(release.notes, [])},'classification_key':None})
+                self.store.save_release(release.model_copy(update={'applicability':conservative_applicability(release.classification)}))
+                continue
+            if rank >= settings.analysis_cap:
+                if not release.classification or release.classification.get('status') != 'ok':
+                    release = release.model_copy(update={'classification':{'status':'unknown','tags':[],'skipped':f'not analysed (older than the newest {settings.analysis_cap})','keyword_warnings':keyword_warnings(release.notes, [])},'classification_key':None})
+                    release = release.model_copy(update={'applicability':conservative_applicability(release.classification)})
+                else:
+                    # Keep the classification, but don't let exclusions made under an
+                    # older profile keep suppressing the item without a model call.
+                    current = self.store.get('applicability:' + self.profile_key(app, release, settings))
+                    verified = current is not None and all(item.get('verified') for item in current)
+                    release = release.model_copy(update={'applicability': current if verified else conservative_applicability(release.classification)})
+                self.store.save_release(release)
+                continue
             key = classification_key(release, app, settings)
             cached = self.store.get('classification:' + key)
             changed = False
@@ -361,7 +520,7 @@ class Coordinator:
             if changed:
                 self.store.save_release(release)
             if not done:
-                work.append(release)
+                work.append((priority(app, release, rank), release))
         return work
 
     @staticmethod
@@ -373,7 +532,11 @@ class Coordinator:
 
     def rollups_due(self) -> bool:
         settings = self.settings()
-        for app in self.store.apps():
+        records = self.store.apps()
+        by_id = {a.id: a for a in records}
+        for app in records:
+            if hidden(app, settings, by_id):
+                continue
             pending = build_view(app, self.store.releases(app.id), settings).pending
             installed = app.installed_version or app.installed_digest
             if installed and (pending or app.detected.get('image_diff')):
@@ -424,9 +587,13 @@ class Coordinator:
             if ready[0] is None:
                 ready[0] = await self.local_ready(settings)
             return ready[0]
-        for app in self.store.apps():
+        records = self.store.apps()
+        by_id = {a.id: a for a in records}
+        for app in records:
             if self.closing or self.demo:
                 break
+            if hidden(app, settings, by_id):
+                continue
             try:
                 await self.refresh_rollup(app, settings, local_ready)
             except asyncio.CancelledError:
@@ -438,7 +605,7 @@ class Coordinator:
         """Process one queued release; False means stop the run and keep the queue."""
         app = self.store.app(item['app_id'])
         release = next((r for r in self.store.releases(item['app_id']) if r.id == item['release_id']), None)
-        if not app or not release or compare_versions(release.version, app.installed_version) != 1:
+        if not app or not release or not is_pending(release, app) or hidden(app, self.settings(), {a.id: a for a in self.store.apps()}):
             self.dequeue(item)
             return True
         settings = self.settings()
