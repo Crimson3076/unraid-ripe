@@ -303,3 +303,43 @@ def test_dashboard_payload_is_small_and_detail_keeps_notes(client):
     assert all('pending' not in c and 'history' not in c for c in cards)
     assert cards[0]['tag_quotes'] == {'bugfix': '1.1.0: Fixed a search bug.'}
     assert client.get('/api/apps/a0').json()['pending'][0]['notes'] == big
+
+
+def test_ui_token_protects_settings_and_mutations(locked):
+    for url in ('/settings', '/logs', '/api/settings', '/api/logs', '/api/connections/home-assistant'):
+        response = locked.get(url)
+        assert response.status_code == 401, url
+        assert 'lan-token-xyz' not in response.text
+    assert locked.patch('/api/settings', json={'poll_hours': 24}, headers={'X-Ripe-Request': '1'}).status_code == 401
+    assert locked.post('/api/poll').status_code == 401
+    for url in ('/', '/health', '/api/dashboard'):
+        assert locked.get(url).status_code == 200, url
+
+
+def test_ui_token_rejects_wrong_credentials_and_requires_csrf(locked):
+    assert locked.get('/api/settings', headers={'Authorization': 'Bearer wrong'}).status_code == 401
+    assert locked.get('/api/settings', headers={'Authorization': 'Bearer lan-token-xyz'}).status_code == 200
+    assert locked.get('/settings', auth=('anyone', 'lan-token-xyz')).status_code == 200
+    assert locked.get('/settings', auth=('lan-token-xyz', 'nope')).status_code == 401
+    assert locked.get('/api/settings', headers={'Authorization': 'Basic !!!'}).status_code == 401
+    ok = locked.patch('/api/settings', json={'poll_hours': 24},
+                      headers={'X-Ripe-Request': '1', 'Authorization': 'Bearer lan-token-xyz'})
+    assert ok.status_code == 200
+    # CSRF check still applies after authentication.
+    assert locked.patch('/api/settings', json={'poll_hours': 12},
+                        headers={'Authorization': 'Bearer lan-token-xyz'}).status_code == 403
+
+
+def test_ui_token_is_off_by_default(client):
+    assert client.get('/api/settings').status_code == 200
+
+
+def test_ui_token_keeps_dashboard_progress_public(locked):
+    response = locked.get('/api/poll/status')
+    assert response.status_code == 200
+    assert 'www-authenticate' not in response.headers
+    assert locked.get('/api/settings').status_code == 401
+
+
+def test_ui_token_rejects_non_utf8_basic_credentials(locked):
+    assert locked.get('/api/settings', headers={'Authorization': 'Basic /w=='}).status_code == 401

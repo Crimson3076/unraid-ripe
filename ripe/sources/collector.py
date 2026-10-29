@@ -6,6 +6,7 @@ import hashlib
 import ipaddress
 import json
 import re
+from collections import Counter
 import socket
 import time
 from datetime import datetime, timezone
@@ -44,7 +45,7 @@ def usable_version_label(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
     value = value.strip()
-    if not value or len(value) > 100 or value.lower() in ("latest", "unknown", "develop", "master", "main"):
+    if not value or len(value) > 100 or value.lower() in ("latest", "unknown", "develop", "master", "main", "null", "none"):
         return None
     return None if BASE_OS_LABEL.fullmatch(value) else value
 
@@ -862,6 +863,22 @@ def ha_records(states: list[JSON], notes: dict[str, str], existing: dict[str, Ap
     return apps, releases
 
 
+def disambiguate_ha_names(apps: list[AppRecord], states: list[JSON]) -> None:
+    """Many devices share one update title ("Cync Full Color A19 Firmware"); keep them distinguishable.
+
+    Runs over all collected HA apps at once, since collect() parses entities one at a time.
+    """
+    counts = Counter(a.name for a in apps)
+    friendly = {"ha:" + str(s.get("entity_id")): str((s.get("attributes") or {}).get("friendly_name") or "") for s in states}
+    proposed = {a.id: friendly.get(a.id) for a in apps if counts[a.name] > 1}
+    proposed_counts = Counter(proposed.values())
+    for a in apps:
+        if counts[a.name] > 1:
+            name = proposed[a.id]
+            unique = name and name != a.name and counts[name] == 0 and proposed_counts[name] == 1
+            a.name = name if unique else f"{a.name} ({a.detected['entity_id']})"
+
+
 def installed_unraid(path: str) -> str | None:
     try:
         content = Path(path).read_text()[:2048]
@@ -907,14 +924,17 @@ async def collect(settings: Settings, *, github_token: str | None = None, ha_tok
             try:
                 states = await ha_states(local, ha_url, ha_token)
                 notes = await ha_release_notes(ha_url, ha_token, [e["entity_id"] for e in states if e.get("state")=="on"])
+                collected: list[AppRecord] = []
                 for state in states:
                     try:
                         ha_apps, ha_notes = ha_records([state], notes, existing)
                     except PARSE_ERRORS:
                         error("ha:" + str(state.get("entity_id")), "Home Assistant: entity parse error")
                         continue
-                    apps.extend(ha_apps)
+                    collected.extend(ha_apps)
                     releases.extend(ha_notes)
+                disambiguate_ha_names(collected, states)
+                apps.extend(collected)
             except SourceError as exc:
                 error("home_assistant", str(exc))
             except PARSE_ERRORS:

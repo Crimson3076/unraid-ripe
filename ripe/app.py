@@ -2,6 +2,7 @@
 from __future__ import annotations
 import asyncio
 import base64
+import binascii
 import hmac
 import os
 import re
@@ -26,7 +27,7 @@ from .notifications import Notifier, is_quiet
 
 PACKAGE = Path(__file__).parent
 # Read-only pages that stay open when RIPE_UI_TOKEN is set; everything else needs the token.
-OPEN_READS = ('/', '/health', '/static', '/apps', '/api/dashboard', '/api/apps')
+OPEN_READS = ('/', '/health', '/static', '/apps', '/api/dashboard', '/api/apps', '/api/poll/status')
 
 
 def token_ok(request: Request, token: str) -> bool:
@@ -36,7 +37,7 @@ def token_ok(request: Request, token: str) -> bool:
     if kind.lower() == 'basic':
         try:
             value = base64.b64decode(value, validate=True).decode().partition(':')[2]
-        except ValueError:
+        except (binascii.Error, UnicodeDecodeError):
             return False
     elif kind.lower() != 'bearer':
         return False
@@ -101,7 +102,6 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
                     with suppress(asyncio.CancelledError):
                         await task
             manager.close()
-    ui_token = (runtime.ui_token if runtime else os.getenv('RIPE_UI_TOKEN')) or None
     app = FastAPI(title='Ripe',version=__version__,lifespan=lifespan, docs_url=None, redoc_url=None)
 
     @app.exception_handler(RequestValidationError)
@@ -112,14 +112,15 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
 
     @app.middleware('http')
     async def protect(request: Request, call_next):
+        token = request.app.state.manager.runtime.ui_token
+        if token and needs_token(request) and not token_ok(request, token):
+            return JSONResponse({'detail':'Authentication required'}, status_code=401,
+                                headers={'WWW-Authenticate':'Basic realm="Ripe", charset="UTF-8"'})
         try:
             if int(request.headers.get('content-length', '0')) > 262144:
                 return JSONResponse({'detail':'Request too large'}, status_code=413)
         except ValueError:
             return JSONResponse({'detail':'Invalid request'}, status_code=400)
-        if ui_token and needs_token(request) and not token_ok(request, ui_token):
-            return JSONResponse({'detail':'Authentication required'}, status_code=401,
-                                headers={'WWW-Authenticate':'Basic realm="Ripe", charset="UTF-8"'})
         if request.method not in ('GET','HEAD','OPTIONS'):
             if request.headers.get('x-ripe-request') != '1':
                 return JSONResponse({'detail':'A same-origin Ripe request is required'}, status_code=403)
