@@ -6,6 +6,7 @@ import hashlib
 import ipaddress
 import json
 import re
+from collections import Counter
 import socket
 import time
 from datetime import datetime, timezone
@@ -19,7 +20,7 @@ import httpx
 import websockets
 
 from ripe.autoprofile import AUTO_FIELDS, INFRA, derive, probe_login, read_cloudflared_targets, read_facts, read_npm_targets
-from ripe.models import AppRecord, Profile, Release, Settings, utcnow
+from ripe.models import AppRecord, Profile, Release, Settings, hidden, utcnow
 from ripe.versions import compare_versions, normalize_version, parse_version, version_parts
 
 JSON = dict[str, Any]
@@ -44,7 +45,7 @@ def usable_version_label(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
     value = value.strip()
-    if not value or len(value) > 100 or value.lower() in ("latest", "unknown", "develop", "master", "main"):
+    if not value or len(value) > 100 or value.lower() in ("latest", "unknown", "develop", "master", "main", "null", "none"):
         return None
     return None if BASE_OS_LABEL.fullmatch(value) else value
 
@@ -132,8 +133,21 @@ def read_templates(directory: str) -> dict[str, JSON]:
 PARSE_ERRORS = (AttributeError, TypeError, ValueError, KeyError)
 
 
+MAPPING_RETRY_SECONDS = 6 * 3600
+
+
+def token_fingerprint(token: str | None) -> str:
+    # Non-reversible tag so a replaced token retries a flagged mapping without storing the token.
+    return hashlib.sha256(("ripe-mapping:" + token).encode()).hexdigest()[:12] if token else ""
+MAPPING_ERROR = "GitHub: mapping needs attention (repository not found)"
+
+
 class SourceError(Exception):
     """Intentionally safe to persist: only fixed source labels and status codes."""
+
+
+class SourceNotFound(SourceError):
+    """HTTP 404: the mapped repository is private or does not exist."""
 
 
 class CachedHTTP:
@@ -158,6 +172,8 @@ class CachedHTTP:
             cached["fetched"] = time.time()
             self.cache_set(key, cached)
             return cached["body"]
+        if response.status_code == 404:
+            raise SourceNotFound(f"{source}: HTTP 404")
         if response.status_code >= 400:
             raise SourceError(f"{source}: HTTP {response.status_code}")
         if len(response.content) > 8 * 1024 * 1024:
@@ -264,9 +280,11 @@ A :ro socket mount alone does not make the Docker daemon's API read-only.
             web_url = safe_url(web_url)
         self.facts[key] = read_facts(item, info, inspect)
         detected = {"ports":ports, "revision": str(labels.get("org.opencontainers.image.revision", ""))[:80], "registry": host, "tag": tag, "profile_evidence": evidence}
+        if source := github_repo(labels.get("org.opencontainers.image.source")):
+            detected["image_source"] = source
         if upstream and evidence.get("upstream_repo"):
             detected["upstream_auto"] = True
-        return (AppRecord(id=key, name=name, source="docker", installed_version=installed, image=image, installed_digest=digest, image_created_at=date(info.get("Created")), upstream_repo=upstream, icon=tpl.get("icon"), web_url=web_url, profile=profile, detected=detected))
+        return (AppRecord(id=key, name=name, source="docker", installed_version=installed, image=image, installed_digest=digest, image_created_at=date(info.get("Created")), upstream_repo=upstream, icon=tpl.get("icon"), web_url=web_url, profile=profile, detected=detected, state=str(item.get("State") or "").lower() or None))
 
 
 def parse_image(image: str) -> tuple[str, str, str]:
@@ -606,6 +624,18 @@ def version_key(value: str) -> tuple:
     return tuple(int(v) for v in re.findall(r"\d+", value)[:6])
 
 
+def mapping_suggestion(app: AppRecord) -> str | None:
+    """Best guess at a working repository: OCI source label, else GHCR owner/package."""
+    current = (app.upstream_repo or "").lower()
+    if (source := github_repo(app.detected.get("image_source"))) and source.lower() != current:
+        return source
+    if app.image:
+        host, repo, _ = parse_image(app.image)
+        if host == "ghcr.io" and repo.count("/") == 1 and repo.lower() != current:
+            return repo
+    return None
+
+
 def latest_stable(releases: list[Release]) -> Release | None:
     """Newest final release; unparseable tags and pre-releases never qualify."""
     final = [r for r in releases if not r.prerelease and (v := parse_version(r.version)) is not None and not v.is_prerelease]
@@ -620,7 +650,6 @@ async def github_releases(http: CachedHTTP, repo: str, app_id: str, token: str |
     if token:
         headers["Authorization"] = "Bearer " + token
     releases = []
-    complete = False
     for page in range(1, 11):
         data = await http.get(f"https://api.github.com/repos/{repo}/releases?per_page=100&page={page}", headers=headers, source="GitHub")
         if not isinstance(data, list):
@@ -633,17 +662,19 @@ async def github_releases(http: CachedHTTP, repo: str, app_id: str, token: str |
                 continue
             releases.append(Release(id=f"github:{repo}:{item.get('id', version)}", app_id=app_id, version=version, published_at=date(item.get("published_at")), prerelease=bool(item.get("prerelease")), notes=str(item.get("body") or ""), source_url=f"https://github.com/{repo}/releases/tag/{quote(version, safe='')}"))
         if len(data) < 100:
-            complete = True
             break
         # We intentionally retain historical base releases for the patch rule.
         if installed_version:
             target = version_parts(installed_version)
             known = [k for r in releases if (k := version_parts(r.version))]
             if target and known and min(known) < target and any(len(k)>=3 and k[:2]==target[:2] and k[2]==0 for k in known):
-                complete = True
                 break
-    if not complete:
-        raise SourceError("GitHub: release history exceeded 1000 records; narrow repository mapping or inspect manually")
+    else:
+        # Page limit reached without proving coverage of the pending span. Creation order is not
+        # version order, so dropped pages could hold pending releases; do not report "up to date".
+        # A history with no parseable versions has nothing to mis-rank, so it is not an error.
+        if any(version_parts(r.version) for r in releases):
+            raise SourceError("GitHub: release history exceeded 1000 records; narrow repository mapping or inspect manually")
     return releases
 
 
@@ -768,6 +799,40 @@ async def ha_release_notes(ha_url: str, token: str, entity_ids: list[str]) -> di
     return result
 
 
+FIRMWARE = re.compile(r"firmware", re.I)
+HA_CARD = re.compile(r"\b(?:cards?|integrations?|custom components?|themes?|hacs)\b", re.I)
+
+
+def ha_section(attr: JSON, title: str) -> str | None:
+    if attr.get("device_class") == "firmware" or FIRMWARE.search(title):
+        return "firmware"
+    if HA_CARD.search(title) or "hacs" in str(attr.get("entity_picture") or "").lower():
+        return "cards"
+    return None
+
+
+def merge_ha_duplicates(apps: list[AppRecord]) -> None:
+    """Fold update entities that track the same repository into one; devices keep their own entry.
+
+    Firmware is per device, so it is never merged. Entities must also agree on installed and latest version: a
+    monorepo shared by different add-ons or cards keeps one entry each. Entities left with the same name get their entity id appended.
+    """
+    survivors: dict[tuple, AppRecord] = {}
+    for app in sorted((a for a in apps if a.source == "home_assistant" and a.section != "firmware" and a.upstream_repo), key=lambda a: (a.update_available is not True, a.id)):
+        first = survivors.setdefault((app.upstream_repo.lower(), app.installed_version, app.latest_version), app)
+        if first is not app:
+            app.merged_into = first.id
+            first.detected.setdefault("merged_entities", []).append(app.detected.get("entity_id", app.id))
+    seen: dict[str, list[AppRecord]] = {}
+    for app in apps:
+        if app.source == "home_assistant" and not app.merged_into:
+            seen.setdefault(app.name.casefold(), []).append(app)
+    for same in seen.values():
+        if len(same) > 1:
+            for app in same:
+                app.name = f"{app.name} ({str(app.detected.get('entity_id', app.id)).removeprefix('update.')})"
+
+
 def ha_records(states: list[JSON], notes: dict[str, str], existing: dict[str, AppRecord]) -> tuple[list[AppRecord], list[Release]]:
     apps, releases = [], []
     for item in states:
@@ -789,13 +854,29 @@ def ha_records(states: list[JSON], notes: dict[str, str], existing: dict[str, Ap
             evidence["upstream_repo"] = "Home Assistant update entity release_url"
         if INFRA.search(title):
             evidence["tier"] = f"name matches '{INFRA.search(title).group(0).lower()}'"
-        apps.append(AppRecord(id=key, name=title, source="home_assistant", installed_version=installed, latest_version=latest, update_available=item.get("state")=="on" if item.get("state") in ("on", "off") else None, upstream_repo=repo, icon=safe_url(attr.get("entity_picture")), profile=profile, detected={"entity_id":entity_id, "profile_evidence":evidence}, error="Entity unavailable" if item.get("state") in ("unavailable", "unknown") else None))
+        apps.append(AppRecord(id=key, name=title, source="home_assistant", installed_version=installed, latest_version=latest, update_available=item.get("state")=="on" if item.get("state") in ("on", "off") else None, upstream_repo=repo, icon=safe_url(attr.get("entity_picture")), profile=profile, detected={"entity_id":entity_id, "profile_evidence":evidence}, error="Entity unavailable" if item.get("state") in ("unavailable", "unknown") else None, section=ha_section(attr, title)))
         text = notes.get(entity_id) or attr.get("release_summary") or ""
         if latest and text:
             # HA update states do not include publication date. Do not start an
             # invented soak clock from state.last_changed or poll time.
             releases.append(Release(id=f"ha:{entity_id}:{latest}", app_id=key, version=latest, notes=str(text), source_url=url or ""))
     return apps, releases
+
+
+def disambiguate_ha_names(apps: list[AppRecord], states: list[JSON]) -> None:
+    """Many devices share one update title ("Cync Full Color A19 Firmware"); keep them distinguishable.
+
+    Runs over all collected HA apps at once, since collect() parses entities one at a time.
+    """
+    counts = Counter(a.name for a in apps)
+    friendly = {"ha:" + str(s.get("entity_id")): str((s.get("attributes") or {}).get("friendly_name") or "") for s in states}
+    proposed = {a.id: friendly.get(a.id) for a in apps if counts[a.name] > 1}
+    proposed_counts = Counter(proposed.values())
+    for a in apps:
+        if counts[a.name] > 1:
+            name = proposed[a.id]
+            unique = name and name != a.name and counts[name] == 0 and proposed_counts[name] == 1
+            a.name = name if unique else f"{a.name} ({a.detected['entity_id']})"
 
 
 def installed_unraid(path: str) -> str | None:
@@ -807,13 +888,15 @@ def installed_unraid(path: str) -> str | None:
         return None
 
 
-async def collect(settings: Settings, *, github_token: str | None = None, ha_token: str | None = None, ha_url: str = "", docker_socket: str = "/var/run/docker.sock", templates_dir: str = "/host/templates", unraid_version_file: str = "/host/unraid-version", cache_get: Callable | None = None, cache_set: Callable | None = None, existing_apps: list[AppRecord] | None = None) -> tuple[list[AppRecord], list[Release], list[JSON]]:
+async def collect(settings: Settings, *, github_token: str | None = None, ha_token: str | None = None, ha_url: str = "", docker_socket: str = "/var/run/docker.sock", templates_dir: str = "/host/templates", unraid_version_file: str = "/host/unraid-version", cache_get: Callable | None = None, cache_set: Callable | None = None, existing_apps: list[AppRecord] | None = None, progress=None) -> tuple[list[AppRecord], list[Release], list[JSON]]:
     existing = {a.id:a for a in existing_apps or []}
     apps: list[AppRecord] = []
     releases: list[Release] = []
     errors: list[JSON] = []
     def error(source: str, message: str):
         errors.append({"source":source, "message":message})
+    if progress:
+        progress.add_sources(3)
     async with httpx.AsyncClient(timeout=20, follow_redirects=False, trust_env=True, headers={"User-Agent":"Ripe/0.1 homelab update tracker"}) as public, httpx.AsyncClient(timeout=12, follow_redirects=False, trust_env=False) as local:
         cached = CachedHTTP(public, cache_get, cache_set)
         registry = RegistryReader(public, cache_get, cache_set)
@@ -835,24 +918,31 @@ async def collect(settings: Settings, *, github_token: str | None = None, ha_tok
                 error("docker", "Docker: parse error")
         else:
             error("docker", "Docker socket not mounted; mount read-only to enable discovery")
+        if progress:
+            progress.source_done("Docker")
         if ha_token and ha_url:
             try:
                 states = await ha_states(local, ha_url, ha_token)
                 notes = await ha_release_notes(ha_url, ha_token, [e["entity_id"] for e in states if e.get("state")=="on"])
+                collected: list[AppRecord] = []
                 for state in states:
                     try:
                         ha_apps, ha_notes = ha_records([state], notes, existing)
                     except PARSE_ERRORS:
                         error("ha:" + str(state.get("entity_id")), "Home Assistant: entity parse error")
                         continue
-                    apps.extend(ha_apps)
+                    collected.extend(ha_apps)
                     releases.extend(ha_notes)
+                disambiguate_ha_names(collected, states)
+                apps.extend(collected)
             except SourceError as exc:
                 error("home_assistant", str(exc))
             except PARSE_ERRORS:
                 error("home_assistant", "Home Assistant: parse error")
         else:
             error("home_assistant", "Home Assistant connection is not configured; open Ripe Settings to enable discovery")
+        if progress:
+            progress.source_done("Home Assistant")
         unraid = AppRecord(id="unraid:os", name="Unraid OS", source="unraid", installed_version=installed_unraid(unraid_version_file), upstream_repo=None, profile=Profile(tier="infrastructure", exposure="lan", origin={f: "auto" for f in AUTO_FIELDS}), detected={"profile_evidence": {"tier": "Unraid OS is the host everything else runs on"}})
         if not unraid.installed_version:
             unraid.error = "Unraid version file not mounted or version unrecognised"
@@ -870,11 +960,26 @@ async def collect(settings: Settings, *, github_token: str | None = None, ha_tok
             unraid.error = "Unraid release notes: parse error"
             error("unraid", unraid.error)
         apps.append(unraid)
+        merge_ha_duplicates(apps)
+        for app in apps:
+            if previous := existing.get(app.id):
+                app.ignored, app.ignored_version = previous.ignored, previous.ignored_version
+        by_id = {a.id: a for a in apps}
+        if progress:
+            progress.source_done("Unraid")
+            progress.add_sources(len(apps))
         # Pagination can stop at an installed version's historical base. A
         # repository-only cache would silently give older installations the
         # shorter span fetched for a newer installation of the same app.
         upstream_cache: dict[tuple[str, str | None], list[Release] | str] = {}
         for app in apps:
+            if hidden(app, settings, by_id):
+                # Ignored, merged or stopped: no registry or GitHub traffic at all.
+                if progress:
+                    progress.source_done(app.name)
+                continue
+            if progress:
+                progress.working_on(app.name)
             registry_ok = False
             if app.source == "docker" and app.image and is_local_image(app.image, app.installed_digest, bool(existing.get(app.id) and existing[app.id].latest_digest)):
                 # Never pulled from a registry: nothing to look up, and not an error.
@@ -915,12 +1020,20 @@ async def collect(settings: Settings, *, github_token: str | None = None, ha_tok
                     error(app.id, str(exc))
                 except PARSE_ERRORS:
                     error(app.id, "Registry: parse error")
-            if app.upstream_repo:
+            flagged = (existing[app.id].detected.get("invalid_mapping") if app.id in existing else None) or {}
+            if app.upstream_repo and str(flagged.get("repo", "")).lower() == app.upstream_repo.lower() \
+                    and flagged.get("token") == token_fingerprint(github_token) and time.time() - float(flagged.get("at") or 0) < MAPPING_RETRY_SECONDS:
+                # Known to 404: keep the flag until the mapping or token changes, or the retry window passes.
+                app.detected["invalid_mapping"] = flagged
+                app.error = MAPPING_ERROR
+            elif app.upstream_repo:
                 cache_key = (app.upstream_repo, app.installed_version)
                 try:
                     if cache_key not in upstream_cache:
                         upstream_cache[cache_key] = await github_releases(cached, app.upstream_repo, app.id, github_token, app.installed_version)
                     upstream = upstream_cache[cache_key]
+                    if isinstance(upstream, SourceError):
+                        raise upstream
                     if isinstance(upstream, str):
                         raise SourceError(upstream)
                     app_releases = [r.model_copy(update={"app_id":app.id}) for r in upstream]
@@ -947,6 +1060,17 @@ async def collect(settings: Settings, *, github_token: str | None = None, ha_tok
                             if previous and previous.detected.get("manifest_diff") and previous.detected.get("manifest_diff_for") == span:
                                 app.detected["manifest_diff"] = previous.detected["manifest_diff"]
                                 app.detected["manifest_diff_for"] = span
+                except SourceNotFound as exc:
+                    upstream_cache[cache_key] = exc
+                    if app.detected.pop("upstream_auto", False):
+                        # An automatically detected repo that does not exist is dropped, not flagged.
+                        app.upstream_repo = None
+                        app.detected.get("profile_evidence", {}).pop("upstream_repo", None)
+                        app.detected["mapping_hint"] = "Detected upstream repository was not found; choose one in the app profile"
+                    else:
+                        app.detected["invalid_mapping"] = {"repo": app.upstream_repo, "status": 404, "at": time.time(), "token": token_fingerprint(github_token), "suggestion": mapping_suggestion(app)}
+                        app.error = MAPPING_ERROR
+                        error(app.id, f"GitHub: {app.upstream_repo} not found (HTTP 404); mapping needs attention")
                 except SourceError as exc:
                     upstream_cache[cache_key] = str(exc)
                     if str(exc) == "GitHub: HTTP 404" and app.detected.pop("upstream_auto", False):
@@ -985,4 +1109,6 @@ async def collect(settings: Settings, *, github_token: str | None = None, ha_tok
                     app.detected["image_diff_for"] = identity
             if not app.installed_version and app.image_created_at:
                 app.detected["version_fallback"] = "unknown (image date " + app.image_created_at.date().isoformat() + ")"
+            if progress:
+                progress.source_done(app.name)
     return apps, releases, errors

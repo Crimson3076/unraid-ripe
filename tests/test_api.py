@@ -220,3 +220,126 @@ def test_pages_show_the_ripe_version_number(client):
     page = client.get('/')
     assert page.status_code == 200
     assert f'Ripe v{__version__}' in page.text
+
+
+@pytest.fixture
+def locked(tmp_path):
+    runtime = Runtime(config_dir=tmp_path, disable_scheduler=True, ui_token='lan-token-xyz')
+    with TestClient(create_app(runtime), base_url='http://localhost') as browser:
+        browser.app.state.manager.request_poll = lambda: False
+        yield browser
+
+
+def test_ui_token_protects_settings_and_changes(locked):
+    assert locked.get('/api/dashboard').status_code == 200
+    assert locked.get('/').status_code == 200
+    for url in ('/settings', '/api/settings', '/api/connections/home-assistant', '/api/connections/github', '/api/logs'):
+        response = locked.get(url)
+        assert response.status_code == 401, url
+        assert 'Basic' in response.headers['www-authenticate']
+    assert change(locked, 'patch', '/api/settings', json={'poll_hours': 24}).status_code == 401
+    assert change(locked, 'post', '/api/poll').status_code == 401
+    wrong = {'Authorization': 'Bearer nope', 'X-Ripe-Request': '1'}
+    assert locked.patch('/api/settings', json={'poll_hours': 24}, headers=wrong).status_code == 401
+
+
+def test_ui_token_accepts_bearer_and_basic(locked):
+    import base64
+    basic = base64.b64encode(b'anyone:lan-token-xyz').decode()
+    assert locked.get('/api/settings', headers={'Authorization': 'Bearer lan-token-xyz'}).status_code == 200
+    assert locked.get('/settings', headers={'Authorization': 'Basic ' + basic}).status_code == 200
+    ok = locked.patch('/api/settings', json={'poll_hours': 24},
+                      headers={'Authorization': 'Basic ' + basic, 'X-Ripe-Request': '1'})
+    assert ok.status_code == 200
+    assert locked.get('/api/settings', headers={'Authorization': 'Basic !!!'}).status_code == 401
+
+
+def test_no_token_configured_keeps_ui_open(client):
+    assert client.get('/api/settings').status_code == 200
+
+
+def test_ui_token_gates_head_and_options_but_not_app_pages(locked):
+    assert locked.head('/api/settings').status_code == 401
+    assert locked.options('/api/settings').status_code == 401
+    assert locked.head('/api/dashboard').status_code != 401
+    for url in ('/apps/demo-romm', '/api/apps/demo-romm'):
+        assert locked.get(url).status_code != 401, url
+    assert locked.get('/applications').status_code == 401
+
+
+def test_ui_token_bearer_works_on_changes(locked):
+    ok = locked.patch('/api/settings', json={'poll_hours': 24},
+                      headers={'Authorization': 'Bearer lan-token-xyz', 'X-Ripe-Request': '1'})
+    assert ok.status_code == 200
+
+
+def test_empty_ui_token_means_unset(tmp_path, monkeypatch):
+    monkeypatch.setenv('RIPE_UI_TOKEN', '')
+    runtime = Runtime(config_dir=tmp_path, disable_scheduler=True)
+    assert runtime.ui_token is None
+    with TestClient(create_app(runtime), base_url='http://localhost') as browser:
+        assert browser.get('/api/settings').status_code == 200
+
+
+def test_ui_token_is_a_redacted_secret():
+    runtime = Runtime(ui_token='lan-token-xyz')
+    assert 'lan-token-xyz' in runtime.secret_values()
+    assert 'lan-token-xyz' not in repr(runtime)
+
+
+def test_dashboard_payload_is_small_and_detail_keeps_notes(client):
+    manager = client.app.state.manager
+    big = 'Fixed a search bug. ' * 20000
+    for n in range(186):
+        manager.store.save_app(AppRecord(id=f'a{n}', name=f'App {n}', source='docker', installed_version='1.0.0',
+                                         latest_version='1.1.0', detected={'junk': 'x' * 2000}))
+        manager.store.save_release(Release(
+            id=f'github:o/a{n}:1.1.0', app_id=f'a{n}', version='1.1.0', notes=big,
+            classification={'status': 'ok', 'tags': ['bugfix'], 'tag_evidence': {'bugfix': 'Fixed a search bug.'}}))
+    response = client.get('/api/dashboard')
+    assert len(response.content) < 1_000_000
+    cards = response.json()['apps']
+    assert len(cards) == 186
+    assert all('pending' not in c and 'history' not in c for c in cards)
+    assert cards[0]['tag_quotes'] == {'bugfix': '1.1.0: Fixed a search bug.'}
+    assert client.get('/api/apps/a0').json()['pending'][0]['notes'] == big
+
+
+def test_ui_token_protects_settings_and_mutations(locked):
+    for url in ('/settings', '/logs', '/api/settings', '/api/logs', '/api/connections/home-assistant'):
+        response = locked.get(url)
+        assert response.status_code == 401, url
+        assert 'lan-token-xyz' not in response.text
+    assert locked.patch('/api/settings', json={'poll_hours': 24}, headers={'X-Ripe-Request': '1'}).status_code == 401
+    assert locked.post('/api/poll').status_code == 401
+    for url in ('/', '/health', '/api/dashboard'):
+        assert locked.get(url).status_code == 200, url
+
+
+def test_ui_token_rejects_wrong_credentials_and_requires_csrf(locked):
+    assert locked.get('/api/settings', headers={'Authorization': 'Bearer wrong'}).status_code == 401
+    assert locked.get('/api/settings', headers={'Authorization': 'Bearer lan-token-xyz'}).status_code == 200
+    assert locked.get('/settings', auth=('anyone', 'lan-token-xyz')).status_code == 200
+    assert locked.get('/settings', auth=('lan-token-xyz', 'nope')).status_code == 401
+    assert locked.get('/api/settings', headers={'Authorization': 'Basic !!!'}).status_code == 401
+    ok = locked.patch('/api/settings', json={'poll_hours': 24},
+                      headers={'X-Ripe-Request': '1', 'Authorization': 'Bearer lan-token-xyz'})
+    assert ok.status_code == 200
+    # CSRF check still applies after authentication.
+    assert locked.patch('/api/settings', json={'poll_hours': 12},
+                        headers={'Authorization': 'Bearer lan-token-xyz'}).status_code == 403
+
+
+def test_ui_token_is_off_by_default(client):
+    assert client.get('/api/settings').status_code == 200
+
+
+def test_ui_token_keeps_dashboard_progress_public(locked):
+    response = locked.get('/api/poll/status')
+    assert response.status_code == 200
+    assert 'www-authenticate' not in response.headers
+    assert locked.get('/api/settings').status_code == 401
+
+
+def test_ui_token_rejects_non_utf8_basic_credentials(locked):
+    assert locked.get('/api/settings', headers={'Authorization': 'Basic /w=='}).status_code == 401

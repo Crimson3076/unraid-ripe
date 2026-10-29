@@ -93,12 +93,24 @@ def _security_detail(releases: list[Release]) -> str:
     return f" ({'; '.join(parts)})" if parts else ""
 
 
+def _disagreed(release: Release) -> bool:
+    # A disagreement needs two models that actually answered.
+    return release.model_disagreement and len((release.classification or {}).get("provenance", [])) > 1
+
+
 def _needs_review(releases: list[Release]) -> bool:
-    return any(r.model_disagreement or (r.classification or {}).get("keyword_warnings")
+    return any(_disagreed(r) or (r.classification or {}).get("keyword_warnings")
                for r in releases)
 
 
-_REVIEW_REASON = "Review incomplete keyword coverage/model disagreement before deciding."
+def _review_reason(releases: list[Release]) -> str:
+    """Name only what actually happened: two configured models disagreed, or keyword coverage is incomplete."""
+    causes = []
+    if any(_disagreed(r) for r in releases):
+        causes.append("model disagreement")
+    if any((r.classification or {}).get("keyword_warnings") for r in releases):
+        causes.append("incomplete keyword coverage")
+    return f"Review {' and '.join(causes) or 'flagged evidence'} before deciding."
 
 
 def soak_deadline(release: Release, releases: list[Release], settings: Settings,
@@ -157,6 +169,8 @@ def build_view(app: AppRecord, releases: list[Release], settings: Settings,
         view.status, view.status_label = "unknown", "Unknown"
         view.recommended_version = None
         view.reason = "Source unavailable; last known data shown. Freshness and the current soak cannot be verified."
+        if app.detected.get("invalid_mapping"):
+            view.reason = "Mapping needs attention: the upstream repository was not found. Choose a repository in the app profile."
     else:
         view.reason = "Source unavailable; last known data shown. " + view.reason
     view.days_remaining = None
@@ -199,6 +213,10 @@ def _build_view(app: AppRecord, releases: list[Release], settings: Settings,
         signals.append("Semver major version change")
         if _DATABASE.search(f"{app.name} {app.image or ''}"):
             signals.append("Database image major version change")
+    newest_known, installed_parts = version_parts(ordered[-1].version) if ordered else None, version_parts(app.installed_version)
+    if (app.upstream_repo and newest_known and installed_parts and newest_known[0] < installed_parts[0]
+            and installed_parts[0] < 1900 and newest_known[0] < 1900):
+        signals.append(f"Probably the wrong repository: its newest release ({ordered[-1].version}) is much older than the installed {app.installed_version}")
     view = AppView(app=app, status="unknown", status_label="Unknown", latest_version=latest,
                    pending=pending, history=history, available_notes=available_notes,
                    no_notes=[r.version for r in pending if not r.notes.strip()], releases_behind=len(pending), tags=tags,
@@ -240,6 +258,9 @@ def _build_view(app: AppRecord, releases: list[Release], settings: Settings,
     if last_fix and (target is None or compare_versions(target.version, last_fix[0].version) == -1):
         target = last_fix[0]
     view.recommended_version = target.version if target else None
+    # Releases that normalise equal (V1.07 vs v1.7.0) display with the latest's spelling.
+    if target and latest and compare_versions(target.version, latest) == 0:
+        view.recommended_version = latest
     view.next_ripe_at = deadline
     view.days_remaining = days_left
     applicable_break = any(_has_applicable(r, kind) for r in pending for kind in ("breaking", "migration"))
@@ -270,7 +291,7 @@ def _build_view(app: AppRecord, releases: list[Release], settings: Settings,
     else:
         view.reason = "Publication date is unknown, so a soak countdown cannot be calculated."
     if attention:
-        view.reason = (view.reason + " " + _REVIEW_REASON).strip()
+        view.reason = (view.reason + " " + _review_reason(pending)).strip()
     return view
 
 
@@ -286,7 +307,7 @@ def _latest_only_view(view: AppView, settings: Settings, now: datetime) -> AppVi
             view.status, view.status_label = "read_first", "Read first"
             view.reason = "Latest image digest is already installed, but pending upstream notes need review. Verify whether this image contains the applicable changes."
             if attention:
-                view.reason += " " + _REVIEW_REASON
+                view.reason += " " + _review_reason(view.pending)
             return view
         return view.model_copy(update={"status": "up_to_date", "status_label": "Up to date", "reason": "Installed digest matches latest." if digest_matches else "Registry reports no image change."})
     changed = app.update_available is True or bool(app.installed_digest and app.latest_digest and app.installed_digest != app.latest_digest)
@@ -312,7 +333,7 @@ def _latest_only_view(view: AppView, settings: Settings, now: datetime) -> AppVi
         if breaking:
             view.reason += " Review the applicable breaking/migration items before deciding."
     if attention:
-        view.reason += " " + _REVIEW_REASON
+        view.reason += " " + _review_reason(view.pending)
     return view
 
 
