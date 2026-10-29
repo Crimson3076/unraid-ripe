@@ -17,6 +17,7 @@ from .intelligence import (classify_release, analyze_applicability, sanitize_pro
 from .intelligence.evidence import conservative_applicability, keyword_warnings
 from .ripeness import build_view, dashboard_sort_key
 from .versions import compare_versions
+from .analysis_queue import is_pending, newest_first, priority, trivial_notes
 from .notifications import Notifier
 from .demo import seed_demo
 
@@ -131,6 +132,9 @@ class Coordinator:
     async def refresh_rollup(self, app: AppRecord, settings: Settings, local_ready) -> None:
         """Regenerate the app's rollup only when installed, latest, their notes or the model setup changed."""
         pending = build_view(app, self.store.releases(app.id), settings).pending
+        omitted = max(0, len(pending) - settings.analysis_cap)
+        total = len(pending)
+        pending = pending[omitted:]
         image_diff, manifest = app.detected.get('image_diff'), app.detected.get('manifest_diff')
         # No version known (latest-only image): the installed digest identifies the installation.
         installed = app.installed_version or app.installed_digest
@@ -148,6 +152,8 @@ class Coordinator:
         result = await build_rollup(app, installed, latest, pending, settings, image_diff=image_diff,
                                     manifest_diff=manifest, gemini_key=self.runtime.gemini_key,
                                     model_unavailable=unavailable, log_call=self.store.log_llm)
+        if omitted:
+            result['span_note'] = f'Covers the newest {len(pending)} of {total} releases; {omitted} older not analysed.'
         self.store.set('rollup:' + app.id, {'key': key if result['status'] == 'ok' else None, 'result': result})
 
     @staticmethod
@@ -175,7 +181,7 @@ class Coordinator:
                 'summary': {s:counts[s] for s in ('ripe','waiting','recommended_now','read_first','up_to_date','unknown')},
                 'last_poll':self.store.get('last_poll'), 'polling': self.polling,
                 'integration_status': self.integration_status(), 'timezone':self.settings().timezone,
-                'auto_profiles': self.auto_profiles()}
+                'auto_profiles': self.auto_profiles(), 'analysis': self.store.get('analysis_progress')}
 
     def auto_profiles(self) -> list[dict]:
         """Apps Ripe filled in by itself that the user has not yet acknowledged."""
@@ -247,6 +253,8 @@ class Coordinator:
                 for release in releases:
                     by_app.setdefault(release.app_id, []).append(release)
                 local_ready = None
+                queue: list = []
+                refresh: list = []
                 for app in apps:
                     generation = generations.get(app.id, 0)
                     if self.store.get('generation:' + app.id, 0) != generation:
@@ -262,6 +270,8 @@ class Coordinator:
                         evidence.pop('upstream_repo', None)
                     app.detected['profile_evidence'] = evidence
                     self.store.save_app(app)
+                    pending = newest_first([r for r in by_app.get(app.id, []) if is_pending(r, app)])
+                    analysed = {r.id: rank for rank, r in enumerate(pending[:settings.analysis_cap])}
                     for release in by_app.get(app.id, []):
                         if self.store.get('generation:' + app.id, 0) != generation:
                             break
@@ -273,38 +283,61 @@ class Coordinator:
                             release.model_disagreement = previous.model_disagreement
                         # Older records supply history and base-line dates without
                         # spending LLM work on releases that aren't pending.
-                        if compare_versions(release.version, app.installed_version) != 1:
+                        if not is_pending(release, app):
                             self.store.save_release(release)
                             continue
-                        key = classification_key(release, app, settings)
-                        cached = self.store.get('classification:' + key)
-                        if cached and (cached.get('classification') or {}).get('status') == 'ok':
-                            release = release.model_copy(update=cached)
-                        elif not release.classification or release.classification_key != key or release.classification.get('status') != 'ok':
-                            if local_ready is None:
-                                local_ready = await self.local_ready(settings)
-                            if settings.classification_provider == 'local' and not local_ready:
-                                release.classification = {'status':'unknown','tags':[], 'keyword_warnings':keyword_warnings(release.notes, []), 'error':'Local model is unavailable; no classification was inferred.'}
-                                release.classification_key = key
-                            else:
-                                release.classification = None
-                                release = await classify_release(release, app, settings, gemini_key=self.runtime.gemini_key,log_call=self.store.log_llm)
-                            self.store.set('classification:' + key, {'classification':release.classification,'classification_key':release.classification_key, 'model_disagreement':release.model_disagreement})
-                        profile_key = fingerprint([app.profile.model_dump(exclude={'origin'}),release.classification_key,settings.local_model,settings.ollama_url,prompt_digest()])
-                        analysis = self.store.get('applicability:' + profile_key)
-                        if analysis is not None and all(item.get('verified') for item in analysis):
-                            release.applicability = analysis
-                        else:
-                            if local_ready is None:
-                                local_ready = await self.local_ready(settings)
-                            if local_ready:
-                                release = await analyze_applicability(release,app,settings,log_call=self.store.log_llm)
-                            else:
+                        if trivial_notes(release.notes):
+                            release.classification = {'status':'unknown','tags':[],'skipped':'no notes','keyword_warnings':[]}
+                            release.classification_key = None
+                            release.applicability = conservative_applicability(release.classification)
+                            self.store.save_release(release)
+                            continue
+                        if release.id not in analysed:
+                            if not release.classification or release.classification.get('status') != 'ok':
+                                release.classification = {'status':'unknown','tags':[],'skipped':f'not analysed (older than the newest {settings.analysis_cap})','keyword_warnings':keyword_warnings(release.notes, [])}
+                                release.classification_key = None
                                 release.applicability = conservative_applicability(release.classification)
-                            self.store.set('applicability:' + profile_key,release.applicability)
-                        if self.store.get('generation:' + app.id, 0) != generation:
-                            break
-                        self.store.save_release(release)
+                            self.store.save_release(release)
+                            continue
+                        queue.append((priority(app, release, analysed[release.id]), len(queue), app, release, generation))
+                    refresh.append((app, generation))
+                queue.sort(key=lambda item: item[:2])
+                self.store.set('analysis_progress', {'done': 0, 'total': len(queue)})
+                for done, (_, _, app, release, generation) in enumerate(queue):
+                    if self.store.get('generation:' + app.id, 0) != generation:
+                        continue
+                    key = classification_key(release, app, settings)
+                    cached = self.store.get('classification:' + key)
+                    if cached and (cached.get('classification') or {}).get('status') == 'ok':
+                        release = release.model_copy(update=cached)
+                    elif not release.classification or release.classification_key != key or release.classification.get('status') != 'ok':
+                        if local_ready is None:
+                            local_ready = await self.local_ready(settings)
+                        if settings.classification_provider == 'local' and not local_ready:
+                            release.classification = {'status':'unknown','tags':[], 'keyword_warnings':keyword_warnings(release.notes, []), 'error':'Local model is unavailable; no classification was inferred.'}
+                            release.classification_key = key
+                        else:
+                            release.classification = None
+                            release = await classify_release(release, app, settings, gemini_key=self.runtime.gemini_key,log_call=self.store.log_llm)
+                        self.store.set('classification:' + key, {'classification':release.classification,'classification_key':release.classification_key, 'model_disagreement':release.model_disagreement})
+                    profile_key = fingerprint([app.profile.model_dump(exclude={'origin'}),release.classification_key,settings.local_model,settings.ollama_url,prompt_digest()])
+                    analysis = self.store.get('applicability:' + profile_key)
+                    if analysis is not None and all(item.get('verified') for item in analysis):
+                        release.applicability = analysis
+                    else:
+                        if local_ready is None:
+                            local_ready = await self.local_ready(settings)
+                        if local_ready:
+                            release = await analyze_applicability(release,app,settings,log_call=self.store.log_llm)
+                        else:
+                            release.applicability = conservative_applicability(release.classification)
+                        self.store.set('applicability:' + profile_key,release.applicability)
+                    if self.store.get('generation:' + app.id, 0) != generation:
+                        continue
+                    self.store.save_release(release)
+                    self.store.set('analysis_progress', {'done': done + 1, 'total': len(queue)})
+                self.store.set('analysis_progress', None)
+                for app, generation in refresh:
                     if self.store.get('generation:' + app.id, 0) == generation:
                         async def ready():
                             nonlocal local_ready
