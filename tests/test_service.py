@@ -367,3 +367,62 @@ async def test_abandoned_poll_cannot_clear_newer_poll_flag(tmp_path,monkeypatch)
         hang.set(); release_second.set()
         manager.closing=True
         manager.close()
+
+
+@pytest.mark.asyncio
+async def test_refreshed_metadata_mid_inference_is_not_reverted(tmp_path,monkeypatch):
+    manager=Coordinator(runtime(tmp_path))
+    slow_setup(manager,monkeypatch)
+    manager.closing=True
+    started,release_gate=asyncio.Event(),asyncio.Event()
+    async def classify(release,app,settings,**kwargs):
+        started.set()
+        await release_gate.wait()
+        return release.model_copy(update={'classification':{'status':'ok','tags':['bugfix'],'tag_evidence':{'bugfix':'Fixed an error.'}},'classification_key':classification_key(release,app,settings)})
+    monkeypatch.setattr(service,'classify_release',classify)
+    try:
+        await manager.poll()
+        item=manager.store.get('classification_queue')[0]
+        task=asyncio.create_task(manager.classify_item(item,[None]))
+        await started.wait()
+        newer=utcnow()
+        manager.store.save_release(manager.store.releases('one')[0].model_copy(update={'published_at':newer}))
+        release_gate.set()
+        assert await task
+        stored=manager.store.releases('one')[0]
+        assert stored.published_at==newer and stored.classification['status']=='ok'
+        assert manager.store.get('classification_queue')==[]
+    finally:
+        manager.close()
+
+
+@pytest.mark.asyncio
+async def test_due_rollup_runs_only_once_the_queue_is_empty(tmp_path,monkeypatch):
+    manager=Coordinator(runtime(tmp_path))
+    slow_setup(manager,monkeypatch)
+    order=[]
+    async def classify(release,app,settings,**kwargs):
+        order.append('classify')
+        return release.model_copy(update={'classification':{'status':'ok','tags':['bugfix'],'tag_evidence':{'bugfix':'Fixed an error.'}},'classification_key':classification_key(release,app,settings)})
+    async def rollup(app,settings,local_ready):
+        order.append('rollup')
+    monkeypatch.setattr(service,'classify_release',classify)
+    monkeypatch.setattr(manager,'refresh_rollup',rollup)
+    try:
+        manager.classify_budget=0  # out of budget: queue stays, so rollups are skipped
+        await manager.poll()
+        await manager.classify_task
+        assert order==[] and manager.queue_length()==1
+        manager.classify_budget=60
+        manager.classify_cooldown=0
+        await manager.cycle()
+        await manager.classify_task
+        assert order==['classify','rollup']
+        # Queue empty but a rollup is due (failed/never stored): the task starts for it alone.
+        order.clear()
+        monkeypatch.setattr(manager,'rollups_due',lambda: True)
+        assert manager.request_classification()
+        await manager.classify_task
+        assert order==['rollup']
+    finally:
+        manager.close()

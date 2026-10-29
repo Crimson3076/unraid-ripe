@@ -474,7 +474,9 @@ class Coordinator:
         if current and current.notes != release.notes:
             return True  # Notes were revised mid-inference: keep the re-queued item and redo it.
         if current:
-            self.store.save_release(release)
+            # Only the inference outputs: a collection may have refreshed other fields (e.g. published_at).
+            self.store.save_release(current.model_copy(update={f: getattr(release, f) for f in
+                ('classification', 'classification_key', 'applicability', 'model_disagreement')}))
         self.dequeue(item)
         self.store.set('last_classification', utcnow().isoformat())
         return True
