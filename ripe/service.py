@@ -136,12 +136,13 @@ class Coordinator:
         comparison = compare_versions(latest, app.ignored_version)
         return latest == app.ignored_version or (comparison is not None and comparison <= 0)
 
-    def inventory(self, now: datetime | None = None) -> dict:
+    def inventory(self, now: datetime | None = None, only: str | None = None) -> dict:
         """Cards for the Overview: hidden apps removed, sidecars folded into their parent, ignored items listed apart."""
         settings = self.settings()
         records = self.store.apps()
         by_id = {a.id: a for a in records}
-        visible = [a for a in records if not hidden(a, settings, by_id)]
+        # `only` builds a single app and its sidecars instead of the whole inventory.
+        visible = [a for a in records if not hidden(a, settings, by_id) and (only is None or only in (a.id, a.parent_id))]
         built = {a.id: self.with_rollup(build_view(a, self.store.releases(a.id), settings, now)) for a in visible}
         ignored = [{'id': a.id, 'name': a.name, 'scope': 'app', 'version': None} for a in records if a.ignored and not a.merged_into]
         cards: list[AppView] = []
@@ -195,7 +196,7 @@ class Coordinator:
         if app is None:
             return None
         # The card carries the sidecars and the status they raise; hidden or ignored apps fall back to their own view.
-        card = next((v for v in self.views() if v.app.id == app_id), None)
+        card = next((v for v in self.inventory(only=app_id)['views'] if v.app.id == app_id), None)
         return card or self.with_rollup(build_view(app, self.store.releases(app_id), self.settings()))
 
     async def refresh_rollup(self, app: AppRecord, settings: Settings, local_ready) -> None:

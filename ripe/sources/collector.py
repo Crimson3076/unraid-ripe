@@ -813,11 +813,12 @@ def ha_section(attr: JSON, title: str) -> str | None:
 def merge_ha_duplicates(apps: list[AppRecord]) -> None:
     """Fold update entities that track the same repository into one; devices keep their own entry.
 
-    Firmware is per device, so it is never merged. Entities left with the same name get their entity id appended.
+    Firmware is per device, so it is never merged. Entities must also agree on installed and latest version: a
+    monorepo shared by different add-ons or cards keeps one entry each. Entities left with the same name get their entity id appended.
     """
-    survivors: dict[str, AppRecord] = {}
+    survivors: dict[tuple, AppRecord] = {}
     for app in sorted((a for a in apps if a.source == "home_assistant" and a.section != "firmware" and a.upstream_repo), key=lambda a: (a.update_available is not True, a.id)):
-        first = survivors.setdefault(app.upstream_repo.lower(), app)
+        first = survivors.setdefault((app.upstream_repo.lower(), app.installed_version, app.latest_version), app)
         if first is not app:
             app.merged_into = first.id
             first.detected.setdefault("merged_entities", []).append(app.detected.get("entity_id", app.id))

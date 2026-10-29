@@ -112,6 +112,15 @@ def test_duplicate_ha_entities_merge_and_same_names_disambiguate():
     assert by_id["ha:update.bulb_1"].name == "Bulb firmware (bulb_1)" and by_id["ha:update.bulb_2"].name == "Bulb firmware (bulb_2)"
 
 
+def test_shared_repo_with_different_versions_is_not_merged():
+    url = "https://github.com/acme/monorepo/releases/tag/v2"
+    states = [ha_state("update.addon_a", "Add-on A Update", "1", "2", release_url=url),
+              ha_state("update.addon_b", "Add-on B Update", "5", "6", release_url=url)]
+    apps, _ = ha_records(states, {}, {})
+    merge_ha_duplicates(apps)
+    assert not any(a.merged_into for a in apps)
+
+
 # --- coordinator / API -------------------------------------------------------------------------
 
 def runtime(tmp_path):
@@ -143,6 +152,15 @@ def test_stopped_hidden_by_default_counted_and_shown_when_included(tmp_path):
     manager.store.save_settings(settings)
     data = manager.dashboard()
     assert len(data["apps"]) == 2 and data["stopped_hidden"] == 0
+    manager.close()
+
+
+def test_stopped_sidecar_is_counted_separately_from_its_parent(tmp_path):
+    manager = make(tmp_path)
+    add(manager, "docker:app", state="running", installed_version="1", latest_version="1")
+    add(manager, "docker:app_db", state="exited", parent_id="docker:app", installed_version="1", latest_version="1")
+    data = manager.dashboard()
+    assert data["stopped_hidden"] == 1 and data["apps"][0]["sidecars"] == []
     manager.close()
 
 
@@ -178,11 +196,18 @@ def test_ignore_api(tmp_path):
         manager.store.save_release(release("docker:x", "1.1.0"))
         assert client.post("/api/apps/docker:x/ignore", json={"scope": "bogus"}).status_code == 422
         assert client.post("/api/apps/docker:nope/ignore", json={"scope": "app"}).status_code == 404
+        add(manager, "docker:fresh", installed_version="1.0.0")
+        assert client.post("/api/apps/docker:fresh/ignore", json={"scope": "version"}).status_code == 409
         assert client.post("/api/apps/docker:x/ignore", json={"scope": "version"}).json()["ignored_version"] == "1.1.0"
         assert client.delete("/api/apps/docker:x/ignore?scope=version").json()["ignored_version"] is None
         assert client.post("/api/apps/docker:x/ignore", json={"scope": "app"}).json()["ignored"] is True
         assert client.get("/api/dashboard").json()["ignored"][0]["scope"] == "app"
+        polls = []
+        manager.request_poll = lambda: polls.append(1) or True
         assert client.patch("/api/settings", json={"include_stopped": True}).json()["include_stopped"] is True
+        assert polls == [1]
+        client.patch("/api/settings", json={"include_stopped": True})
+        assert polls == [1]  # no change, no extra check
 
 
 def test_sidecars_fold_into_parent_and_raise_its_status(tmp_path):
