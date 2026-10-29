@@ -111,7 +111,8 @@
       const data=await api('/api/dashboard');dashboardData=data;zone=data.timezone||zone;demoContext(data.demo);
       text('#footer-timezone',`Ripe · ${zone}`);text('#app-count',(data.apps||[]).length);
       const count=data.summary||{};['ripe','recommended_now','read_first','waiting'].forEach(key=>text(`#count-${key}`,count[key]??data.apps.filter(v=>v.status===key).length));
-      text('#last-check',data.last_poll?`Last checked ${date(data.last_poll,true)} · ${data.apps.length} applications`:'No completed check yet · Inventory will appear after your first scan');
+      const prog=data.analysis;const working=prog&&prog.total?` · Analysing ${prog.done} of ${prog.total} releases`:'';
+      text('#last-check',(data.last_poll?`Last checked ${date(data.last_poll,true)} · ${data.apps.length} applications`:'No completed check yet · Inventory will appear after your first scan')+working);
       $('#demo-banner').hidden=!data.demo;
       if(data.demo&&!$('#exit-demo'))$('#demo-banner').insertAdjacentHTML('beforeend','<button id="exit-demo" type="button">Leave demo</button>');
       if($('#exit-demo'))$('#exit-demo').onclick=async()=>{try{await api('/api/demo',{method:'DELETE'});await loadDashboard();toast('Demo closed. Your live inventory is active.');}catch(e){errorAt('#dashboard-error',e);}};
@@ -183,7 +184,7 @@
     const unavailable=rollup.status==='unavailable'?`<div class="notice warning">${icon('alert')} Summary unavailable: ${h(rollup.error||'model unavailable')}. It will be retried at the next check.</div>`:'';
     const body=sections||(rollup.status==='unavailable'?'':`<p class="rollup-empty">${h(rollup.headline||'Nothing notable found.')}</p>`);
     const meta=rollup.model?`<div class="model-meta"><span>${h(rollup.provider||'Local')} · ${h(rollup.model)}</span><span>Prompt ${h(rollup.prompt_version||'unknown')}</span></div>`:'';
-    return `<section class="rollup-card" id="rollup"><h2>${icon('sparkles')}Since your version (${h(rollup.installed||view.app.installed_version||'unknown')})</h2>${unavailable}${body}${meta}</section>`;
+    return `<section class="rollup-card" id="rollup"><h2>${icon('sparkles')}Since your version (${h(rollup.installed||view.app.installed_version||'unknown')})</h2>${unavailable}${rollup.span_note?`<p class="muted">${h(rollup.span_note)}</p>`:''}${body}${meta}</section>`;
   }
   function releaseLine(release,view) {
     const c=release.classification||{};
