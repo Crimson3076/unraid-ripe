@@ -242,3 +242,81 @@ async def test_stale_exclusions_reset_outside_the_analysis_cap(tmp_path,monkeypa
         manager.close()
     assert stored['1.1.0'].classification['status']=='ok'
     assert not any(i.get('status')=='does_not_apply' for i in stored['1.1.0'].applicability)
+
+
+@pytest.mark.asyncio
+async def test_unknown_span_classifies_only_the_newest_three(tmp_path,monkeypatch):
+    app,releases=_many(30,installed=None)
+    app.image_created_at=utcnow()-timedelta(days=200)
+    calls,stored=await _run(tmp_path,monkeypatch,[app],releases)
+    assert {v for _,v in calls}=={'1.28.0','1.29.0','1.30.0'}
+    assert 'not analysed' in stored['1.10.0'].classification['skipped']
+
+
+@pytest.mark.asyncio
+async def test_unorderable_installed_tag_is_not_analysed_beyond_three(tmp_path,monkeypatch):
+    app,releases=_many(30,installed='latest')
+    app.image_created_at=utcnow()-timedelta(days=200)
+    calls,_=await _run(tmp_path,monkeypatch,[app],releases)
+    assert len(calls)==3
+
+
+@pytest.mark.asyncio
+async def test_rollback_window_covers_three_releases_at_or_below_installed(tmp_path,monkeypatch):
+    app,releases=_many(10,installed='1.6.0')
+    manager=Coordinator(runtime(tmp_path))
+    sent=[]
+    async def collect(*args,**kwargs):
+        return [app],releases,[]
+    async def ready(*args):
+        return True
+    async def classify(release,app,settings,**kwargs):
+        return release.model_copy(update={'classification':{'status':'ok','tags':[],'tag_evidence':{}},'classification_key':classification_key(release,app,settings)})
+    async def applic(release,app,settings,**kwargs):
+        return release
+    async def rollup(app,installed,latest,pending,settings,**kwargs):
+        sent.append((kwargs.get('prompt'),[r.version for r in pending]))
+        return {'status':'ok','installed':installed,'latest':latest,'releases':[r.version for r in pending],'groups':{},'headline':'x'}
+    monkeypatch.setattr(service,'collect',collect)
+    monkeypatch.setattr(service,'classify_release',classify)
+    monkeypatch.setattr(service,'analyze_applicability',applic)
+    monkeypatch.setattr(service,'build_rollup',rollup)
+    monkeypatch.setattr(manager,'local_ready',ready)
+    try:
+        await manager.poll()
+        view=manager.view('big')
+    finally:
+        manager.close()
+    assert [r.version for r in view.rollback]==['1.4.0','1.5.0','1.6.0']
+    assert ('rollback-v1',['1.4.0','1.5.0','1.6.0']) in sent
+    assert not any(v in ('1.1.0','1.2.0','1.3.0') for _,vs in sent for v in vs)
+    assert view.rollback_rollup['releases']==['1.4.0','1.5.0','1.6.0']
+
+
+def test_rollback_window_setting_bounds():
+    from ripe.models import Settings
+    from ripe.ripeness import build_view
+    app,releases=_many(10,installed='1.6.0')
+    assert Settings().rollback_window==3
+    assert build_view(app,releases,Settings(rollback_window=0)).rollback==[]
+    assert len(build_view(app,releases,Settings(rollback_window=10)).rollback)==6
+    with pytest.raises(ValueError):
+        Settings(rollback_window=11)
+
+
+def test_tag_prefixes_and_build_suffixes_are_ordered():
+    from ripe.versions import compare_versions
+    assert compare_versions('n8n@1.2.3','1.2.2')==1
+    assert compare_versions('1.2.3-python3.13-alpine3.23','1.2.3')==0
+    assert compare_versions('4.5.6-r0-ls237','4.5.5')==1
+    assert compare_versions('1.0.0-rc1','1.0.0')==-1
+
+
+def test_mapping_with_much_older_releases_is_flagged():
+    from ripe.models import Settings
+    from ripe.ripeness import build_view
+    app,releases=_many(3,installed='11.4.2')
+    view=build_view(app,releases,Settings())
+    assert any('mapping is probably wrong' in s for s in view.hard_signals)
+    app,releases=_many(3,installed='1.2.0')
+    assert not any('mapping' in s for s in build_view(app,releases,Settings()).hard_signals)

@@ -10,13 +10,19 @@ from packaging.version import InvalidVersion, Version
 
 _PREFIX = re.compile(r"^(?:version[-_]|release[-_]|v(?=\d))", re.I)
 _LINUXSERVER = re.compile(r"(?:[-_](?:ls|linuxserver)\d+)$", re.I)
+# Monorepo tags such as "n8n@1.2.3" or "@scope/pkg@1.2.3" carry the package name before the version.
+_PACKAGE = re.compile(r"^(?:@?[\w.-]+(?:/[\w.-]+)?)@(?=v?\d)")
+# Image build flavours that follow the app version: -python3.13-alpine3.23, -r0-ls237, -bookworm-slim.
+_BUILD = re.compile(r"(?:[-_](?:py(?:thon)?\d[\w.]*|alpine[\d.]*|debian[\d.]*|ubuntu[\d.]*|bookworm|bullseye|trixie|jammy|noble|slim|r\d+|(?:ls|linuxserver)\d+))+$", re.I)
 _DATE = re.compile(r"^(?:RELEASE[.-])?(\d{4})[-.](\d{2})[-.](\d{2})(?:[Tt](\d{2})[-:](\d{2})[-:](\d{2})[Zz]?)?$")
 
 
 def normalize_version(value: str | None) -> str | None:
     if not value:
         return None
-    text = _PREFIX.sub("", value.strip())
+    text = _PACKAGE.sub("", value.strip())
+    text = _PREFIX.sub("", text)
+    text = _BUILD.sub("", text)
     text = _LINUXSERVER.sub("", text)
     date = _DATE.fullmatch(text)
     if date:
