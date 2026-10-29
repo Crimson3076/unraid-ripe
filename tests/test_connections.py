@@ -270,7 +270,7 @@ async def test_poll_passes_current_credentials_to_collect_and_classify(tmp_path,
     async def fake_collect(settings, **kwargs):
         seen['collect'].append(kwargs['github_token'])
         app = AppRecord(id='a', name='A', source='docker', installed_version='1.0.0', latest_version='2.0.0')
-        release = Release(id='r', app_id='a', version='2.0.0', published_at=utcnow() - timedelta(days=30), notes='notes')
+        release = Release(id='r', app_id='a', version='2.0.0', published_at=utcnow() - timedelta(days=30), notes='Bug fixes and small improvements for the importer.')
         return [app], [release], []
     async def fake_classify(release, app, settings, *, gemini_key=None, log_call=None):
         seen['classify'].append(gemini_key)  # status is not ok, so nothing is cached

@@ -1,6 +1,9 @@
 """LAN-only Stage 1 API and pages. No install/update/exec endpoints exist."""
 from __future__ import annotations
 import asyncio
+import base64
+import binascii
+import hmac
 import os
 import re
 from contextlib import asynccontextmanager, suppress
@@ -23,6 +26,27 @@ from .autoprofile import edited_origin
 from .notifications import Notifier, is_quiet
 
 PACKAGE = Path(__file__).parent
+TOKEN_PATHS = ('/settings','/logs','/api/settings','/api/logs')
+
+
+def needs_token(request: Request) -> bool:
+    path = request.url.path.rstrip('/') or '/'
+    return (request.method not in ('GET','HEAD','OPTIONS') or path in TOKEN_PATHS
+            or path == '/api/connections' or path.startswith('/api/connections/'))
+
+
+def token_ok(request: Request, token: str) -> bool:
+    header = request.headers.get('authorization', '')
+    scheme, _, value = header.partition(' ')
+    value = value.strip()
+    if scheme.lower() == 'basic':
+        try:
+            value = base64.b64decode(value, validate=True).decode().partition(':')[2]
+        except (binascii.Error, UnicodeDecodeError):
+            return False
+    elif scheme.lower() != 'bearer':
+        return False
+    return hmac.compare_digest(value.encode(), token.encode())
 
 
 def validate_settings(data: dict, current: Settings) -> Settings:
@@ -86,6 +110,10 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
 
     @app.middleware('http')
     async def protect(request: Request, call_next):
+        token = request.app.state.manager.runtime.ui_token
+        if token and needs_token(request) and not token_ok(request, token):
+            return JSONResponse({'detail':'Authentication required'}, status_code=401,
+                                headers={'WWW-Authenticate':'Basic realm="Ripe", charset="UTF-8"'})
         try:
             if int(request.headers.get('content-length', '0')) > 262144:
                 return JSONResponse({'detail':'Request too large'}, status_code=413)
@@ -168,6 +196,30 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             manager.store.save_release(release)
         manager.request_poll()
         return {'profile':profile,'sanitized':True}
+
+    def ignore_scope(data: dict) -> str:
+        scope = data.get('scope')
+        if scope not in ('app', 'version'):
+            raise HTTPException(422, 'Choose to ignore the app or its current version')
+        return scope
+
+    @app.post('/api/apps/{app_id}/ignore')
+    async def ignore(request: Request, app_id: str, data: dict = Body(...)):
+        try:
+            record = request.app.state.manager.set_ignore(app_id, ignore_scope(data), True)
+        except KeyError:
+            raise HTTPException(404, 'App not found') from None
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from None
+        return {'ignored': record.ignored, 'ignored_version': record.ignored_version}
+
+    @app.delete('/api/apps/{app_id}/ignore')
+    async def unignore(request: Request, app_id: str, scope: str = ''):
+        try:
+            record = request.app.state.manager.set_ignore(app_id, ignore_scope({'scope': scope}), False)
+        except KeyError:
+            raise HTTPException(404, 'App not found') from None
+        return {'ignored': record.ignored, 'ignored_version': record.ignored_version}
 
     @app.post('/api/auto-profiles/review')
     async def review_auto_profiles(request:Request):
@@ -293,7 +345,10 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         except ValueError as exc:
             # Pydantic messages can echo submitted secrets; only return fixed text.
             raise HTTPException(422,'Invalid settings: use valid timezone, HH:MM times, local model URL and complete soak tiers') from None
+        was_included = manager.settings().include_stopped
         manager.store.save_settings(updated)
+        if updated.include_stopped and not was_included:
+            manager.request_poll()  # containers that were skipped need their first lookup
         return updated
 
     @app.post('/api/poll',status_code=202)
@@ -301,6 +356,10 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         manager=request.app.state.manager
         accepted=manager.request_poll()
         return {'status':'started' if accepted else ('demo' if manager.demo else 'already running')}
+
+    @app.get('/api/poll/status')
+    async def poll_status(request:Request):
+        return request.app.state.manager.poll_status()
 
     @app.get('/api/logs')
     async def logs(request:Request):

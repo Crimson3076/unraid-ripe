@@ -71,7 +71,40 @@
   function statusLabel(view) {return view.status==='waiting' && Number.isFinite(view.days_remaining) ? `${view.days_remaining} ${view.days_remaining===1?'day':'days'} to go` : view.status_label || labels[view.status];}
   function hardSignals(signals) {return (signals||[]).map(s=>`<div class="hard-signal">${icon('alert')}${h(s)}</div>`).join('');}
   function needsMapping(app) {return Boolean(app.detected?.mapping_hint)&&!app.upstream_repo;}
-  function appCard(view) {const app=view.app;const quotes=view.tag_quotes||{};return `<a class="app-card" href="/apps/${encodeURIComponent(app.id)}"><div class="app-card-top">${avatar(app)}<div class="app-card-title"><h3>${h(app.name)}</h3><div class="app-source">${h(sources[app.source]||app.source)}</div></div><span class="card-chevron">${icon('chevron')}</span></div><div class="card-status">${chip(view.status,statusLabel(view))}<span class="behind">${view.releases_behind?`${h(view.releases_behind)} ${view.releases_behind===1?'release':'releases'} behind`:view.status==='up_to_date'?'All caught up':''}</span></div>${versions(view)}<p class="card-reason">${h(view.rollup?.headline || view.reason || app.error || 'Open the release notes for details.')}</p>${app.latest_only?`<div class="hard-signal">${icon('box')}Latest only · ${app.image_changed_at?'image changed '+h(date(app.image_changed_at)):'no versioned target available'}</div>`:''}${view.hard_signals?.length?hardSignals(view.hard_signals.slice(0,2)):''}${needsMapping(app)?`<div class="mapping-hint" role="link" tabindex="0" data-href="/apps/${encodeURIComponent(app.id)}#profile">${icon('help')}No release notes source. Choose a GitHub repo in the app profile.</div>`:''}<div class="tag-list">${tagChips(view.tags,quotes)}</div></a>`;}
+  function appCard(view) {const app=view.app;const quotes=view.tag_quotes||{};return `<a class="app-card" href="/apps/${encodeURIComponent(app.id)}"><div class="app-card-top">${avatar(app)}<div class="app-card-title"><h3>${h(app.name)}</h3><div class="app-source">${h(sources[app.source]||app.source)}</div></div><span class="card-chevron">${icon('chevron')}</span></div><div class="card-status">${chip(view.status,statusLabel(view))}<span class="behind">${view.releases_behind?`${h(view.releases_behind)} ${view.releases_behind===1?'release':'releases'} behind`:view.status==='up_to_date'?'All caught up':''}</span></div>${versions(view)}<p class="card-reason">${h(view.rollup?.headline || view.reason || app.error || 'Open the release notes for details.')}</p>${app.latest_only?`<div class="hard-signal">${icon('box')}Latest only · ${app.image_changed_at?'image changed '+h(date(app.image_changed_at)):'no versioned target available'}</div>`:''}${view.hard_signals?.length?hardSignals(view.hard_signals.slice(0,2)):''}${needsMapping(app)?`<div class="mapping-hint" role="link" tabindex="0" data-href="/apps/${encodeURIComponent(app.id)}#profile">${icon('help')}No release notes source. Choose a GitHub repo in the app profile.</div>`:''}<div class="tag-list">${tagChips(view.tags,quotes)}</div>${sidecarList(view)}${ignoreButtons(view)}</a>`;}
+  function sidecarList(view) {
+    const side=view.sidecars||[];if(!side.length)return '';
+    return `<div class="sidecars"><div class="sidecars-title">Supporting containers (${side.length})</div><ul>${side.map(c=>`<li><span class="sidecar-name">${h(c.app.name)}</span><span class="sidecar-version">${h(c.app.installed_version||'Unknown')}${c.latest_version&&c.latest_version!==c.app.installed_version?' → '+h(c.latest_version):''}</span>${chip(c.status,statusLabel(c))}</li>`).join('')}</ul></div>`;
+  }
+  function ignoreButtons(view,className='ignore-actions') {
+    const app=view.app,id=h(app.id);
+    const target=view.latest_version||app.latest_digest;
+    const version=app.ignored_version?`<button class="button secondary small" type="button" data-undo="version" data-id="${id}">Show this version again</button>`:(view.status!=='up_to_date'&&target?`<button class="button secondary small" type="button" data-ignore="version" data-id="${id}">Ignore this version</button>`:'');
+    const whole=app.ignored?`<button class="button secondary small" type="button" data-undo="app" data-id="${id}">Stop ignoring this app</button>`:`<button class="button secondary small" type="button" data-ignore="app" data-id="${id}">Ignore this app</button>`;
+    return `<div class="${className}">${whole}${version}</div>`;
+  }
+  const attention=v=>['recommended_now','read_first'].includes(v.status)||(v.tags||[]).some(t=>['security','breaking'].includes(t));
+  const sectionInfo={firmware:{name:'Device firmware',icon:'server'},cards:{name:'Home Assistant cards & integrations',icon:'box'}};
+  const sectionOpen={};
+  function collapsible(key,title,count,body,open) {
+    return `<details class="collapse-group" data-section="${h(key)}"${open?' open':''}><summary class="tier-heading">${h(title)} (${count})</summary>${body}</details>`;
+  }
+  function ignoredPanel(list) {
+    if(!list.length)return '';
+    const rows=list.map(item=>`<li><a href="/apps/${encodeURIComponent(item.id)}">${h(item.name)}</a> <span class="muted">${item.scope==='version'?'version '+h(item.version)+' hidden':'ignored'}</span> <button class="button secondary small" type="button" data-undo="${h(item.scope)}" data-id="${h(item.id)}">Undo</button></li>`).join('');
+    return collapsible('ignored','Ignored',list.length,`<ul class="ignored-list">${rows}</ul>`,sectionOpen.ignored??false);
+  }
+  async function changeIgnore(button) {
+    const undo=Boolean(button.dataset.undo),scope=button.dataset.undo||button.dataset.ignore,id=encodeURIComponent(button.dataset.id);
+    button.disabled=true;
+    try{
+      if(undo)await api(`/api/apps/${id}/ignore?scope=${scope}`,{method:'DELETE'});
+      else await api(`/api/apps/${id}/ignore`,{method:'POST',body:JSON.stringify({scope})});
+      toast(undo?'Restored.':scope==='app'?'App ignored. Undo it from the Ignored list.':'This version is hidden until a newer one appears.');
+      if(page==='app')await loadDetail();else await loadDashboard(true);
+    }catch(e){errorAt(page==='app'?'#detail-error':'#dashboard-error',e);button.disabled=false;}
+  }
+  const ignoreClick=e=>{const button=e.target.closest?.('[data-ignore],[data-undo]');if(!button)return;e.preventDefault();e.stopPropagation();void changeIgnore(button);};
   function renderGroups() {
     if(!dashboardData)return;
     const all=dashboardData.apps||[];
@@ -80,13 +113,16 @@
       const search=`${v.app.name} ${v.app.image||''} ${v.app.upstream_repo||''}`.toLowerCase().includes(appSearch);
       return status && search;
     });
-    $('#empty-state').hidden=all.length!==0;
+    $('#empty-state').hidden=all.length!==0||(dashboardData.ignored||[]).length!==0;
     const groups=Object.keys(tiers).map(tier=>{
-      const values=filtered.filter(v=>(v.app.profile?.tier||'general')===tier);
+      const values=filtered.filter(v=>!v.app.section&&(v.app.profile?.tier||'general')===tier);
       if(!values.length)return'';
       const info=tiers[tier];
       return `<section class="tier-group"><h3 class="tier-heading">${icon(info.icon)}${h(info.name)}<span class="count-pill">${values.length}</span><span class="tier-description">${h(info.description)}</span></h3><div class="app-grid">${values.map(appCard).join('')}</div></section>`;
-    }).join('');
+    }).join('')+Object.entries(sectionInfo).map(([key,info])=>{
+      const values=filtered.filter(v=>v.app.section===key);
+      return values.length?collapsible(key,info.name,values.length,`<div class="app-grid">${values.map(appCard).join('')}</div>`,sectionOpen[key]??values.some(attention)):'';
+    }).join('')+ignoredPanel(dashboardData.ignored||[]);
     $('#app-groups').innerHTML=groups|| (all.length?'<div class="no-results">No applications match this view. Try another filter or search.</div>':'');
     $$('[data-filter]').forEach(b=>{b.classList.toggle('active',b.dataset.filter===filter);b.setAttribute('aria-pressed',String(b.dataset.filter===filter));});
   }
@@ -106,24 +142,113 @@
     box.innerHTML=`<strong>Ripe set up ${h(list.length)} app profile${list.length===1?'':'s'}</strong> from what Docker already knows. <details><summary>Review</summary>${list.map(a=>`<p><a href="/apps/${encodeURIComponent(a.id)}#profile">${h(a.name)}</a><br>${Object.entries(a.reasons).map(([k,v])=>`${h(profileFields[k]||k)}: ${h(v)}`).join('<br>')}</p>`).join('')}<button id="review-auto" class="button secondary small" type="button">Looks good</button></details>`;
     $('#review-auto').onclick=async()=>{try{await api('/api/auto-profiles/review',{method:'POST'});box.hidden=true;}catch(e){errorAt('#dashboard-error',e);}};
   }
+  function renderStopped(data) {
+    const note=$('#stopped-note');if(!note)return;
+    const n=Number(data.stopped_hidden||0);note.hidden=!n;
+    if(n){note.innerHTML=`${h(n)} stopped container${n===1?'':'s'} hidden · <button class="link-button" id="show-stopped" type="button">Show</button>`;
+      $('#show-stopped').onclick=async()=>{try{await api('/api/settings',{method:'PATCH',body:JSON.stringify({include_stopped:true})});toast('Stopped containers are included from the next check.');await loadDashboard(true);}catch(e){errorAt('#dashboard-error',e);}};}
+  }
   async function loadDashboard(quiet=false) {
     try {
       const data=await api('/api/dashboard');dashboardData=data;zone=data.timezone||zone;demoContext(data.demo);
       text('#footer-timezone',`Ripe · ${zone}`);text('#app-count',(data.apps||[]).length);
       const count=data.summary||{};['ripe','recommended_now','read_first','waiting'].forEach(key=>text(`#count-${key}`,count[key]??data.apps.filter(v=>v.status===key).length));
-      text('#last-check',data.last_poll?`Last checked ${date(data.last_poll,true)} · ${data.apps.length} applications`:'No completed check yet · Inventory will appear after your first scan');
+      const prog=data.analysis;const working=prog&&prog.total?` · Analysing ${prog.done} of ${prog.total} releases`:'';
+      text('#last-check',(data.last_poll?`Last checked ${date(data.last_poll,true)} · ${data.apps.length} applications`:'No completed check yet · Inventory will appear after your first scan')+working);
       $('#demo-banner').hidden=!data.demo;
       if(data.demo&&!$('#exit-demo'))$('#demo-banner').insertAdjacentHTML('beforeend','<button id="exit-demo" type="button">Leave demo</button>');
       if($('#exit-demo'))$('#exit-demo').onclick=async()=>{try{await api('/api/demo',{method:'DELETE'});await loadDashboard();toast('Demo closed. Your live inventory is active.');}catch(e){errorAt('#dashboard-error',e);}};
-      renderGroups();renderIntegrations(data.integration_status);renderAutoProfiles(data.auto_profiles||[]);clearError('#dashboard-error');
+      renderStopped(data);renderGroups();renderIntegrations(data.integration_status);renderAutoProfiles(data.auto_profiles||[]);clearError('#dashboard-error');
     } catch(e) {if(!quiet){$('#app-groups').innerHTML='';errorAt('#dashboard-error',e);}}
   }
+  const phaseNames={collecting:'Collecting sources',analysing:'Analysing releases',summarising:'Writing summaries'};
+  let refreshPoll=async()=>{};
+  function pollPercent(s) {
+    if(s.phase==='collecting'){const t=s.sources?.total||0;return t?Math.min(100,Math.round(100*s.sources.done/t)):null;}
+    if(s.phase==='analysing'){const t=s.releases?.total||0;return t?Math.min(100,Math.round(100*s.releases.done/t)):100;}
+    return 100;
+  }
+  function etaText(seconds) {
+    if(!Number.isFinite(seconds))return '';
+    return seconds<60?'less than a minute left':`about ${Math.round(seconds/60)} min left`;
+  }
+  function pollLine(s) {
+    const parts=[phaseNames[s.phase]||'Checking'];
+    const c=s.phase==='collecting'?s.sources:s.phase==='analysing'?s.releases:null;
+    if(c?.total)parts.push(`${c.done} of ${c.total}`);
+    if(s.current)parts.push(s.current);
+    const eta=s.phase==='analysing'?etaText(s.eta_seconds):'';
+    if(eta)parts.push(eta);
+    return parts.join(' · ');
+  }
+  function pollPanel(s) {
+    const errors=s.errors||[];
+    return `<dl><dt>Phase</dt><dd>${h(phaseNames[s.phase]||(s.last_error?'Stopped':'Finished'))}</dd><dt>Sources</dt><dd>${h(s.sources?.done??0)} of ${h(s.sources?.total??0)}</dd><dt>Releases</dt><dd>${h(s.releases?.done??0)} of ${h(s.releases?.total??0)}</dd><dt>Skipped</dt><dd>${h(s.releases?.skipped??0)} (older than the analysis cap, or no notes)</dd><dt>Current</dt><dd>${h(s.current||'—')}</dd></dl>${s.last_error?`<h4>Check stopped</h4><p>${h(s.last_error)}</p>`:''}<h4>Errors so far</h4>${errors.length?`<ul>${errors.map(e=>`<li><strong>${h(e.source)}</strong>: ${h(e.message)}</li>`).join('')}</ul>`:'<p class="muted">None.</p>'}`;
+  }
+  function initProgress() {
+    const strip=$('#poll-strip');if(!strip)return;
+    const bar=$('#poll-bar'),fill=$('#poll-bar-fill'),line=$('#poll-line'),panel=$('#poll-panel'),toggle=$('#poll-strip-toggle'),logs=$('#poll-logs-link'),dismiss=$('#poll-dismiss');
+    let last=null,timer,hideTimer,wasRunning=false;
+    const dismissKey='ripe-poll-dismissed';
+    const dismissed=()=>{try{return sessionStorage.getItem(dismissKey);}catch{return null;}};
+    const setBar=pct=>{
+      bar.classList.toggle('indeterminate',pct===null);
+      if(pct===null){bar.removeAttribute('aria-valuenow');fill.style.width='';}
+      else{bar.setAttribute('aria-valuenow',String(pct));fill.style.width=pct+'%';}
+    };
+    const setButton=s=>{
+      const button=$('#poll-button');if(!button)return;
+      if(s.running){
+        const pct=pollPercent(s);
+        button.disabled=true;button.setAttribute('aria-disabled','true');button.setAttribute('aria-busy','true');
+        button.innerHTML=`<span class="spinner" aria-hidden="true"></span>Checking…${pct===null?'':' '+pct+'%'}`;
+      }else if(button.getAttribute('aria-busy')==='true'){
+        button.disabled=false;button.removeAttribute('aria-disabled');button.removeAttribute('aria-busy');
+        button.innerHTML='<span data-icon="refresh"></span>Check for updates';hydrateIcons(button);
+      }
+    };
+    const hide=()=>{clearTimeout(hideTimer);strip.hidden=true;strip.dataset.state='idle';strip.classList.remove('fading');panel.hidden=true;toggle.setAttribute('aria-expanded','false');};
+    const show=state=>{clearTimeout(hideTimer);strip.hidden=false;strip.dataset.state=state;strip.classList.remove('fading');logs.hidden=dismiss.hidden=state!=='failed';};
+    function render(s) {
+      last=s;setButton(s);
+      if(s.running){
+        show('running');setBar(pollPercent(s));line.textContent=pollLine(s);
+      }else if(s.last_error){
+        if(dismissed()===(s.finished_at||'x')){hide();}
+        else{show('failed');setBar(100);line.textContent=`Check stopped: ${s.last_error}`;}
+      }else if(wasRunning){
+        show('done');setBar(100);line.textContent='Update check finished';
+        hideTimer=setTimeout(()=>{strip.classList.add('fading');hideTimer=setTimeout(hide,600);},3000);
+      }else if(strip.dataset.state!=='done'){
+        hide();
+      }
+      if(!panel.hidden)panel.innerHTML=pollPanel(s);
+      if(wasRunning&&!s.running)document.dispatchEvent(new CustomEvent('ripe:poll-finished',{detail:s}));
+      wasRunning=Boolean(s.running);
+    }
+    function schedule() {
+      clearTimeout(timer);
+      timer=setTimeout(()=>{if(document.hidden&&!last?.running)schedule();else void refresh();},last?.running?2000:30000);
+    }
+    async function refresh() {
+      try{render(await api('/api/poll/status'));}catch{}
+      schedule();
+    }
+    toggle.addEventListener('click',()=>{panel.hidden=!panel.hidden;toggle.setAttribute('aria-expanded',String(!panel.hidden));if(!panel.hidden&&last)panel.innerHTML=pollPanel(last);});
+    dismiss.addEventListener('click',()=>{try{sessionStorage.setItem(dismissKey,last?.finished_at||'x');}catch{}hide();});
+    document.addEventListener('visibilitychange',()=>{if(!document.hidden)void refresh();});
+    refreshPoll=refresh;
+    void refresh();
+  }
   function initDashboard() {
+    document.addEventListener('ripe:poll-finished',()=>loadDashboard(true));
     $$('[data-filter]').forEach(button=>button.addEventListener('click',()=>{filter=button.dataset.filter;renderGroups();}));
     const openHint=e=>{const hint=e.target.closest?.('.mapping-hint');if(!hint||(e.type==='keydown'&&e.key!=='Enter')||(e.type==='auxclick'&&e.button!==1))return;e.preventDefault();e.stopPropagation();if(e.ctrlKey||e.metaKey||e.shiftKey||e.type==='auxclick')window.open(hint.dataset.href,'_blank','noopener');else location.href=hint.dataset.href;};
+    $('#app-groups').addEventListener('toggle',e=>{const key=e.target.dataset?.section;if(key)sectionOpen[key]=e.target.open;},true);
+    $('#app-groups').addEventListener('click',ignoreClick);
     $('#app-groups').addEventListener('click',openHint);$('#app-groups').addEventListener('auxclick',openHint);$('#app-groups').addEventListener('keydown',openHint);
     $('#app-search').addEventListener('input',e=>{appSearch=e.target.value.toLowerCase().trim();renderGroups();});
-    $('#poll-button').onclick=async()=>{const button=$('#poll-button');button.disabled=true;try{const result=await api('/api/poll',{method:'POST'});toast(result.message || (result.status==='demo'?'Demo mode uses sample data and does not scan your homelab.':result.status==='already running'?'An update check is already running.':'Update check started. This may take a little while.'));setTimeout(()=>loadDashboard(true),1500);}catch(e){errorAt('#dashboard-error',e);}finally{button.disabled=false;}};
+    $('#poll-button').onclick=async()=>{const button=$('#poll-button');if(button.getAttribute('aria-busy')==='true')return;button.disabled=true;try{const result=await api('/api/poll',{method:'POST'});toast(result.message || (result.status==='demo'?'Demo mode uses sample data and does not scan your homelab.':result.status==='already running'?'An update check is already running.':'Update check started. This may take a little while.'));await refreshPoll();}catch(e){errorAt('#dashboard-error',e);}finally{if(button.getAttribute('aria-busy')!=='true')button.disabled=false;}};
     $('#demo-button').onclick=async()=>{const button=$('#demo-button');button.disabled=true;try{await api('/api/demo',{method:'POST'});filter='all';await loadDashboard();toast('Exploring synthetic examples. No live actions or notifications.');}catch(e){errorAt('#dashboard-error',e);}finally{button.disabled=false;}};
     loadDashboard();setInterval(()=>{if(!document.hidden)loadDashboard(true);},30000);
   }
@@ -183,7 +308,19 @@
     const unavailable=rollup.status==='unavailable'?`<div class="notice warning">${icon('alert')} Summary unavailable: ${h(rollup.error||'model unavailable')}. It will be retried at the next check.</div>`:'';
     const body=sections||(rollup.status==='unavailable'?'':`<p class="rollup-empty">${h(rollup.headline||'Nothing notable found.')}</p>`);
     const meta=rollup.model?`<div class="model-meta"><span>${h(rollup.provider||'Local')} · ${h(rollup.model)}</span><span>Prompt ${h(rollup.prompt_version||'unknown')}</span></div>`:'';
-    return `<section class="rollup-card" id="rollup"><h2>${icon('sparkles')}Since your version (${h(rollup.installed||view.app.installed_version||'unknown')})</h2>${unavailable}${body}${meta}</section>`;
+    return `<section class="rollup-card" id="rollup"><h2>${icon('sparkles')}Since your version (${h(rollup.installed||view.app.installed_version||'unknown')})</h2>${unavailable}${rollup.span_note?`<p class="muted">${h(rollup.span_note)}</p>`:''}${body}${meta}</section>`;
+  }
+  function rollbackPanel(view) {
+    const back=view.rollback;if(!back||back.status!=='ok')return '';
+    const notes=Object.fromEntries((view.history||[]).map(r=>[r.version,r.notes]));
+    const sections=Object.entries(rollupGroups).map(([group,[sym,label]])=>{
+      const items=((back.groups||{})[group]||[]).filter(item=>item.source==='release'&&hasEvidence(item.evidence,notes[item.release]));
+      if(!items.length)return '';
+      return `<div class="rollup-group ${h(group)}"><h3>${icon(sym)}${h(label)}</h3><ul>${items.map(item=>`<li><span>${h(item.text)}</span> <span class="rollup-from">· ${h(item.release)}</span><details><summary>Evidence</summary>${evidence(item.evidence,`Release ${item.release}`)}</details></li>`).join('')}</ul></div>`;
+    }).join('');
+    if(!sections)return '';
+    const meta=back.model?`<div class="model-meta"><span>${h(back.provider||'Local')} · ${h(back.model)}</span><span>Prompt ${h(back.prompt_version||'unknown')}</span></div>`:'';
+    return `<section class="rollup-card" id="rollback"><h2>${icon('alert')}If you need to roll back</h2><p class="muted">What older versions lack or reintroduce, from the ${h(String((back.releases||[]).length))} most recent releases up to ${h(back.installed||'your version')}.</p>${sections}${meta}</section>`;
   }
   function releaseLine(release,view) {
     const c=release.classification||{};
@@ -227,7 +364,8 @@
     detailData=view;const app=view.app;demoContext(app.source==='demo');
     document.title=`${app.name} · Ripe`;
     text('#breadcrumb-page',app.name);
-    $('#app-detail').innerHTML=`${app.source==='demo'?'<div class="demo-banner">'+icon('flask')+'Synthetic example · no live homelab data</div>':''}<div class="detail-heading">${avatar(app)}<div><h1>${h(app.name)}<span class="accent">.</span></h1><div class="app-source">${h(sources[app.source]||app.source)}${app.image?' · '+h(app.image):''}</div></div>${chip(view.status,statusLabel(view))}</div><div class="detail-overview">${versions(view)}<div class="detail-reason"><strong>${h(view.status_label||labels[view.status])}</strong>${h(view.reason||'Open the evidence below to understand this update.')}${ripeLabel(view)}</div></div>${app.error?`<div class="notice warning">${h(app.error)}</div>`:''}${view.hard_signals?.length?`<div class="notice warning">${hardSignals(view.hard_signals)}</div>`:''}<nav class="detail-tabs" aria-label="Application sections"><a href="#pending">Pending releases <span class="count-pill">${(view.pending||[]).length}</span></a><a href="#profile">Your setup</a><a href="#history">History <span class="count-pill">${(view.history||[]).length}</span></a></nav><div class="detail-layout"><div class="detail-main"><section id="pending"><div class="subsection-title"><h2>What’s ahead</h2><p>${view.pending?.length?'One summary for the whole span, then each release with its own evidence.':'Each release, its own evidence.'}</p></div>${rollupPanel(view)}${view.pending?.length?pendingList(view):'<div class="empty-section">No pending releases in the current inventory. If a version or source is unknown, set the repository mapping and check again.</div>'}</section>${view.available_notes?.length?`<section class="history-section"><div class="subsection-title"><h2>Available notes — update span unknown</h2><p>The installed version cannot be ordered against these releases. These are not counted as pending.</p></div>${view.available_notes.map(r=>releaseCard(r)).join('')}</section>`:''}<section class="history-section" id="history"><div class="subsection-title"><h2>Update history</h2><p>Releases you already have.</p></div>${historyList(view)}</section></div>${profileForm(app)}</div>`;
+    $('#app-detail').innerHTML=`${app.source==='demo'?'<div class="demo-banner">'+icon('flask')+'Synthetic example · no live homelab data</div>':''}<div class="detail-heading">${avatar(app)}<div><h1>${h(app.name)}<span class="accent">.</span></h1><div class="app-source">${h(sources[app.source]||app.source)}${app.image?' · '+h(app.image):''}</div></div>${chip(view.status,statusLabel(view))}</div><div class="detail-overview">${versions(view)}<div class="detail-reason"><strong>${h(view.status_label||labels[view.status])}</strong>${h(view.reason||'Open the evidence below to understand this update.')}${ripeLabel(view)}</div></div>${app.error?`<div class="notice warning">${h(app.error)}</div>`:''}${view.hard_signals?.length?`<div class="notice warning">${hardSignals(view.hard_signals)}</div>`:''}${ignoreButtons(view,'ignore-actions detail-ignore')}${app.ignored?'<div class="notice info">This app is ignored: it is not checked or analysed and is hidden from the Overview.</div>':''}${app.ignored_version?`<div class="notice info">Version ${h(app.ignored_version)} is hidden on the Overview until a newer one appears.</div>`:''}${(view.sidecars||[]).length?`<section class="sidecars detail-sidecars"><h2>Supporting containers</h2><ul>${view.sidecars.map(c=>`<li><a href="/apps/${encodeURIComponent(c.app.id)}">${h(c.app.name)}</a> <span class="sidecar-version">${h(c.app.installed_version||'Unknown')}${c.latest_version&&c.latest_version!==c.app.installed_version?' → '+h(c.latest_version):''}</span>${chip(c.status,statusLabel(c))}</li>`).join('')}</ul></section>`:''}${app.parent_id?`<p class="muted">Supports <a href="/apps/${encodeURIComponent(app.parent_id)}">its parent app</a>${app.detected?.sidecar_reason?' · '+h(app.detected.sidecar_reason):''}.</p>`:''}<nav class="detail-tabs" aria-label="Application sections"><a href="#pending">Pending releases <span class="count-pill">${(view.pending||[]).length}</span></a><a href="#profile">Your setup</a><a href="#history">History <span class="count-pill">${(view.history||[]).length}</span></a></nav><div class="detail-layout"><div class="detail-main"><section id="pending"><div class="subsection-title"><h2>What’s ahead</h2><p>${view.pending?.length?'One summary for the whole span, then each release with its own evidence.':'Each release, its own evidence.'}</p></div>${rollupPanel(view)}${view.pending?.length?pendingList(view):'<div class="empty-section">No pending releases in the current inventory. If a version or source is unknown, set the repository mapping and check again.</div>'}</section>${rollbackPanel(view)}${view.available_notes?.length?`<section class="history-section"><div class="subsection-title"><h2>Available notes — update span unknown</h2><p>The installed version cannot be ordered against these releases. These are not counted as pending.</p></div>${view.available_notes.map(r=>releaseCard(r)).join('')}</section>`:''}<section class="history-section" id="history"><div class="subsection-title"><h2>Update history</h2><p>Releases you already have.</p></div>${historyList(view)}</section></div>${profileForm(app)}</div>`;
+    $('#app-detail').onclick=ignoreClick;
     $('#profile-form').onsubmit=async e=>{
       e.preventDefault();const form=e.currentTarget;const data=new FormData(form);let config;
       try{config=JSON.parse(data.get('config'));if(!config||typeof config!=='object'||Array.isArray(config))throw new Error();}catch{toast('Relevant config keys must be a JSON object.');return;}
@@ -315,7 +453,7 @@
       e.preventDefault();const form=e.currentTarget;const data=new FormData(form);const button=$('button[type=submit]',form);button.disabled=true;clearError('#settings-error');
       const fields=['quiet_start','quiet_end','timezone','digest_time','dashboard_url','ollama_url','local_model','gemini_model','classification_provider','notification_script','notification_channel','npm_database_path','cloudflared_config_path'];const values={};fields.forEach(name=>values[name]=data.get(name));
       ['patch_soak_days','poll_hours','digest_weekday'].forEach(name=>values[name]=Number(data.get(name)));
-      ['patch_exception','notifications_enabled','second_opinion'].forEach(name=>values[name]=form.elements.namedItem(name).checked);
+      ['patch_exception','notifications_enabled','second_opinion','include_stopped'].forEach(name=>values[name]=form.elements.namedItem(name).checked);
       values.soak_days={infrastructure:Number(data.get('soak_infrastructure')),internet:Number(data.get('soak_internet')),general:Number(data.get('soak_general'))};
       values.notification_people=String(data.get('notification_people')).split(',').map(x=>x.trim()).filter(Boolean);
       try{const saved=await api('/api/settings',{method:'PATCH',body:JSON.stringify(values)});settings={...settings,...values,...saved};setForm(form,settings);zone=settings.timezone;text('#footer-timezone',`Ripe · ${zone}`);text('#settings-save-state','Saved. Your preferences are active.');toast('Settings saved.');}catch(error){errorAt('#settings-error',error);}finally{button.disabled=false;}
@@ -324,17 +462,20 @@
   }
 
   function stringify(value) {return typeof value==='string'?value:JSON.stringify(value,null,2);}
+  function logCallFailed(item) {return ['unavailable','error','invalid_json'].includes(item.outcome)||item.status==='error'||Boolean(item.error);}
+  function logEvidencePassed(item) {return item.evidence_passed??item.evidence_valid??item.evidence_checks_passed;}
   function logRow(item) {
-    const passed=item.evidence_passed??item.evidence_valid??item.evidence_checks_passed;
-    const evidenceStatus=passed===true?'Evidence checked':passed===false?'Evidence rejected':item.status==='error'?'Call failed':'View evidence results';
+    const passed=logEvidencePassed(item);
+    const failed=logCallFailed(item);
+    const evidenceStatus=failed?`Call failed${item.error?` (${item.error})`:''}`:passed===true?'Evidence checked':passed===false?'Evidence rejected':'View evidence results';
     const ms=item.duration_ms??(item.duration!=null?item.duration*1000:null);
     const input=item.input_size??item.input_chars??item.input_characters;
     const rows={...item};delete rows.model;
-    return `<details class="log-entry"><summary><span class="log-model">${h(item.model||item.provider||'Model call')}</span><span class="log-meta">${item.prompt_version?`<span>Prompt ${h(item.prompt_version)}</span>`:''}${ms!=null?`<span>${h((ms/1000).toFixed(1))}s</span>`:''}${input!=null?`<span>${h(input)} chars</span>`:''}<span>${h(item.retries??item.retry??item.attempt??0)} retries</span></span><span class="status-chip ${passed===false?'read_first':passed===true?'ripe':'unknown'}">${h(evidenceStatus)}</span><time class="log-time">${h(date(item.created_at||item.timestamp||item.at,true))}</time></summary><pre class="raw-notes">${h(stringify(rows))}</pre></details>`;
+    return `<details class="log-entry"><summary><span class="log-model">${h(item.model||item.provider||'Model call')}</span><span class="log-meta">${item.prompt_version?`<span>Prompt ${h(item.prompt_version)}</span>`:''}${ms!=null?`<span>${h((ms/1000).toFixed(1))}s</span>`:''}${input!=null?`<span>${h(input)} chars</span>`:''}<span>${h(item.retries??item.retry??item.attempt??0)} retries</span></span><span class="status-chip ${failed?'waiting':passed===false?'read_first':passed===true?'ripe':'unknown'}">${h(evidenceStatus)}</span><time class="log-time">${h(date(item.created_at||item.timestamp||item.at,true))}</time></summary><pre class="raw-notes">${h(stringify(rows))}</pre></details>`;
   }
   async function loadLogs() {
-    try{const [data,context]=await Promise.all([api('/api/logs'),api('/api/dashboard')]);demoContext(context.demo);const calls=data.llm||[];const errors=data.errors||[];let rate=Number(data.disagreement_rate||0);if(rate<=1)rate*=100;
-      $('#logs-content').innerHTML=`<div class="log-summary"><div class="log-stat"><strong>${calls.length}</strong><span>Recorded model calls</span><p>Prompt versions, timing, and output</p></div><div class="log-stat"><strong>${h(rate.toFixed(1))}%</strong><span>Model disagreement rate</span><p>Compared releases with differing conclusions</p></div><div class="log-stat"><strong>${errors.length}</strong><span>Data-source errors</span><p>Failed or unavailable source requests</p></div></div><section class="log-panel"><h2>Model calls</h2>${calls.length?calls.map(logRow).join(''):'<div class="empty-section">No model calls yet. Ripe logs classification and local profile analysis as releases are collected.</div>'}</section><section class="log-panel"><h2>Data sources</h2>${errors.length?errors.map(item=>`<article class="source-error"><div class="error-top">${icon('alert')}<strong>${h(item.source||item.category||'Source error')}</strong><time>${h(date(item.created_at||item.timestamp||item.at,true))}</time></div><p>${h(item.message||item.error||stringify(item))}</p>${item.first_seen?`<p class="error-meta">Failing since ${h(date(item.first_seen,true))} · ${h(String(item.attempts||1))} attempt${item.attempts>1?'s':''} · last ${h(ageOf(item.last_seen))} ago</p>`:''}</article>`).join(''):'<div class="empty-section">No data-source errors recorded.</div>'}</section><div class="privacy-note">${icon('lock')}<div><strong>A useful trail, without your secrets.</strong><p>Model output and diagnostic records are sanitized before storage. Profiles are used only for local analysis.</p></div></div>`;clearError('#logs-error');
+    try{const [data,context]=await Promise.all([api('/api/logs'),api('/api/dashboard')]);demoContext(context.demo);const calls=data.llm||[];const errors=data.errors||[];const failed=calls.filter(logCallFailed).length;const rejected=calls.filter(item=>!logCallFailed(item)&&logEvidencePassed(item)===false).length;let rate=Number(data.disagreement_rate||0);if(rate<=1)rate*=100;
+      $('#logs-content').innerHTML=`<div class="log-summary"><div class="log-stat"><strong>${calls.length}</strong><span>Recorded model calls</span><p>${failed} failed calls · ${rejected} evidence rejected</p></div><div class="log-stat"><strong>${h(rate.toFixed(1))}%</strong><span>Model disagreement rate</span><p>Compared releases with differing conclusions</p></div><div class="log-stat"><strong>${errors.length}</strong><span>Data-source errors</span><p>Failed or unavailable source requests</p></div></div><section class="log-panel"><h2>Model calls</h2>${calls.length?calls.map(logRow).join(''):'<div class="empty-section">No model calls yet. Ripe logs classification and local profile analysis as releases are collected.</div>'}</section><section class="log-panel"><h2>Data sources</h2>${errors.length?errors.map(item=>`<article class="source-error"><div class="error-top">${icon('alert')}<strong>${h(item.source||item.category||'Source error')}</strong><time>${h(date(item.created_at||item.timestamp||item.at,true))}</time></div><p>${h(item.message||item.error||stringify(item))}</p>${item.first_seen?`<p class="error-meta">Failing since ${h(date(item.first_seen,true))} · ${h(String(item.attempts||1))} attempt${item.attempts>1?'s':''} · last ${h(ageOf(item.last_seen))} ago</p>`:''}</article>`).join(''):'<div class="empty-section">No data-source errors recorded.</div>'}</section><div class="privacy-note">${icon('lock')}<div><strong>A useful trail, without your secrets.</strong><p>Model output and diagnostic records are sanitized before storage. Profiles are used only for local analysis.</p></div></div>`;clearError('#logs-error');
     }catch(error){errorAt('#logs-error',error);}
   }
   function initTheme() {
@@ -343,12 +484,12 @@
     const setTheme=value=>{document.documentElement.dataset.theme=value;$('#theme-toggle').innerHTML=icon(value==='dark'?'sun':'moon');$('#theme-toggle').setAttribute('aria-label',`Switch to ${value==='dark'?'light':'dark'} theme`);};
     setTheme(theme);$('#theme-toggle').onclick=()=>{const next=document.documentElement.dataset.theme==='dark'?'light':'dark';setTheme(next);try{localStorage.setItem('ripe-theme',next);}catch{}};
   }
-  hydrateIcons();initTheme();
+  hydrateIcons();initTheme();initProgress();
   const active=page==='app'?'dashboard':page;
   const link=$(`[data-nav="${active}"]`);if(link){link.classList.add('active');link.setAttribute('aria-current','page');}
   text('#breadcrumb-page',{dashboard:'Overview',settings:'Settings',logs:'Activity & logs',app:'Application'}[page]||'Overview');
   if(page==='dashboard')initDashboard();
   if(page==='app')loadDetail();
   if(page==='settings')initSettings();
-  if(page==='logs'){loadLogs();$('#refresh-logs').onclick=loadLogs;}
+  if(page==='logs'){document.addEventListener('ripe:poll-finished',loadLogs);void loadLogs();$('#refresh-logs').onclick=loadLogs;}
 })();

@@ -30,6 +30,15 @@
       <div class="breadcrumb">Homelab <span>/</span> <span id="breadcrumb-page">Overview</span></div>
       <div class="topbar-right"><span class="demo-context" id="demo-context" hidden>Demo data</span><span class="readonly-badge"><span data-icon="lock"></span> Read only</span><button id="theme-toggle" type="button" class="icon-button" aria-label="Switch color theme" title="Switch color theme"><span data-icon="moon"></span></button></div>
     </header>
+    <section id="poll-strip" class="poll-strip" data-state="idle" aria-label="Update check progress" hidden>
+      <button id="poll-strip-toggle" class="poll-strip-toggle" type="button" aria-expanded="false" aria-controls="poll-panel">
+        <span class="poll-bar" id="poll-bar" role="progressbar" aria-label="Update check progress" aria-valuemin="0" aria-valuemax="100"><span class="poll-bar-fill" id="poll-bar-fill"></span></span>
+        <span class="poll-line" id="poll-line"></span>
+      </button>
+      <a id="poll-logs-link" class="poll-logs-link" href="/logs" hidden>Activity &amp; logs</a>
+      <button id="poll-dismiss" class="poll-dismiss" type="button" aria-label="Dismiss" hidden>&times;</button>
+      <div id="poll-panel" class="poll-panel" hidden></div>
+    </section>
     <main id="main-content" tabindex="-1">{% block content %}{% endblock %}</main>
     <footer class="page-footer"><span>Made for a calmer homelab. · <span id="ripe-version">Ripe v{{ ripe_version }}</span></span><span id="footer-timezone">Ripe · Stage 1</span></footer>
   </div>

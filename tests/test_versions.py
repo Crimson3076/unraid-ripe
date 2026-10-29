@@ -47,3 +47,24 @@ def test_null_version_label_is_not_a_version():
 def test_revision_suffix_kept_without_linuxserver_tag():
     assert compare_versions('1.0-r1', '1.0-r2') == -1
     assert normalize_version('1.0-r1-ls5') == '1.0'
+
+
+def test_tag_prefixes_and_build_suffixes_are_stripped_before_ordering():
+    from ripe.versions import compare_versions, parse_version
+    assert str(parse_version('n8n@1.2.3')) == '1.2.3'
+    assert compare_versions('1.2.3-python3.13-alpine3.23', '1.2.3') == 0
+    assert compare_versions('10.11.6-r0-ls237', '10.11.6') == 0
+    assert compare_versions('2.0.1-bookworm-slim', '2.0.0') == 1
+    assert compare_versions('1.0.0-rc1', '1.0.0') == -1
+    assert compare_versions('1.0.0-beta.2', '1.0.0') == -1
+
+
+def test_mapped_repo_far_behind_installed_is_flagged():
+    from ripe.models import AppRecord, Release, Settings
+    from ripe.ripeness import build_view
+    app = AppRecord(id='m', name='mariadb', source='docker', installed_version='11.4.2', upstream_repo='x/mariadb')
+    old = Release(id='github:x/mariadb:1', app_id='m', version='5.5.1', notes='n')
+    view = build_view(app, [old], Settings())
+    assert any('wrong repository' in s for s in view.hard_signals)
+    app.installed_version = '5.5.0'
+    assert not any('wrong repository' in s for s in build_view(app, [old], Settings()).hard_signals)

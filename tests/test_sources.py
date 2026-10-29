@@ -275,7 +275,7 @@ def _gh(tag, prerelease=False):
     return {'id': tag, 'tag_name': tag, 'body': 'notes', 'published_at': '2026-10-01T00:00:00Z', 'prerelease': prerelease}
 
 
-async def _collect(monkeypatch, tmp_path, apps, github=None, registry_digest='sha256:' + 'f' * 64, existing=None):
+async def _collect(monkeypatch, tmp_path, apps, github=None, registry_digest='sha256:' + 'f' * 64, existing=None, settings=None):
     from ripe.models import Settings
     from ripe.sources import collector
     socket = tmp_path / 'docker.sock'
@@ -297,7 +297,7 @@ async def _collect(monkeypatch, tmp_path, apps, github=None, registry_digest='sh
         return original_client(*args, **kwargs)
     monkeypatch.setattr(collector.httpx, 'AsyncClient', make_client)
     cache = {}
-    return await collector.collect(Settings(), docker_socket=str(socket), unraid_version_file=str(tmp_path / 'no-version'), cache_get=cache.get, cache_set=cache.__setitem__, existing_apps=existing)
+    return await collector.collect(settings or Settings(), docker_socket=str(socket), unraid_version_file=str(tmp_path / 'no-version'), cache_get=cache.get, cache_set=cache.__setitem__, existing_apps=existing)
 
 
 async def test_unmapped_latest_app_uses_digest_logic(monkeypatch, tmp_path):
@@ -772,3 +772,22 @@ def test_ha_shared_friendly_names_fall_back_to_entity_ids():
     apps = [a for s in states for a in ha_records([s], {}, {})[0]]
     disambiguate_ha_names(apps, states)
     assert [a.name for a in apps] == ["Device Firmware (update.a)", "Device Firmware (update.b)"]
+
+
+async def test_stopped_ignored_and_merged_apps_are_not_polled(monkeypatch, tmp_path):
+    def app(name, **extra):
+        return AppRecord(id='docker:' + name, name=name, source='docker', image=f'ghcr.io/o/{name}:latest', installed_digest='sha256:' + '1' * 64, **extra)
+    live, stopped, ignored = app('live', state='running'), app('stopped', state='exited'), app('ign')
+    previous = ignored.model_copy(update={'ignored': True})
+    apps, _, _ = await _collect(monkeypatch, tmp_path, [live, stopped, ignored], existing=[previous])
+    by_id = {a.id: a for a in apps}
+    assert by_id['docker:live'].latest_digest and not by_id['docker:stopped'].latest_digest and not by_id['docker:ign'].latest_digest
+    assert by_id['docker:ign'].ignored
+
+
+async def test_stopped_container_is_polled_once_included(monkeypatch, tmp_path):
+    from ripe.models import Settings
+    from ripe.sources import collector
+    stopped = AppRecord(id='docker:stopped', name='stopped', source='docker', image='ghcr.io/o/stopped:latest', installed_digest='sha256:' + '1' * 64, state='exited')
+    apps, _, _ = await _collect(monkeypatch, tmp_path, [stopped], settings=Settings(include_stopped=True))
+    assert next(a for a in apps if a.id == 'docker:stopped').latest_digest
