@@ -125,12 +125,20 @@ class Coordinator:
         return view
 
     @staticmethod
+    def ignore_target(view: AppView) -> str | None:
+        """What an ignore pins: the image digest for latest-only images (rebuilds keep the same upstream version), else the version."""
+        app = view.app
+        if app.latest_only and app.latest_digest:
+            return app.latest_digest
+        return view.latest_version or app.latest_digest
+
+    @staticmethod
     def version_ignored(view: AppView) -> bool:
         """The user hid this update; it stays hidden until something newer than the hidden version exists."""
         app = view.app
         if not app.ignored_version:
             return False
-        latest = view.latest_version or app.latest_digest
+        latest = Coordinator.ignore_target(view)
         if not latest or view.status == 'up_to_date':
             return False
         comparison = compare_versions(latest, app.ignored_version)
@@ -170,6 +178,7 @@ class Coordinator:
             if view.status in attention and _STATUS_ORDER[view.status] < _STATUS_ORDER.get(parent.status, 99):
                 parent.status, parent.status_label = view.status, view.status_label
                 parent.reason = f'{view.app.name}: {view.reason}'
+                parent.recommended_version = view.recommended_version
                 parent.days_remaining, parent.next_ripe_at = view.days_remaining, view.next_ripe_at
                 parent.tags = sorted({*parent.tags, *view.tags})
         hidden_stopped = sum(1 for a in records if stopped(a) and not settings.include_stopped and not a.ignored and not a.merged_into)
@@ -187,7 +196,7 @@ class Coordinator:
             app.ignored = on
         elif on:
             view = self.view(app_id)
-            latest = (view.latest_version or app.latest_digest) if view else None
+            latest = self.ignore_target(view) if view else None
             if not latest:
                 raise ValueError('No newer version is known')
             app.ignored_version = latest

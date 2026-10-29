@@ -264,3 +264,29 @@ async def test_firmware_without_notes_never_reaches_a_model(tmp_path, monkeypatc
 
     await manager.refresh_rollup(app, manager.settings(), ready)
     manager.close()
+
+
+def test_latest_only_ignore_pins_the_digest_not_the_upstream_version(tmp_path):
+    manager = make(tmp_path)
+    manager.request_poll = lambda: False
+    add(manager, "docker:lo", installed_version="1.0.0", latest_version="1.0.0", latest_only=True, installed_digest="sha256:old", latest_digest="sha256:a", update_available=True)
+    manager.set_ignore("docker:lo", "version", True)
+    assert manager.store.app("docker:lo").ignored_version == "sha256:a"
+    assert manager.dashboard()["apps"] == []
+    app = manager.store.app("docker:lo")
+    app.latest_digest = "sha256:b"  # rebuilt, same upstream version
+    manager.store.save_app(app)
+    assert len(manager.dashboard()["apps"]) == 1
+    manager.close()
+
+
+def test_sidecar_promotion_replaces_the_parents_recommended_version(tmp_path):
+    manager = make(tmp_path)
+    add(manager, "docker:app", name="app", state="running", installed_version="1.0.0", latest_version="1.1.0")
+    add(manager, "docker:app_db", name="app_db", state="running", parent_id="docker:app", installed_version="16.1.0", latest_version="16.2.0")
+    manager.store.save_release(release("docker:app", "1.1.0"))
+    manager.store.save_release(release("docker:app_db", "16.2.0", classification={"status": "ok", "tags": ["security"], "security": [{"description": "d", "evidence": "e"}]},
+                  applicability=[{"kind": "security", "index": 0, "status": "applies", "evidence": "e", "profile_evidence": "p", "verified": True}]))
+    card = manager.dashboard()["apps"][0]
+    assert card["status"] == "recommended_now" and card["recommended_version"] != "1.1.0"
+    manager.close()
