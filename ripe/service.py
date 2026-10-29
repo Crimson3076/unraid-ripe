@@ -150,10 +150,28 @@ class Coordinator:
                                     model_unavailable=unavailable, log_call=self.store.log_llm)
         self.store.set('rollup:' + app.id, {'key': key if result['status'] == 'ok' else None, 'result': result})
 
+    @staticmethod
+    def card(view: AppView) -> dict:
+        """Overview fields only; notes, history and classifications load from /api/apps/{id}."""
+        def norm(text) -> str:
+            return ' '.join(str(text or '').lower().split())
+        quotes: dict[str, str] = {}
+        for release in view.pending:
+            c = release.classification or {}
+            for tag in c.get('tags', []):
+                evidence = (c.get('tag_evidence') or {}).get(tag)
+                if tag not in quotes and norm(evidence) and norm(evidence) in norm(release.notes):
+                    quotes[tag] = f'{release.version}: {evidence}'
+        data = view.model_dump(mode='json', exclude={'pending', 'history', 'available_notes', 'no_notes', 'rollup'})
+        data['app']['detected'] = {k: v for k, v in data['app']['detected'].items() if k == 'mapping_hint'}
+        data['tag_quotes'] = quotes
+        data['rollup'] = {'headline': view.rollup['headline']} if view.rollup and view.rollup.get('headline') else None
+        return data
+
     def dashboard(self) -> dict:
         views = self.views()
         counts = Counter(v.status for v in views)
-        return {'apps': [v.model_dump(mode='json') for v in views], 'demo': self.demo,
+        return {'apps': [self.card(v) for v in views], 'demo': self.demo,
                 'summary': {s:counts[s] for s in ('ripe','waiting','recommended_now','read_first','up_to_date','unknown')},
                 'last_poll':self.store.get('last_poll'), 'polling': self.polling,
                 'integration_status': self.integration_status(), 'timezone':self.settings().timezone,
