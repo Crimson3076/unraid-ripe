@@ -307,3 +307,22 @@ def test_applicability_prompt_digest_tracks_actual_prompt_content(monkeypatch):
     assert len(first) == 64
     with pytest.raises(ValueError):
         prompt_digest('../../secret')
+
+
+@pytest.mark.asyncio
+async def test_unconfigured_gemini_is_skipped_without_call_records(monkeypatch):
+    from ripe.intelligence import service
+    providers = []
+    async def fake(provider, model, prompt, payload, settings, key):
+        providers.append(provider)
+        return json.dumps(classification())
+    monkeypatch.setattr(service, '_call_model', fake)
+    for settings in (Settings(second_opinion=True), Settings(classification_provider='gemini')):
+        providers.clear()
+        logs = []
+        result = await classify_release(release(), app(), settings, log_call=logs.append)
+        assert providers == ['local']
+        assert {x['provider'] for x in logs} == {'local'}
+        assert result.classification['status'] == 'ok'
+        assert not result.model_disagreement
+        assert len(result.classification['provenance']) == 1
