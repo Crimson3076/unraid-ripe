@@ -837,13 +837,15 @@ def installed_unraid(path: str) -> str | None:
         return None
 
 
-async def collect(settings: Settings, *, github_token: str | None = None, ha_token: str | None = None, ha_url: str = "", docker_socket: str = "/var/run/docker.sock", templates_dir: str = "/host/templates", unraid_version_file: str = "/host/unraid-version", cache_get: Callable | None = None, cache_set: Callable | None = None, existing_apps: list[AppRecord] | None = None) -> tuple[list[AppRecord], list[Release], list[JSON]]:
+async def collect(settings: Settings, *, github_token: str | None = None, ha_token: str | None = None, ha_url: str = "", docker_socket: str = "/var/run/docker.sock", templates_dir: str = "/host/templates", unraid_version_file: str = "/host/unraid-version", cache_get: Callable | None = None, cache_set: Callable | None = None, existing_apps: list[AppRecord] | None = None, progress=None) -> tuple[list[AppRecord], list[Release], list[JSON]]:
     existing = {a.id:a for a in existing_apps or []}
     apps: list[AppRecord] = []
     releases: list[Release] = []
     errors: list[JSON] = []
     def error(source: str, message: str):
         errors.append({"source":source, "message":message})
+    if progress:
+        progress.add_sources(3)
     async with httpx.AsyncClient(timeout=20, follow_redirects=False, trust_env=True, headers={"User-Agent":"Ripe/0.1 homelab update tracker"}) as public, httpx.AsyncClient(timeout=12, follow_redirects=False, trust_env=False) as local:
         cached = CachedHTTP(public, cache_get, cache_set)
         registry = RegistryReader(public, cache_get, cache_set)
@@ -865,6 +867,8 @@ async def collect(settings: Settings, *, github_token: str | None = None, ha_tok
                 error("docker", "Docker: parse error")
         else:
             error("docker", "Docker socket not mounted; mount read-only to enable discovery")
+        if progress:
+            progress.source_done("Docker")
         if ha_token and ha_url:
             try:
                 states = await ha_states(local, ha_url, ha_token)
@@ -883,6 +887,8 @@ async def collect(settings: Settings, *, github_token: str | None = None, ha_tok
                 error("home_assistant", "Home Assistant: parse error")
         else:
             error("home_assistant", "Home Assistant connection is not configured; open Ripe Settings to enable discovery")
+        if progress:
+            progress.source_done("Home Assistant")
         unraid = AppRecord(id="unraid:os", name="Unraid OS", source="unraid", installed_version=installed_unraid(unraid_version_file), upstream_repo=None, profile=Profile(tier="infrastructure", exposure="lan", origin={f: "auto" for f in AUTO_FIELDS}), detected={"profile_evidence": {"tier": "Unraid OS is the host everything else runs on"}})
         if not unraid.installed_version:
             unraid.error = "Unraid version file not mounted or version unrecognised"
@@ -900,11 +906,16 @@ async def collect(settings: Settings, *, github_token: str | None = None, ha_tok
             unraid.error = "Unraid release notes: parse error"
             error("unraid", unraid.error)
         apps.append(unraid)
+        if progress:
+            progress.source_done("Unraid")
+            progress.add_sources(len(apps))
         # Pagination can stop at an installed version's historical base. A
         # repository-only cache would silently give older installations the
         # shorter span fetched for a newer installation of the same app.
         upstream_cache: dict[tuple[str, str | None], list[Release] | str] = {}
         for app in apps:
+            if progress:
+                progress.working_on(app.name)
             registry_ok = False
             if app.source == "docker" and app.image and is_local_image(app.image, app.installed_digest, bool(existing.get(app.id) and existing[app.id].latest_digest)):
                 # Never pulled from a registry: nothing to look up, and not an error.
@@ -1034,4 +1045,6 @@ async def collect(settings: Settings, *, github_token: str | None = None, ha_tok
                     app.detected["image_diff_for"] = identity
             if not app.installed_version and app.image_created_at:
                 app.detected["version_fallback"] = "unknown (image date " + app.image_created_at.date().isoformat() + ")"
+            if progress:
+                progress.source_done(app.name)
     return apps, releases, errors

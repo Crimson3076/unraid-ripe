@@ -302,6 +302,10 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         accepted=manager.request_poll()
         return {'status':'started' if accepted else ('demo' if manager.demo else 'already running')}
 
+    @app.get('/api/poll/status')
+    async def poll_status(request:Request):
+        return request.app.state.manager.poll_status()
+
     @app.get('/api/logs')
     async def logs(request:Request):
         return request.app.state.manager.store.logs()
