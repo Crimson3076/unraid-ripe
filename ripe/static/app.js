@@ -195,8 +195,11 @@
       return `<div class="rollup-group ${h(group)}"><h3>${icon(sym)}${h(label)}</h3><ul>${items.map(item=>`<li><span>${h(item.text)}</span> <span class="rollup-from">· ${h(item.release)}</span><details><summary>Evidence</summary>${evidence(item.evidence,`Release ${item.release}`)}</details></li>`).join('')}</ul></div>`;
     }).join('');
     const unavailable=back?.status==='unavailable'?`<div class="notice warning">${icon('alert')} Summary unavailable: ${h(back.error||'model unavailable')}. It will be retried at the next check.</div>`:'';
-    const body=sections||(back&&back.status!=='unavailable'?'<p class="rollup-empty">Nothing notable found in these releases.</p>':(back?'':'<p class="rollup-empty">Not summarised yet; it appears after the next check.</p>'));
-    return `<section class="rollup-card" id="rollback"><h2>${icon('history')}If you need to roll back</h2><p class="muted">Going back to a version older than ${h(window[0].version)} undoes the newest ${window.length} release${window.length===1?'':'s'} up to your installed ${h(view.app.installed_version||'')}. Only these are analysed.</p>${unavailable}${body}</section>`;
+    const skipped=back?.status==='ok'?(back.no_notes||[]):[],analysed=window.length-skipped.length;
+    const empty=analysed>0?'Nothing notable found in these releases.':'None of these releases had usable notes, so nothing was analysed.';
+    const body=sections||(back&&back.status!=='unavailable'?`<p class="rollup-empty">${empty}</p>`:(back?'':'<p class="rollup-empty">Not summarised yet; it appears after the next check.</p>'));
+    const gap=skipped.length?`<p class="muted">Not analysed (no notes or too long): ${skipped.map(h).join(', ')}</p>`:'';
+    return `<section class="rollup-card" id="rollback"><h2>${icon('history')}If you need to roll back</h2><p class="muted">Going back to a version older than ${h(window[0].version)} undoes the newest ${window.length} release${window.length===1?'':'s'} up to your installed ${h(view.app.installed_version||'')}. Only these are analysed.</p>${unavailable}${body}${gap}</section>`;
   }
   function releaseLine(release,view) {
     const c=release.classification||{};

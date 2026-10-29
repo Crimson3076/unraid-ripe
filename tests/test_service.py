@@ -376,6 +376,24 @@ async def test_refresh_rollback_caches_retries_and_resets(tmp_path,monkeypatch):
         manager.close()
 
 
+def test_stored_rollback_is_dropped_when_installed_or_window_changes(tmp_path,monkeypatch):
+    app,releases=_many(10,installed='1.6.0')
+    manager=Coordinator(runtime(tmp_path))
+    monkeypatch.setattr(manager.store,'releases',lambda app_id:releases)
+    monkeypatch.setattr(manager.store,'app',lambda app_id:app)
+    try:
+        manager.store.set('rollback:'+app.id,{'key':'k','result':_ok(app)})
+        assert manager.view(app.id).rollback_rollup is not None
+        stale={**_ok(app),'installed':'1.5.0'}
+        manager.store.set('rollback:'+app.id,{'key':'k','result':stale})
+        assert manager.view(app.id).rollback_rollup is None
+        other={**_ok(app),'releases':['1.1.0']}
+        manager.store.set('rollback:'+app.id,{'key':'k','result':other})
+        assert manager.view(app.id).rollback_rollup is None
+    finally:
+        manager.close()
+
+
 def test_card_excludes_rollback_payload():
     from ripe.models import Settings
     from ripe.ripeness import build_view
