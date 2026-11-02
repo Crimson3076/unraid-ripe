@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 
 import httpx
@@ -175,13 +175,45 @@ async def test_first_run_seeds_digest_instead_of_sending(store):
     assert len(calls) == 1
 
 
+@pytest.mark.parametrize('sidecar', [False, True])
+async def test_security_alert_ignores_target_change_but_realerts_when_new_fix_soaks(store, sidecar):
+    calls, transport = recorder()
+    settings = configured_settings(timezone='UTC')
+    store.set('digest-sent-for', '2026-10-26')
+    notifier = Notifier(store, 'http://ha.local:8123', 'test-ha-secret', transport=transport)
+    now = instant('2026-10-26T15:00:00Z')
+    view = security_view()
+    card = (AppView(app=AppRecord(id='docker:parent', name='Parent', source='docker'),
+                    status='recommended_now', status_label='Recommended now', sidecars=[view])
+            if sidecar else view)
+    await notifier.tick(settings, [card], now=now)
+    view.recommended_version = '1.03'  # a non-security release finished its soak
+    await notifier.tick(settings, [card], now=now)
+    assert len(calls) == 1
+    low = {'tags': ['security'], 'security': [{'description': 'Minor hardening.', 'severity': 'low',
+           'requires': 'none', 'evidence': 'Hardened parser.'}]}
+    later = Release(id='github:example/gateway:103', app_id=view.app.id, version='1.03', notes='Hardened parser.',
+                    classification=low, published_at=now - timedelta(days=1))
+    view.pending.append(later)
+    await notifier.tick(settings, [card], now=now)
+    assert len(calls) == 1  # still soaking
+    ready_at = later.published_at + timedelta(days=settings.patch_soak_days)
+    await notifier.tick(settings, [card], now=ready_at - timedelta(seconds=1))
+    assert len(calls) == 1
+    await notifier.tick(settings, [card], now=ready_at)
+    assert len(calls) == 2
+    restarted = Notifier(store, 'http://ha.local:8123', 'test-ha-secret', transport=transport)
+    await restarted.tick(settings, [card], now=ready_at)
+    assert len(calls) == 2
+
+
 async def test_sidecar_security_fixes_alert_separately(store):
     calls, transport = recorder()
     notifier = Notifier(store, 'http://homeassistant.local:8123', 'test-ha-secret', transport=transport)
     settings = configured_settings(timezone='UTC', quiet_start='00:00', quiet_end='00:00')
     def view(version):
         side = AppView(app=AppRecord(id='docker:db', name='db', source='docker'), status='recommended_now', status_label='Recommended now',
-                       pending=[Release(id='docker:db:'+version, app_id='docker:db', version=version, notes='n', classification={'security': [{'description': 'd'}]})])
+                       pending=[Release(id='docker:db:'+version, app_id='docker:db', version=version, notes='n', classification={'security': [{'description': 'd', 'evidence': 'n', 'severity': 'high'}]})])
         return AppView(app=AppRecord(id='docker:app', name='app', source='docker'), status='recommended_now', status_label='Recommended now', sidecars=[side])
     now = instant('2026-10-27T12:00:00Z')
     for version in ('16.2.0', '16.2.0', '16.3.0'):

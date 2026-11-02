@@ -19,6 +19,8 @@ _TAG_ORDER = {"security": 0, "breaking": 1, "migration": 2, "deprecation": 3,
 _STATUS_ORDER = {"recommended_now": 0, "read_first": 1, "unknown": 2,
                  "waiting": 3, "ripe": 4, "up_to_date": 5}
 _TIER_ORDER = {"infrastructure": 0, "internet": 1, "general": 2}
+_ADVISORY = re.compile(r"\b(?:CVE-\d{4}-\d{4,}|GHSA(?:-[23456789cfghjmpqrvwx]{4}){3})\b", re.I)
+_URGENT_SEVERITY = ("high", "critical")
 _DATABASE = re.compile(r"(?:^|[\W_])(?:mariadb|mysql|postgres(?:ql)?|redis|mongo(?:db)?)(?:$|[\W_])", re.I)
 
 
@@ -43,6 +45,52 @@ def _applicable(release: Release, kind: str, index: int) -> bool:
 def _has_applicable(release: Release, kind: str) -> bool:
     return any(item.get("evidence") and _applicable(release, kind, i)
                for i, item in enumerate(_classification(release).get(kind, [])))
+
+
+def advisory_ids(release: Release) -> list[str]:
+    """Advisory IDs quoted by an applicable security item, so an advisory for an
+    excluded fix cannot make a different fix urgent."""
+    items = _classification(release).get("security", [])
+    text = " ".join(f"{item.get('evidence') or ''} {item.get('description') or ''}"
+                    for i, item in enumerate(items)
+                    if item.get("evidence") and _applicable(release, "security", i))
+    return sorted({m.upper() for m in _ADVISORY.findall(text)} & {m.upper() for m in _ADVISORY.findall(release.notes or "")})
+
+
+def _security_severities(release: Release) -> list[str]:
+    items = _classification(release).get("security", [])
+    return sorted({str(item["severity"]).lower() for i, item in enumerate(items)
+                   if item.get("evidence") and item.get("severity") and _applicable(release, "security", i)})
+
+
+def _security_urgent(release: Release) -> bool:
+    return bool(advisory_ids(release)) or any(s in _URGENT_SEVERITY for s in _security_severities(release))
+
+
+def _security_ready_at(release: Release, settings: Settings) -> datetime | None:
+    if not _has_applicable(release, "security") or release.published_at is None:
+        return None
+    published = _aware(release.published_at)
+    return published if _security_urgent(release) else published + timedelta(days=settings.patch_soak_days)
+
+
+def _security_ready(release: Release, settings: Settings, now: datetime) -> bool:
+    """A security claim alone never skips the soak: only an advisory ID or high
+    severity does. Otherwise the short patch soak still applies, so a hostile
+    upstream cannot get an hours-old release recommended by writing "Security"."""
+    if not _has_applicable(release, "security"):
+        return False
+    if _security_urgent(release):
+        return True
+    return release.published_at is not None and \
+        _aware(release.published_at) + timedelta(days=settings.patch_soak_days) <= now
+
+
+def _security_detail(releases: list[Release]) -> str:
+    severities = sorted({s for r in releases for s in _security_severities(r)})
+    ids = sorted({i for r in releases for i in advisory_ids(r)})
+    parts = ([f"severity {', '.join(severities)}"] if severities else []) + ([", ".join(ids)] if ids else [])
+    return f" ({'; '.join(parts)})" if parts else ""
 
 
 def _disagreed(release: Release) -> bool:
@@ -191,13 +239,24 @@ def _build_view(app: AppRecord, releases: list[Release], settings: Settings,
     latest_missing = compare_versions(latest, newest.version) == 1
     deadline = None if latest_missing else soak_deadline(newest, releases, settings, app.profile.tier)
     days_left = max(0, math.ceil((deadline - now).total_seconds() / 86400)) if deadline else None
+    security_at = None
+    if not latest_missing and not any(_security_ready(r, settings, now) for r in pending):
+        times = [t for r in pending if (t := _security_ready_at(r, settings))]
+        security_at = min(times, default=None)
+        if security_at and (deadline is None or security_at < deadline):
+            deadline = security_at
+            days_left = max(0, math.ceil((deadline - now).total_seconds() / 86400))
+        else:
+            security_at = None
     ripe = [] if latest_missing else [r for r in pending if _is_ripe(r, pending, releases, settings, app.profile.tier, now)]
     target = ripe[-1] if ripe else None
-    security = [r for r in pending if _has_applicable(r, "security")]
+    security = [r for r in pending if _security_ready(r, settings, now)]
     # The earliest version containing all known fixes is the last fixing
-    # release. Recommending the first would knowingly omit later security fixes.
-    if security and (target is None or compare_versions(target.version, security[-1].version) == -1):
-        target = security[-1]
+    # release. Recommending the first would knowingly omit later security fixes,
+    # so unsoaked applicable fixes still constrain the target once one is ready.
+    last_fix = [r for r in pending if _has_applicable(r, "security")][-1:] if security else []
+    if last_fix and (target is None or compare_versions(target.version, last_fix[0].version) == -1):
+        target = last_fix[0]
     view.recommended_version = target.version if target else None
     # Releases that normalise equal (V1.07 vs v1.7.0) display with the latest's spelling.
     if target and latest and compare_versions(target.version, latest) == 0:
@@ -209,7 +268,7 @@ def _build_view(app: AppRecord, releases: list[Release], settings: Settings,
     unknown = latest_missing or any(not r.notes.strip() or not _classification(r) for r in pending)
     if security:
         view.status, view.status_label = "recommended_now", "Recommended now"
-        view.reason = f"Applicable security fix: {target.version if target else security[-1].version} is the earliest target containing all known applicable fixes. Your approval is still required."
+        view.reason = f"Applicable security fix{_security_detail(security)}: {target.version if target else last_fix[0].version} is the earliest target containing all known applicable fixes. Your approval is still required."
         if applicable_break:
             view.reason += " Read the applicable breaking or migration steps first."
     elif applicable_break or attention or any(s in signals for s in ("Semver major version change", "Database image major version change", "Pending span includes a pre-release")):
@@ -225,7 +284,8 @@ def _build_view(app: AppRecord, releases: list[Release], settings: Settings,
             view.reason += f" Newest {newest.version} still needs {days_left} days."
     elif deadline is not None:
         view.status, view.status_label = "waiting", "Waiting"
-        view.reason = f"Newest {newest.version} needs {days_left} more days."
+        view.reason = (f"An applicable security fix becomes recommended in {days_left} days." if security_at
+                       else f"Newest {newest.version} needs {days_left} more days.")
         if any((d := soak_deadline(r, releases, settings, app.profile.tier)) and d <= now for r in pending[:-1]):
             view.reason += " Earlier releases were superseded before completing their soak; the clock restarted."
     else:
@@ -237,12 +297,13 @@ def _build_view(app: AppRecord, releases: list[Release], settings: Settings,
 
 def _latest_only_view(view: AppView, settings: Settings, now: datetime) -> AppView:
     app = view.app
-    security = any(_has_applicable(r, "security") for r in view.pending)
+    ready = [r for r in view.pending if _security_ready(r, settings, now)]
+    security = bool(ready)
     breaking = any(_has_applicable(r, kind) for r in view.pending for kind in ("breaking", "migration"))
     attention = _needs_review(view.pending)
     digest_matches = bool(app.installed_digest and app.latest_digest and app.installed_digest == app.latest_digest)
     if digest_matches or app.update_available is False:
-        if security or breaking or attention:
+        if security or breaking or attention or any(_has_applicable(r, "security") for r in view.pending):
             view.status, view.status_label = "read_first", "Read first"
             view.reason = "Latest image digest is already installed, but pending upstream notes need review. Verify whether this image contains the applicable changes."
             if attention:
@@ -264,7 +325,7 @@ def _latest_only_view(view: AppView, settings: Settings, now: datetime) -> AppVi
     if security:
         view.status, view.status_label = "recommended_now", "Recommended now"
         view.recommended_version = "latest"
-        view.reason += " Applicable security fix in the pending changelog: review latest now; a version-specific image target is unavailable. Your approval is still required."
+        view.reason += f" Applicable security fix{_security_detail(ready)} in the pending changelog: review latest now; a version-specific image target is unavailable. Your approval is still required."
         if breaking:
             view.reason += " Read the applicable breaking or migration steps first."
     elif breaking or attention:
