@@ -153,8 +153,7 @@
       const data=await api('/api/dashboard');dashboardData=data;zone=data.timezone||zone;demoContext(data.demo);
       text('#footer-timezone',`Ripe · ${zone}`);text('#app-count',(data.apps||[]).length);
       const count=data.summary||{};['ripe','recommended_now','read_first','waiting'].forEach(key=>text(`#count-${key}`,count[key]??data.apps.filter(v=>v.status===key).length));
-      const prog=data.analysis;const working=prog&&prog.total?` · Analysing ${prog.done} of ${prog.total} releases`:'';
-      text('#last-check',(data.last_poll?`Last checked ${date(data.last_poll,true)} · ${data.apps.length} applications`:'No completed check yet · Inventory will appear after your first scan')+working);
+      text('#last-check',(data.last_collection||data.last_poll)?`Last checked ${date(data.last_collection||data.last_poll,true)} · ${data.apps.length} applications${data.classification_queue_length?` · ${data.classification_queue_length} summaries pending`:''}`:'No completed check yet · Inventory will appear after your first scan');
       $('#demo-banner').hidden=!data.demo;
       if(data.demo&&!$('#exit-demo'))$('#demo-banner').insertAdjacentHTML('beforeend','<button id="exit-demo" type="button">Leave demo</button>');
       if($('#exit-demo'))$('#exit-demo').onclick=async()=>{try{await api('/api/demo',{method:'DELETE'});await loadDashboard();toast('Demo closed. Your live inventory is active.');}catch(e){errorAt('#dashboard-error',e);}};

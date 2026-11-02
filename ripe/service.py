@@ -36,6 +36,11 @@ def fingerprint(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, default=str).encode()).hexdigest()
 
 
+POLL_TIMEOUT_SECONDS = 2 * 3600      # a collection older than this is treated as dead
+CLASSIFY_BUDGET_SECONDS = 20 * 60    # per classification run; the queue resumes later
+CLASSIFY_COOLDOWN_SECONDS = 10 * 60  # pause between budget-limited runs
+
+
 class Coordinator:
     def __init__(self, runtime: Runtime):
         self.runtime = runtime
@@ -59,6 +64,13 @@ class Coordinator:
         self.lock = asyncio.Lock()
         self.task: asyncio.Task | None = None
         self.poll_task: asyncio.Task | None = None
+        self.poll_token: object | None = None
+        self.poll_started: float | None = None
+        self.poll_timeout = POLL_TIMEOUT_SECONDS
+        self.classify_task: asyncio.Task | None = None
+        self.classify_ended: float | None = None
+        self.classify_budget = CLASSIFY_BUDGET_SECONDS
+        self.classify_cooldown = CLASSIFY_COOLDOWN_SECONDS
         if runtime.demo:
             self.enter_demo()
 
@@ -299,6 +311,7 @@ class Coordinator:
                 'include_stopped': self.settings().include_stopped,
                 'summary': {s:counts[s] for s in ('ripe','waiting','recommended_now','read_first','up_to_date','unknown')},
                 'last_poll':self.store.get('last_poll'), 'polling': self.polling,
+                **self.queue_progress(),
                 'integration_status': self.integration_status(), 'timezone':self.settings().timezone,
                 'auto_profiles': self.auto_profiles(), 'analysis': self.store.get('analysis_progress'), 'poll': self.progress.snapshot()}
 
@@ -320,6 +333,11 @@ class Coordinator:
 
     def review_auto_profiles(self):
         self.store.set('autoprofile:reviewed', sorted({*self.store.get('autoprofile:reviewed', []), *(a['id'] for a in self.auto_profiles())}))
+
+    def queue_progress(self) -> dict:
+        return {'last_collection': self.store.get('last_collection') or self.store.get('last_poll'),
+                'classification_queue_length': self.queue_length(),
+                'last_classification': self.store.get('last_classification')}
 
     def integration_status(self) -> dict:
         return {'docker_socket': 'present' if __import__('os').path.exists(self.runtime.docker_socket) else 'not mounted',
@@ -345,12 +363,34 @@ class Coordinator:
             self.store.set('ollama_status','unreachable; verify the configured local Ollama endpoint')
             return False
 
-    def request_poll(self) -> bool:
-        if self.demo or self.polling or (self.poll_task and not self.poll_task.done()):
-            return False
+    def poll_stale(self) -> bool:
+        return self.polling and self.poll_started is not None and time.monotonic() - self.poll_started > self.poll_timeout
+
+    def abandon_poll(self):
+        """Treat a poll older than the timeout as dead so the next one can run."""
+        if self.poll_task and not self.poll_task.done():
+            self.poll_task.cancel()
+        self.poll_task = None  # a cancelling task must not block the next poll
+        self.polling = False
+        self.poll_token = None
+        self.store.log_error({'source':'collector','message':'An earlier update check exceeded its time limit and was abandoned.'})
+
+    def start_poll(self):
+        token = object()
+        self.poll_token = token
         self.polling = True
         self.progress.start()
-        self.poll_task = asyncio.create_task(self.poll())
+        self.poll_started = time.monotonic()
+        self.poll_task = asyncio.create_task(self.poll(token))
+
+    def request_poll(self) -> bool:
+        if self.demo:
+            return False
+        if self.polling or (self.poll_task and not self.poll_task.done()):
+            if not self.poll_stale():
+                return False
+            self.abandon_poll()
+        self.start_poll()
         return True
 
     def poll_status(self) -> dict:
@@ -361,185 +401,290 @@ class Coordinator:
         if self.polling:
             self.store.set('poll_again', True)
 
-    async def poll(self):
-        if self.demo or self.lock.locked():
+    async def poll(self, token: object | None = None):
+        """Collect installed/latest versions and save them; classification is queued, not awaited."""
+        if self.demo:
             return
-        async with self.lock:
-            self.polling = True
-            if not self.progress.running:
-                self.progress.start()
-            failure = None
-            try:
-                settings = self.settings()
-                prior_apps = self.store.apps()
-                generations = {a.id: self.store.get('generation:' + a.id, 0) for a in prior_apps}
-                apps, releases, errors = await collect(settings, github_token=self.runtime.github_token,
-                    ha_token=self.runtime.ha_token, ha_url=self.runtime.ha_url,
-                    docker_socket=self.runtime.docker_socket, templates_dir=self.runtime.templates_dir,
-                    unraid_version_file=self.runtime.unraid_version_file,
-                    cache_get=self.store.get, cache_set=self.store.set, existing_apps=self.store.apps(),
-                    progress=self.progress)
-                self.progress.end_collecting()
-                self.progress.add_errors(errors)
-                for error in errors:
-                    self.store.log_error(error)
-                by_app: dict[str,list[Release]] = {}
-                for release in releases:
-                    by_app.setdefault(release.app_id, []).append(release)
-                by_id = {a.id: a for a in apps}
-                local_ready = None
-                queue: list = []
-                skipped = 0
-                refresh: list = []
-                for app in apps:
-                    generation = generations.get(app.id, 0)
-                    if self.store.get('generation:' + app.id, 0) != generation:
-                        continue
-                    preference = self.store.get('profile:' + app.id)
-                    # Fields the user edited are never overwritten; the rest follow what was read this scan.
-                    app.profile, evidence = merge_profile(app.profile, dict(app.detected.get('profile_evidence') or {}),
-                                                          Profile.model_validate(preference) if preference is not None else None)
-                    app.profile = sanitize_profile(app.profile)
-                    mapping = self.store.get('mapping:' + app.id)
-                    if mapping is not None:
-                        app.upstream_repo = mapping.get('upstream_repo')
-                        evidence.pop('upstream_repo', None)
-                    app.detected['profile_evidence'] = evidence
-                    self.store.save_app(app)
-                    if hidden(app, settings, by_id):
-                        continue  # ignored, merged or stopped: no analysis, no model calls
-                    # Same channel and latest-version ceiling as the dashboard span, so betas
-                    # or releases above an authoritative latest don't use up the cap.
-                    shown = {r.id for r in build_view(app, by_app.get(app.id, []), settings).pending}
-                    unknown_installed = parse_version(app.installed_version) is None
-                    pending = newest_first([r for r in by_app.get(app.id, []) if is_pending(r, app) and (unknown_installed or r.id in shown)])
-                    # An installed version that can't be ordered means the span is unknown: classify only the newest few for context.
-                    cap = min(settings.analysis_cap, UNKNOWN_SPAN_CAP) if unknown_installed else settings.analysis_cap
-                    analysed = {r.id: rank for rank, r in enumerate(pending[:cap])}
-                    for release in by_app.get(app.id, []):
-                        if self.store.get('generation:' + app.id, 0) != generation:
-                            break
-                        previous = {r.id:r for r in self.store.releases(app.id)}.get(release.id)
-                        if previous and previous.notes == release.notes:
-                            release.classification = previous.classification
-                            release.applicability = previous.applicability
-                            release.classification_key = previous.classification_key
-                            release.model_disagreement = previous.model_disagreement
-                        # Older records supply history and base-line dates without
-                        # spending LLM work on releases that aren't pending.
-                        if not is_pending(release, app):
-                            self.store.save_release(release)
-                            continue
-                        if trivial_notes(release.notes):
-                            release.classification = {'status':'unknown','tags':[],'skipped':'no notes','keyword_warnings':keyword_warnings(release.notes, [])}
-                            release.classification_key = None
-                            release.applicability = conservative_applicability(release.classification)
-                            self.store.save_release(release)
-                            skipped += 1
-                            continue
-                        if release.id not in analysed:
-                            if not release.classification or release.classification.get('status') != 'ok':
-                                release.classification = {'status':'unknown','tags':[],'skipped':f'not analysed (older than the newest {cap})' if not unknown_installed else f'not analysed (installed version unknown; only the newest {cap} are read)','keyword_warnings':keyword_warnings(release.notes, [])}
-                                release.classification_key = None
-                                release.applicability = conservative_applicability(release.classification)
-                            else:
-                                # Keep the classification, but don't let exclusions made under an
-                                # older profile keep suppressing the item without a model call.
-                                profile_key = fingerprint([app.profile.model_dump(exclude={'origin'}),release.classification_key,settings.local_model,settings.ollama_url,prompt_digest()])
-                                current = self.store.get('applicability:' + profile_key)
-                                if current is not None and all(item.get('verified') for item in current):
-                                    release.applicability = current
-                                else:
-                                    release.applicability = conservative_applicability(release.classification)
-                            self.store.save_release(release)
-                            skipped += 1
-                            continue
-                        queue.append((priority(app, release, analysed[release.id]), len(queue), app, release, generation))
-                    refresh.append((app, generation))
-                queue.sort(key=lambda item: item[:2])
-                self.store.set('analysis_progress', {'done': 0, 'total': len(queue)})
-                self.progress.begin_analysis(len(queue), skipped)
-                for done, (_, _, app, release, generation) in enumerate(queue):
-                    if self.store.get('generation:' + app.id, 0) != generation:
-                        self.progress.release_done(app.name)
-                        continue
-                    self.progress.working_on(app.name)
-                    started, called = time.monotonic(), False
-                    key = classification_key(release, app, settings)
-                    cached = self.store.get('classification:' + key)
-                    if cached and (cached.get('classification') or {}).get('status') == 'ok':
-                        release = release.model_copy(update=cached)
-                    elif not release.classification or release.classification_key != key or release.classification.get('status') != 'ok':
-                        if local_ready is None:
-                            local_ready = await self.local_ready(settings)
-                        if settings.classification_provider == 'local' and not local_ready:
-                            release.classification = {'status':'unknown','tags':[], 'keyword_warnings':keyword_warnings(release.notes, []), 'error':'Local model is unavailable; no classification was inferred.'}
-                            release.classification_key = key
-                        else:
-                            release.classification = None
-                            called = True
-                            release = await classify_release(release, app, settings, gemini_key=self.runtime.gemini_key,log_call=self.store.log_llm)
-                        self.store.set('classification:' + key, {'classification':release.classification,'classification_key':release.classification_key, 'model_disagreement':release.model_disagreement})
-                    profile_key = fingerprint([app.profile.model_dump(exclude={'origin'}),release.classification_key,settings.local_model,settings.ollama_url,prompt_digest()])
-                    analysis = self.store.get('applicability:' + profile_key)
-                    if analysis is not None and all(item.get('verified') for item in analysis):
-                        release.applicability = analysis
-                    else:
-                        if local_ready is None:
-                            local_ready = await self.local_ready(settings)
-                        if local_ready:
-                            called = True
-                            release = await analyze_applicability(release,app,settings,log_call=self.store.log_llm)
-                        else:
-                            release.applicability = conservative_applicability(release.classification)
-                        self.store.set('applicability:' + profile_key,release.applicability)
-                    self.progress.release_done(app.name, time.monotonic() - started if called else None)
-                    if self.store.get('generation:' + app.id, 0) != generation:
-                        continue
-                    self.store.save_release(release)
-                    self.store.set('analysis_progress', {'done': done + 1, 'total': len(queue)})
-                self.store.set('analysis_progress', None)
-                self.progress.begin_summaries()
-                for app, generation in refresh:
-                    if self.store.get('generation:' + app.id, 0) == generation:
-                        async def ready():
-                            nonlocal local_ready
-                            if local_ready is None:
-                                local_ready = await self.local_ready(settings)
-                            return local_ready
-                        await self.refresh_rollup(app, settings, ready)
-                        await self.refresh_rollback(app, settings, ready)
-                # Mark a source failure as stale rather than silently deleting its
-                # previous records; these visible errors prevent a fresh-data claim.
-                current_ids = {a.id for a in apps}
-                for prior in self.store.apps():
-                    if prior.id not in current_ids:
-                        prior.error = 'Not seen in the latest collection; source may be unavailable. Last known data shown.'
-                        self.store.save_app(prior)
-                self.store.set('last_poll',utcnow().isoformat())
-                self.store.set('poll_errors',errors)
-                failing = {str(e.get('source')) for e in errors}
-                if local_ready is False:
-                    failing.add('ollama')
-                    self.store.log_error({'source':'ollama','message':'Configured model unavailable on the local Ollama endpoint. Pending classifications remain unknown.'})
-                # A source that didn't fail this time has recovered; hide its old errors.
-                self.store.resolve_errors(failing)
-                self.store.prune_errors()
-                await self.notify()
-            except asyncio.CancelledError:
-                failure = 'Check was interrupted.'
-                raise
-            except Exception as exc:
-                # External response bodies/exception strings can contain secrets.
-                failure = f'Collection failed ({type(exc).__name__}); last known records preserved.'
-                self.store.log_error({'source':'collector','message':failure})
-            finally:
+        token = token or object()
+        failure = None
+        try:
+            async with self.lock:
+                self.poll_token = token
+                self.polling = True
+                self.poll_started = time.monotonic()
+                if not self.progress.running:
+                    self.progress.start()
+                await self.collect_inventory()
+        except asyncio.CancelledError:
+            failure = 'Check was interrupted.'
+            raise
+        except Exception as exc:
+            # External response bodies/exception strings can contain secrets.
+            failure = f'Collection failed ({type(exc).__name__}); last known records preserved.'
+            self.store.log_error({'source':'collector','message':failure})
+        finally:
+            # An abandoned poll no longer owns the flag (a newer poll may).
+            if self.poll_token is token:
                 self.progress.finish(failure)
                 self.polling = False
+                self.poll_token = None
                 if not self.closing and self.store.get('poll_again'):
                     self.store.set('poll_again',False)
-                    self.progress.start()
-                    self.poll_task = asyncio.create_task(self.poll())
+                    self.start_poll()
+
+    async def collect_inventory(self):
+        settings = self.settings()
+        prior_apps = self.store.apps()
+        generations = {a.id: self.store.get('generation:' + a.id, 0) for a in prior_apps}
+        apps, releases, errors = await collect(settings, github_token=self.runtime.github_token,
+            ha_token=self.runtime.ha_token, ha_url=self.runtime.ha_url,
+            docker_socket=self.runtime.docker_socket, templates_dir=self.runtime.templates_dir,
+            unraid_version_file=self.runtime.unraid_version_file,
+            cache_get=self.store.get, cache_set=self.store.set, existing_apps=self.store.apps(),
+            progress=self.progress)
+        self.progress.end_collecting()
+        self.progress.add_errors(errors)
+        for error in errors:
+            self.store.log_error(error)
+        by_app: dict[str,list[Release]] = {}
+        for release in releases:
+            by_app.setdefault(release.app_id, []).append(release)
+        work: list = []
+        by_id = {a.id: a for a in apps}
+        # No awaits below: the stored queue is replaced atomically.
+        for app in apps:
+            if self.store.get('generation:' + app.id, 0) != generations.get(app.id, 0):
+                continue
+            preference = self.store.get('profile:' + app.id)
+            # Fields the user edited are never overwritten; the rest follow what was read this scan.
+            app.profile, evidence = merge_profile(app.profile, dict(app.detected.get('profile_evidence') or {}),
+                                                  Profile.model_validate(preference) if preference is not None else None)
+            app.profile = sanitize_profile(app.profile)
+            mapping = self.store.get('mapping:' + app.id)
+            if mapping is not None:
+                app.upstream_repo = mapping.get('upstream_repo')
+                evidence.pop('upstream_repo', None)
+            app.detected['profile_evidence'] = evidence
+            self.store.save_app(app)
+            previous = {r.id:r for r in self.store.releases(app.id)}
+            for release in by_app.get(app.id, []):
+                old = previous.get(release.id)
+                if old and old.notes == release.notes:
+                    release.classification = old.classification
+                    release.applicability = old.applicability
+                    release.classification_key = old.classification_key
+                    release.model_disagreement = old.model_disagreement
+                self.store.save_release(release)
+            if hidden(app, settings, by_id):
+                continue  # ignored, merged or stopped: no analysis, no model calls
+            work.extend(self.pending_work(app, settings))
+        # Mark a source failure as stale rather than silently deleting its
+        # previous records; these visible errors prevent a fresh-data claim.
+        current_ids = {a.id for a in apps}
+        for prior in self.store.apps():
+            if prior.id not in current_ids:
+                prior.error = 'Not seen in the latest collection; source may be unavailable. Last known data shown.'
+                self.store.save_app(prior)
+        # Exposed apps and security wording first, then newest, so what matters most is summarised first.
+        work.sort(key=lambda item: item[0])
+        self.store.set('classification_queue', [{'app_id':r.app_id,'release_id':r.id} for _, r in work])
+        now = utcnow().isoformat()
+        self.store.set('last_poll', now)
+        self.store.set('last_collection', now)
+        self.store.set('poll_errors', errors)
+        # A source that didn't fail this time has recovered; hide its old errors.
+        self.store.resolve_errors({str(e.get('source')) for e in errors})
+        self.store.prune_errors()
+        self.request_classification()
+        await self.notify()
+
+    def pending_work(self, app: AppRecord, settings: Settings) -> list[tuple]:
+        """Apply cached results to pending releases; return (priority, release) for those still needing the model."""
+        work = []
+        releases = self.store.releases(app.id)
+        # Same channel and latest-version ceiling as the dashboard span, so betas
+        # or releases above an authoritative latest don't use up the cap.
+        shown = {r.id for r in build_view(app, releases, settings).pending}
+        unknown_installed = parse_version(app.installed_version) is None
+        pending = newest_first([r for r in releases if is_pending(r, app) and (unknown_installed or r.id in shown)])
+        # An installed version that can't be ordered means the span is unknown: classify only the newest few for context.
+        cap = min(settings.analysis_cap, UNKNOWN_SPAN_CAP) if unknown_installed else settings.analysis_cap
+        for rank, release in enumerate(pending):
+            if trivial_notes(release.notes):
+                release = release.model_copy(update={'classification':{'status':'unknown','tags':[],'skipped':'no notes','keyword_warnings':keyword_warnings(release.notes, [])},'classification_key':None})
+                self.store.save_release(release.model_copy(update={'applicability':conservative_applicability(release.classification)}))
+                continue
+            if rank >= cap:
+                if not release.classification or release.classification.get('status') != 'ok':
+                    release = release.model_copy(update={'classification':{'status':'unknown','tags':[],'skipped':f'not analysed (older than the newest {cap})' if not unknown_installed else f'not analysed (installed version unknown; only the newest {cap} are read)','keyword_warnings':keyword_warnings(release.notes, [])},'classification_key':None})
+                    release = release.model_copy(update={'applicability':conservative_applicability(release.classification)})
+                else:
+                    # Keep the classification, but don't let exclusions made under an
+                    # older profile keep suppressing the item without a model call.
+                    current = self.store.get('applicability:' + self.profile_key(app, release, settings))
+                    verified = current is not None and all(item.get('verified') for item in current)
+                    release = release.model_copy(update={'applicability': current if verified else conservative_applicability(release.classification)})
+                self.store.save_release(release)
+                continue
+            key = classification_key(release, app, settings)
+            cached = self.store.get('classification:' + key)
+            changed = False
+            if cached and (cached.get('classification') or {}).get('status') == 'ok' and (
+                    release.classification_key != key or release.classification != cached['classification']):
+                release = release.model_copy(update=cached)
+                changed = True
+            classified = (release.classification or {}).get('status') == 'ok' and release.classification_key == key
+            done = False
+            if classified:
+                analysis = self.store.get('applicability:' + self.profile_key(app, release, settings))
+                if analysis is not None and all(item.get('verified') for item in analysis):
+                    done = True
+                    if release.applicability != analysis:
+                        release, changed = release.model_copy(update={'applicability': analysis}), True
+                elif changed and not release.applicability:
+                    release = release.model_copy(update={'applicability': conservative_applicability(release.classification)})
+            if changed:
+                self.store.save_release(release)
+            if not done:
+                work.append((priority(app, release, rank), release))
+        return work
+
+    @staticmethod
+    def profile_key(app: AppRecord, release: Release, settings: Settings) -> str:
+        return fingerprint([app.profile.model_dump(exclude={'origin'}),release.classification_key,settings.local_model,settings.ollama_url,prompt_digest()])
+
+    def queue_length(self) -> int:
+        return len(self.store.get('classification_queue', []))
+
+    def rollups_due(self) -> bool:
+        settings = self.settings()
+        records = self.store.apps()
+        by_id = {a.id: a for a in records}
+        for app in records:
+            if hidden(app, settings, by_id):
+                continue
+            pending = build_view(app, self.store.releases(app.id), settings).pending
+            installed = app.installed_version or app.installed_digest
+            if installed and (pending or app.detected.get('image_diff')):
+                key = rollup_key(app, installed, rollup_latest(app, pending), pending, app.detected.get('image_diff'), app.detected.get('manifest_diff'), settings)
+                stored = self.store.get('rollup:' + app.id) or {}
+                if stored.get('key') != key or stored['result'].get('status') != 'ok':
+                    return True
+            elif self.store.get('rollup:' + app.id):
+                return True
+            if self.rollback_due(app, settings):
+                return True
+        return False
+
+    def rollback_due(self, app: AppRecord, settings: Settings) -> bool:
+        window = [r for r in build_view(app, self.store.releases(app.id), settings).history
+                  if not r.prerelease and not parse_version(r.version).is_prerelease][-settings.rollback_window:] if settings.rollback_window else []
+        if not window or not app.installed_version or not any(r.notes.strip() for r in window):
+            return bool(self.store.get('rollback:' + app.id))
+        key = rollup_key(app, app.installed_version, app.installed_version, window, None, None, settings, ROLLBACK_PROMPT)
+        stored = self.store.get('rollback:' + app.id) or {}
+        return stored.get('key') != key or stored['result'].get('status') != 'ok'
+
+    def request_classification(self) -> bool:
+        if self.demo or self.closing or (self.classify_task and not self.classify_task.done()) or not (self.queue_length() or self.rollups_due()):
+            return False
+        self.classify_task = asyncio.create_task(self.classify_queue())
+        return True
+
+    def dequeue(self, item: dict):
+        self.store.set('classification_queue', [i for i in self.store.get('classification_queue', []) if i != item])
+
+    async def classify_queue(self):
+        """Work the persisted queue one release at a time until empty or out of time budget."""
+        started = time.monotonic()
+        ready: list = [None]
+        try:
+            while not self.closing and not self.demo and time.monotonic() - started < self.classify_budget:
+                queue = self.store.get('classification_queue', [])
+                if not queue:
+                    break
+                item = queue[0]
+                try:
+                    if not await self.classify_item(item, ready):
+                        break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self.store.log_error({'source':'classifier','message':f'Classification failed ({type(exc).__name__}); will retry on the next check.'})
+                    self.dequeue(item)
+            if not self.store.get('classification_queue', []):
+                await self.refresh_rollups(ready)
+        finally:
+            self.classify_ended = time.monotonic()
+
+    async def refresh_rollups(self, ready: list):
+        """Rollups use the model too, so they run after collection with the queue, never inside it."""
+        settings = self.settings()
+        async def local_ready():
+            if ready[0] is None:
+                ready[0] = await self.local_ready(settings)
+            return ready[0]
+        records = self.store.apps()
+        by_id = {a.id: a for a in records}
+        for app in records:
+            if self.closing or self.demo:
+                break
+            if hidden(app, settings, by_id):
+                continue
+            try:
+                await self.refresh_rollup(app, settings, local_ready)
+                await self.refresh_rollback(app, settings, local_ready)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.store.log_error({'source':'classifier','message':f'Summary failed ({type(exc).__name__}); will retry on the next check.'})
+
+    async def classify_item(self, item: dict, ready: list) -> bool:
+        """Process one queued release; False means stop the run and keep the queue."""
+        app = self.store.app(item['app_id'])
+        release = next((r for r in self.store.releases(item['app_id']) if r.id == item['release_id']), None)
+        if not app or not release or not is_pending(release, app) or hidden(app, self.settings(), {a.id: a for a in self.store.apps()}):
+            self.dequeue(item)
+            return True
+        settings = self.settings()
+        generation = self.store.get('generation:' + app.id, 0)
+        key = classification_key(release, app, settings)
+        cached = self.store.get('classification:' + key)
+        if cached and (cached.get('classification') or {}).get('status') == 'ok':
+            release = release.model_copy(update=cached)
+        elif not release.classification or release.classification_key != key or release.classification.get('status') != 'ok':
+            if ready[0] is None:
+                ready[0] = await self.local_ready(settings)
+            if settings.classification_provider == 'local' and not ready[0]:
+                self.store.log_error({'source':'ollama','message':'Configured model unavailable on the local Ollama endpoint. Pending classifications stay queued.'})
+                return False
+            release = await classify_release(release.model_copy(update={'classification':None}), app, settings,
+                                             gemini_key=self.runtime.gemini_key, log_call=self.store.log_llm)
+            self.store.set('classification:' + key, {'classification':release.classification,'classification_key':release.classification_key, 'model_disagreement':release.model_disagreement})
+        profile_key = self.profile_key(app, release, settings)
+        analysis = self.store.get('applicability:' + profile_key)
+        if analysis is not None and all(entry.get('verified') for entry in analysis):
+            release.applicability = analysis
+        else:
+            if ready[0] is None:
+                ready[0] = await self.local_ready(settings)
+            if ready[0]:
+                release = await analyze_applicability(release, app, settings, log_call=self.store.log_llm)
+            else:
+                release.applicability = conservative_applicability(release.classification)
+            self.store.set('applicability:' + profile_key, release.applicability)
+        if self.store.get('generation:' + app.id, 0) != generation:
+            return True  # Edited mid-inference: discard the result and redo with the new profile.
+        current = next((r for r in self.store.releases(app.id) if r.id == release.id), None)
+        if current and current.notes != release.notes:
+            return True  # Notes were revised mid-inference: keep the re-queued item and redo it.
+        if current:
+            # Only the inference outputs: a collection may have refreshed other fields (e.g. published_at).
+            self.store.save_release(current.model_copy(update={f: getattr(release, f) for f in
+                ('classification', 'classification_key', 'applicability', 'model_disagreement')}))
+        self.dequeue(item)
+        self.store.set('last_classification', utcnow().isoformat())
+        return True
 
     async def notify(self):
         if not self.store.get('last_poll'):
@@ -551,10 +696,15 @@ class Coordinator:
         if not self.demo:
             last = self.store.get('last_poll')
             elapsed = (utcnow()-datetime.fromisoformat(last)).total_seconds() if last else float('inf')
+            if self.poll_stale():
+                self.abandon_poll()
             if elapsed >= self.settings().poll_hours*3600:
                 self.request_poll()
             if not self.polling:
                 await self.notify()
+            # Resume a queue left over from a restart or a budget-limited run.
+            if self.classify_ended is None or time.monotonic() - self.classify_ended >= self.classify_cooldown:
+                self.request_classification()
 
     async def run(self):
         while True:
